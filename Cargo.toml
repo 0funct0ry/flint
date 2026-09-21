@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/flint-core",
+    "crates/flint-cli",
+    "crates/flint-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Flint Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/0funct0ry/flint"
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"

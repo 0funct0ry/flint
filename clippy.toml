@@ -1,0 +1,3 @@
+# Clippy configuration for Flint
+# Stricter linting across workspace
+cognitive-complexity-threshold = 30

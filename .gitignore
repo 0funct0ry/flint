@@ -1,0 +1,43 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock
+
+# Node / Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Tauri build artifacts
+src-tauri/target/
+crates/flint-app/target/
+
+# OS / Editor files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+
+# Environment & Logs
+.env
+.env.*
+!.env.example
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Internal documents & agent configurations (Private)
+internal-docs/
+.agents/
+.idea/

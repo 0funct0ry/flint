@@ -2,6 +2,9 @@
 //!
 //! This crate has zero Tauri or GUI dependencies and can be tested in complete isolation.
 
+pub mod render;
+pub use render::{render_note_markdown, RenderResult};
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -696,10 +699,7 @@ pub fn rename_path(
 }
 
 /// Duplicate an existing note, generating a non-colliding copy name (e.g. `<stem> 1.md` or `<stem> copy.md`).
-pub fn duplicate_note(
-    root: &Path,
-    safe_path: &SafePath,
-) -> Result<NoteMeta, NoteError> {
+pub fn duplicate_note(root: &Path, safe_path: &SafePath) -> Result<NoteMeta, NoteError> {
     let abs_path = safe_path.as_path();
     if !abs_path.exists() {
         return Err(NoteError::NotFound(safe_path.to_posix_string()));
@@ -709,7 +709,10 @@ pub fn duplicate_note(
     }
 
     let content = fs::read_to_string(abs_path).map_err(|e| NoteError::Io(e.to_string()))?;
-    let parent_rel = safe_path.as_relative_path().parent().unwrap_or_else(|| Path::new(""));
+    let parent_rel = safe_path
+        .as_relative_path()
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
     let stem = safe_path
         .as_relative_path()
         .file_stem()
@@ -730,7 +733,10 @@ pub fn duplicate_note(
     };
 
     let mut counter = 1;
-    while resolve_in_workspace(root, &candidate_rel).map(|p| p.exists()).unwrap_or(false) {
+    while resolve_in_workspace(root, &candidate_rel)
+        .map(|p| p.exists())
+        .unwrap_or(false)
+    {
         counter += 1;
         candidate_name = format!("{} {}.{}", stem, counter, ext);
         candidate_rel = if parent_rel.as_os_str().is_empty() {
@@ -745,11 +751,7 @@ pub fn duplicate_note(
 }
 
 /// Delete a file or note. If `permanent` is false, moves to OS trash (SPEC §10.3, M4).
-pub fn delete_path(
-    _root: &Path,
-    safe_path: &SafePath,
-    permanent: bool,
-) -> Result<(), NoteError> {
+pub fn delete_path(_root: &Path, safe_path: &SafePath, permanent: bool) -> Result<(), NoteError> {
     let abs_path = safe_path.as_path();
     if !abs_path.exists() {
         return Err(NoteError::NotFound(safe_path.to_posix_string()));
@@ -768,10 +770,7 @@ pub fn delete_path(
 }
 
 /// Create a new folder at the given safe path (SPEC §11, M4).
-pub fn create_folder(
-    _root: &Path,
-    safe_path: &SafePath,
-) -> Result<(), NoteError> {
+pub fn create_folder(_root: &Path, safe_path: &SafePath) -> Result<(), NoteError> {
     let abs_path = safe_path.as_path();
     if abs_path.exists() {
         return Err(NoteError::AlreadyExists(safe_path.to_posix_string()));
@@ -781,11 +780,7 @@ pub fn create_folder(
 }
 
 /// Delete a folder. If `permanent` is false, moves to OS trash (SPEC §11, M4).
-pub fn delete_folder(
-    _root: &Path,
-    safe_path: &SafePath,
-    permanent: bool,
-) -> Result<(), NoteError> {
+pub fn delete_folder(_root: &Path, safe_path: &SafePath, permanent: bool) -> Result<(), NoteError> {
     let abs_path = safe_path.as_path();
     if !abs_path.exists() {
         return Err(NoteError::NotFound(safe_path.to_posix_string()));
@@ -1307,7 +1302,8 @@ mod tests {
 
         // 2. Create nested note (auto-creates parent folder)
         let nested_note = SafePath::resolve(root, "sub/dir/nested.md").unwrap();
-        let nested_meta = create_note(root, &nested_note, Some("---\ntitle: Nested\n---\n")).unwrap();
+        let nested_meta =
+            create_note(root, &nested_note, Some("---\ntitle: Nested\n---\n")).unwrap();
         assert_eq!(nested_meta.title, "Nested");
         assert!(root.join("sub/dir/nested.md").exists());
 

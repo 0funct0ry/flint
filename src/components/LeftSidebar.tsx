@@ -34,6 +34,8 @@ export interface LeftSidebarProps {
   inlineAction: InlineActionState | null;
   onCommitInlineAction: (name: string) => Promise<void>;
   onCancelInlineAction: () => void;
+  activeHeadingAnchor?: string;
+  onSelectHeading?: (anchor: string) => void;
 }
 
 export const LeftSidebar: React.FC<LeftSidebarProps> = ({
@@ -58,6 +60,8 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   inlineAction,
   onCommitInlineAction,
   onCancelInlineAction,
+  activeHeadingAnchor,
+  onSelectHeading,
 }) => {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set(['projects', 'projects/payments', 'archive', 'reading', 'guides'])
@@ -811,12 +815,19 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
               headings.map((h, i) => {
                 const indentClass =
                   h.level === 1 ? 'pl-2.5' : h.level === 2 ? 'pl-6' : 'pl-9';
+                const isActive = activeHeadingAnchor === h.anchor;
                 return (
                   <div
                     key={i}
-                    className={`flex items-center gap-1.5 h-6 pr-2 text-[12px] text-[var(--text-2)] hover:bg-[var(--panel-2)] cursor-pointer select-none ${indentClass}`}
+                    onClick={() => onSelectHeading && onSelectHeading(h.anchor)}
+                    className={`flex items-center gap-1.5 h-6 pr-2 text-[12px] cursor-pointer select-none transition-colors ${indentClass} ${
+                      isActive
+                        ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
+                        : 'text-[var(--text-2)] hover:bg-[var(--panel-2)] hover:text-[var(--text)]'
+                    }`}
+                    title={h.text}
                   >
-                    <span className="text-[var(--faint)] text-xs">§</span>
+                    <span className={`text-xs ${isActive ? 'text-[var(--accent)]' : 'text-[var(--faint)]'}`}>§</span>
                     <span className="truncate">{h.text}</span>
                   </div>
                 );

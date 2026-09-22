@@ -1,4 +1,5 @@
 import React, { useEffect, useRef } from 'react';
+import katex from 'katex';
 import { EditorSelection, EditorState, Prec } from '@codemirror/state';
 import { EditorView, keymap, highlightActiveLine } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
@@ -24,6 +25,8 @@ export interface CenterPaneProps {
   onShowDifferences: () => void;
   onBack: () => void;
   onForward: () => void;
+  onHeadingInView?: (anchor: string) => void;
+  scrollToAnchor?: string | null;
 }
 
 /**
@@ -137,9 +140,13 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   onShowDifferences,
   onBack,
   onForward,
+  onHeadingInView,
+  scrollToAnchor,
 }) => {
   const editorContainerRef = useRef<HTMLDivElement>(null);
+  const readerContainerRef = useRef<HTMLDivElement>(null);
   const editorViewRef = useRef<EditorView | null>(null);
+  const isScrollingSyncRef = useRef(false);
 
   const onContentChangeRef = useRef(onContentChange);
   onContentChangeRef.current = onContentChange;
@@ -152,6 +159,139 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
 
   // Track the note path currently loaded in the editor instance
   const loadedNotePathRef = useRef<string>('');
+
+  // Render KaTeX formulas whenever note.renderedHtml or viewMode changes
+  useEffect(() => {
+    if (!readerContainerRef.current) return;
+    if (viewMode === 'edit') return;
+
+    const renderMath = () => {
+      if (!readerContainerRef.current) return;
+
+      // Render inline math
+      const inlineMathNodes = readerContainerRef.current.querySelectorAll('.flint-math-inline');
+      inlineMathNodes.forEach((node) => {
+        const math = node.getAttribute('data-math');
+        if (math && !node.hasAttribute('data-rendered')) {
+          try {
+            katex.render(math, node as HTMLElement, {
+              throwOnError: false,
+              displayMode: false,
+            });
+            node.setAttribute('data-rendered', 'true');
+          } catch (e) {
+            console.warn('KaTeX inline render error:', e);
+          }
+        }
+      });
+
+      // Render block display math
+      const blockMathNodes = readerContainerRef.current.querySelectorAll('.flint-math-block');
+      blockMathNodes.forEach((node) => {
+        const math = node.getAttribute('data-math');
+        if (math && !node.hasAttribute('data-rendered')) {
+          try {
+            katex.render(math, node as HTMLElement, {
+              throwOnError: false,
+              displayMode: true,
+            });
+            node.setAttribute('data-rendered', 'true');
+          } catch (e) {
+            console.warn('KaTeX block render error:', e);
+          }
+        }
+      });
+    };
+
+    // Run immediately and in animation frame to ensure DOM is attached
+    renderMath();
+    const frame = requestAnimationFrame(renderMath);
+    return () => cancelAnimationFrame(frame);
+  }, [note.renderedHtml, viewMode]);
+
+  // Scroll to anchor when requested from outline
+  useEffect(() => {
+    if (!scrollToAnchor || !readerContainerRef.current) return;
+    const targetElem = readerContainerRef.current.querySelector(`#${CSS.escape(scrollToAnchor)}`);
+    if (targetElem) {
+      targetElem.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  }, [scrollToAnchor]);
+
+  // Track active heading in view as reader scrolls
+  useEffect(() => {
+    const reader = readerContainerRef.current;
+    if (!reader || !onHeadingInView) return;
+
+    const handleScroll = () => {
+      const headings = reader.querySelectorAll('h1, h2, h3, h4, h5, h6');
+      let currentAnchor = '';
+      const readerTop = reader.getBoundingClientRect().top;
+
+      headings.forEach((h) => {
+        const rect = h.getBoundingClientRect();
+        if (rect.top - readerTop <= 60 && h.id) {
+          currentAnchor = h.id;
+        }
+      });
+
+      if (currentAnchor) {
+        onHeadingInView(currentAnchor);
+      }
+    };
+
+    reader.addEventListener('scroll', handleScroll, { passive: true });
+    return () => reader.removeEventListener('scroll', handleScroll);
+  }, [onHeadingInView, note.renderedHtml]);
+
+  // Synchronized scrolling in split view
+  useEffect(() => {
+    if (viewMode !== 'split') return;
+
+    const editorScroller = editorContainerRef.current?.querySelector('.cm-scroller');
+    const reader = readerContainerRef.current;
+    if (!editorScroller || !reader) return;
+
+    const handleEditorScroll = () => {
+      if (isScrollingSyncRef.current) return;
+      isScrollingSyncRef.current = true;
+
+      const editorScrollTop = editorScroller.scrollTop;
+      const editorScrollHeight = editorScroller.scrollHeight - editorScroller.clientHeight;
+      const progress = editorScrollHeight > 0 ? editorScrollTop / editorScrollHeight : 0;
+
+      const readerScrollHeight = reader.scrollHeight - reader.clientHeight;
+      reader.scrollTop = progress * readerScrollHeight;
+
+      requestAnimationFrame(() => {
+        isScrollingSyncRef.current = false;
+      });
+    };
+
+    const handleReaderScroll = () => {
+      if (isScrollingSyncRef.current) return;
+      isScrollingSyncRef.current = true;
+
+      const readerScrollTop = reader.scrollTop;
+      const readerScrollHeight = reader.scrollHeight - reader.clientHeight;
+      const progress = readerScrollHeight > 0 ? readerScrollTop / readerScrollHeight : 0;
+
+      const editorScrollHeight = editorScroller.scrollHeight - editorScroller.clientHeight;
+      editorScroller.scrollTop = progress * editorScrollHeight;
+
+      requestAnimationFrame(() => {
+        isScrollingSyncRef.current = false;
+      });
+    };
+
+    editorScroller.addEventListener('scroll', handleEditorScroll, { passive: true });
+    reader.addEventListener('scroll', handleReaderScroll, { passive: true });
+
+    return () => {
+      editorScroller.removeEventListener('scroll', handleEditorScroll);
+      reader.removeEventListener('scroll', handleReaderScroll);
+    };
+  }, [viewMode, note.path]);
 
   // Initialize CodeMirror 6 editor instance with full SPEC §8.2 extension suite
   useEffect(() => {
@@ -262,11 +402,20 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   const handleReaderClick = (e: React.MouseEvent<HTMLDivElement>) => {
     const target = (e.target as HTMLElement).closest('a');
     if (target) {
-      e.preventDefault();
       const href = target.getAttribute('href');
-      if (href && href.startsWith('#/note/')) {
-        const notePath = href.replace('#/note/', '');
-        onNavigateRelative(notePath);
+      if (href) {
+        if (href.startsWith('#/note/')) {
+          e.preventDefault();
+          const notePath = href.replace('#/note/', '');
+          onNavigateRelative(notePath);
+        } else if (href.startsWith('#')) {
+          e.preventDefault();
+          const anchor = href.slice(1);
+          const targetElem = readerContainerRef.current?.querySelector(`#${CSS.escape(anchor)}`);
+          if (targetElem) {
+            targetElem.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
+        }
       }
     }
   };
@@ -359,6 +508,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
 
           {/* Reader Pane: Mounted and toggled via CSS */}
           <div
+            ref={readerContainerRef}
             className={`h-full min-w-0 overflow-auto bg-[var(--canvas)] ${
               viewMode === 'read'
                 ? 'w-full block'

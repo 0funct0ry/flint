@@ -108,7 +108,7 @@ button {
 .reader-content {
   padding: 26px 36px 40vh;
   width: 100%;
-  max-width: 100%;
+  max-width: 80ch; /* SPEC §9.2: line measure under 80 characters */
   color: var(--text-2);
   user-select: text;
 }
@@ -118,18 +118,28 @@ button {
   letter-spacing: -0.01em;
   margin: 0 0 14px;
   color: var(--text);
+  scroll-margin-top: 16px;
 }
 .reader-content h2 {
   font-size: 16px;
   font-weight: 600;
   margin: 26px 0 9px;
   color: var(--text);
+  scroll-margin-top: 16px;
 }
 .reader-content h3 {
   font-size: 14px;
   font-weight: 600;
   margin: 20px 0 8px;
   color: var(--text);
+  scroll-margin-top: 16px;
+}
+.reader-content h4, .reader-content h5, .reader-content h6 {
+  font-size: 13px;
+  font-weight: 600;
+  margin: 16px 0 6px;
+  color: var(--text);
+  scroll-margin-top: 16px;
 }
 .reader-content p {
   margin: 0 0 13px;
@@ -140,6 +150,7 @@ button {
   color: var(--accent);
   text-decoration: none;
   border-bottom: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  transition: border-color 0.15s ease;
 }
 .reader-content a:hover {
   border-bottom-color: var(--accent);
@@ -195,11 +206,28 @@ button {
   overflow-x: auto;
   line-height: 1.6;
 }
+.reader-content pre.syntect-code {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.reader-content pre.syntect-code code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: inherit;
+}
+.reader-content .table-container {
+  overflow-x: auto;
+  max-width: 100%;
+  margin: 0 0 15px;
+  border-radius: 4px;
+}
 .reader-content table {
   border-collapse: collapse;
   font-size: 13px;
-  margin: 0 0 15px;
   width: 100%;
+  margin: 0;
 }
 .reader-content th, .reader-content td {
   border: 1px solid var(--border);
@@ -219,15 +247,45 @@ button {
   margin: 0 0 13px;
   font-style: italic;
 }
-.reader-math {
-  font-family: var(--mono);
-  background: var(--panel);
+.reader-content img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+  margin: 8px 0 14px;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 12px;
-  text-align: center;
-  margin: 0 0 15px;
-  color: var(--text);
+}
+
+/* Missing image placeholder */
+.flint-missing-image {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  margin: 6px 0;
+  background: var(--panel-2);
+  border: 1px dashed var(--border);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.flint-missing-image-icon {
+  font-size: 14px;
+}
+.flint-missing-image code {
+  font-size: 11px;
+}
+
+/* Math block and inline */
+.flint-math-block {
+  display: flex;
+  justify-content: center;
+  margin: 14px 0;
+  padding: 8px;
+  overflow-x: auto;
+}
+.flint-math-inline {
+  display: inline-block;
+  padding: 0 2px;
 }
 
 /* CodeMirror custom overrides */

@@ -57,6 +57,10 @@ export const App: React.FC = () => {
   // Inline tree action state (create-note, create-folder, rename)
   const [inlineAction, setInlineAction] = useState<InlineActionState | null>(null);
 
+  // Outline heading state
+  const [activeHeadingAnchor, setActiveHeadingAnchor] = useState<string>('');
+  const [scrollToAnchor, setScrollToAnchor] = useState<string | null>(null);
+
   // Toast notifications
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
@@ -127,7 +131,19 @@ export const App: React.FC = () => {
         [path]: noteContent.fingerprint,
       }));
 
-      const renderedHtml = renderMarkdownToHtml(noteContent.content);
+      // Render through the Rust backend pulldown-cmark + syntect + ammonia pipeline
+      let renderedHtml = '';
+      let headings = noteContent.meta.headings;
+
+      try {
+        const renderRes = await api.noteRender(path, noteContent.content, theme);
+        renderedHtml = renderRes.html;
+        if (renderRes.headings && renderRes.headings.length > 0) {
+          headings = renderRes.headings;
+        }
+      } catch {
+        renderedHtml = renderMarkdownToHtml(noteContent.content);
+      }
 
       setNoteState((prev) => {
         const existing = prev[path] || FIXTURE_NOTES[path] || {
@@ -137,7 +153,7 @@ export const App: React.FC = () => {
           tags: noteContent.meta.tags,
           content: noteContent.content,
           renderedHtml,
-          headings: noteContent.meta.headings,
+          headings,
           outgoingLinks: [],
           backlinks: [],
           lastModifiedAgo: 'just now',
@@ -149,7 +165,7 @@ export const App: React.FC = () => {
             ...existing,
             title: noteContent.meta.title,
             tags: noteContent.meta.tags,
-            headings: noteContent.meta.headings,
+            headings,
             content: noteContent.content,
             renderedHtml,
           },
@@ -161,7 +177,7 @@ export const App: React.FC = () => {
     } catch (err) {
       console.warn(`Failed to read note ${path}:`, err);
     }
-  }, []);
+  }, [theme]);
 
   // Save note via IPC
   const saveNote = useCallback(
@@ -752,6 +768,13 @@ export const App: React.FC = () => {
             inlineAction={inlineAction}
             onCommitInlineAction={handleCommitInlineAction}
             onCancelInlineAction={() => setInlineAction(null)}
+            activeHeadingAnchor={activeHeadingAnchor}
+            onSelectHeading={(anchor) => {
+              setActiveHeadingAnchor(anchor);
+              setScrollToAnchor(anchor);
+              // Clear scrollToAnchor after scrolling
+              setTimeout(() => setScrollToAnchor(null), 300);
+            }}
           />
         )}
 
@@ -769,15 +792,16 @@ export const App: React.FC = () => {
             // Force overwrite on disk
             saveNote(true);
           }}
-          onLoadFromDisk={() => {
-            // Reload note from disk discarding buffer
-            loadNote(currentNotePath);
+          onLoadFromDisk={async () => {
+            await loadNote(currentNotePath);
           }}
           onShowDifferences={() => {
             setDiffViewerOpen(true);
           }}
           onBack={handleBack}
           onForward={handleForward}
+          onHeadingInView={(anchor) => setActiveHeadingAnchor(anchor)}
+          scrollToAnchor={scrollToAnchor}
         />
 
         {rightSidebarVisible && (

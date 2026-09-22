@@ -1,7 +1,8 @@
 use flint_core::{
     bootstrap_workspace, build_workspace_tree, create_folder, create_note, delete_folder,
-    delete_path, duplicate_note, read_note, rename_path, resolve_workspace_root,
-    write_note_atomic, Fingerprint, NoteContent, NoteMeta, SafePath, TreeNodeItem, WorkspaceInfo,
+    delete_path, duplicate_note, read_note, rename_path, render_note_markdown,
+    resolve_workspace_root, write_note_atomic, Fingerprint, NoteContent, NoteMeta, RenderResult,
+    SafePath, TreeNodeItem, WorkspaceInfo,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -219,6 +220,30 @@ fn reveal_in_file_manager(path: String, state: State<AppState>) -> Result<(), St
     Ok(())
 }
 
+/// Render a note's Markdown content to sanitized HTML and outline (SPEC §8.4, §11, M5).
+#[tauri::command]
+fn note_render(
+    path: String,
+    content: Option<String>,
+    theme: Option<String>,
+    state: State<AppState>,
+) -> Result<RenderResult, String> {
+    let root = get_workspace_root(&state)?;
+    let theme_str = theme.unwrap_or_else(|| "dark".to_string());
+
+    let raw_content = match content {
+        Some(c) => c,
+        None => {
+            let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+            let note = read_note(&root, &safe_path).map_err(|e| e.to_string())?;
+            note.content
+        }
+    };
+
+    let result = render_note_markdown(&raw_content, &theme_str, Some(&root), Some(&path));
+    Ok(result)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     run_with_workspace(None);
@@ -241,7 +266,8 @@ pub fn run_with_workspace(initial_path: Option<PathBuf>) {
             note_delete,
             folder_create,
             folder_delete,
-            reveal_in_file_manager
+            reveal_in_file_manager,
+            note_render
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

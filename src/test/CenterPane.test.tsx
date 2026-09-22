@@ -76,4 +76,41 @@ describe('CenterPane', () => {
 
     expect(screen.getByTitle('Unsaved changes')).toHaveClass('opacity-100');
   });
+
+  it('renders and invokes KaTeX on inline and block math elements', () => {
+    const mathNote: NoteFixture = {
+      ...sampleNote,
+      renderedHtml: `
+        <h1 id="math-title">Math Note</h1>
+        <p>Inline: <span class="flint-math-inline" data-math="E=mc^2"></span></p>
+        <div class="flint-math-block" data-math="\\int_0^1 x dx"></div>
+      `,
+    };
+
+    render(
+      <CenterPane
+        note={mathNote}
+        viewMode="read"
+        isDirty={false}
+        onContentChange={vi.fn()}
+        onNavigateRelative={vi.fn()}
+        showConflictBanner={false}
+        onKeepVersion={vi.fn()}
+        onLoadFromDisk={vi.fn()}
+        onShowDifferences={vi.fn()}
+        onBack={vi.fn()}
+        onForward={vi.fn()}
+      />
+    );
+
+    const inlineElem = document.querySelector('.flint-math-inline');
+    expect(inlineElem).toBeInTheDocument();
+    expect(inlineElem).toHaveAttribute('data-rendered', 'true');
+    expect(inlineElem?.querySelector('.katex')).toBeInTheDocument();
+
+    const blockElem = document.querySelector('.flint-math-block');
+    expect(blockElem).toBeInTheDocument();
+    expect(blockElem).toHaveAttribute('data-rendered', 'true');
+    expect(blockElem?.querySelector('.katex-display')).toBeInTheDocument();
+  });
 });

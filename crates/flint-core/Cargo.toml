@@ -12,6 +12,9 @@ serde_json.workspace = true
 thiserror.workspace = true
 trash.workspace = true
 ignore = "0.4"
+pulldown-cmark.workspace = true
+ammonia.workspace = true
+syntect.workspace = true
 
 [dev-dependencies]
 proptest = "1.6"

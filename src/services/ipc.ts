@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Fingerprint, NoteContent, NoteMeta, RenameResult, TreeNodeItem, WorkspaceInfo } from "../types";
+import { Fingerprint, NoteContent, NoteMeta, RenameResult, RenderResult, TreeNodeItem, WorkspaceInfo } from "../types";
 import { FIXTURE_NOTES } from "../fixtures/workspace";
+import { renderMarkdownToHtml } from "./markdown";
 
 export const isTauriEnvironment = (): boolean => {
   return typeof window !== "undefined" && Boolean((window as any).__TAURI_INTERNALS__);
@@ -239,5 +240,23 @@ export const api = {
     if (isTauriEnvironment()) {
       return await invoke<void>("reveal_in_file_manager", { path });
     }
+  },
+
+  async noteRender(path: string, content?: string, theme?: string): Promise<RenderResult> {
+    if (isTauriEnvironment()) {
+      return await invoke<RenderResult>("note_render", { path, content, theme });
+    }
+
+    const rawContent = content !== undefined
+      ? content
+      : browserMockStorage[path]?.content || FIXTURE_NOTES[path]?.content || "";
+
+    const html = renderMarkdownToHtml(rawContent);
+    const headings = FIXTURE_NOTES[path]?.headings || [];
+
+    return {
+      html,
+      headings,
+    };
   },
 };

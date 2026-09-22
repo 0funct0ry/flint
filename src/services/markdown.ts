@@ -2,7 +2,7 @@
  * Render Markdown content to HTML for reader pane preview.
  * Strips front matter and converts standard Markdown elements:
  * headings, blockquotes, code blocks, inline code, bold, italic,
- * task lists, unordered/ordered lists, tables, links, and paragraphs.
+ * math ($...$ and $$...$$), task lists, unordered/ordered lists, tables, links, and paragraphs.
  */
 export function renderMarkdownToHtml(markdown: string): string {
   if (!markdown) return '';
@@ -21,6 +21,45 @@ export function renderMarkdownToHtml(markdown: string): string {
     }
   }
 
+  // 2. Protect code fences and inline code spans first so math within code is preserved
+  const codeSpans: Array<{ placeholder: string; raw: string }> = [];
+
+  // Protect code fences ```...``` or ~~~...~~~
+  content = content.replace(/(```[\s\S]*?```|~~~[\s\S]*?~~~)/g, (match) => {
+    const placeholder = `FLINTCODEFENCEPLACEHOLDER${codeSpans.length}`;
+    codeSpans.push({ placeholder, raw: match });
+    return placeholder;
+  });
+
+  // Protect inline code spans `...`
+  content = content.replace(/(`+)([\s\S]*?)\1/g, (match) => {
+    const placeholder = `FLINTINLINECODEPLACEHOLDER${codeSpans.length}`;
+    codeSpans.push({ placeholder, raw: match });
+    return placeholder;
+  });
+
+  // 3. Extract math delimiters $$...$$ and $...$
+  const mathSpans: Array<{ placeholder: string; content: string; isBlock: boolean }> = [];
+
+  // Protect block math $$...$$
+  content = content.replace(/\$\$([\s\S]*?)\$\$/g, (_, math) => {
+    const placeholder = `FLINTMATHBLOCKPLACEHOLDER${mathSpans.length}`;
+    mathSpans.push({ placeholder, content: math.trim(), isBlock: true });
+    return `\n\n${placeholder}\n\n`;
+  });
+
+  // Protect inline math $...$ (not preceded or followed by space/newlines, ignoring escaped \$)
+  content = content.replace(/(?<!\\)\$([^\s$](?:[^$\n]*?[^\s$])?)\$/g, (_, math) => {
+    const placeholder = `FLINTMATHINLINEPLACEHOLDER${mathSpans.length}`;
+    mathSpans.push({ placeholder, content: math, isBlock: false });
+    return placeholder;
+  });
+
+  // Restore protected code fences and inline code spans back to markdown content
+  for (const span of codeSpans) {
+    content = content.split(span.placeholder).join(span.raw);
+  }
+
   const lines = content.split(/\r?\n/);
   const htmlOutput: string[] = [];
 
@@ -36,7 +75,11 @@ export function renderMarkdownToHtml(markdown: string): string {
     if (paragraphBuffer.length > 0) {
       const pText = paragraphBuffer.join(' ').trim();
       if (pText) {
-        htmlOutput.push(`<p>${formatInline(pText)}</p>`);
+        if (pText.startsWith('FLINTMATHBLOCKPLACEHOLDER')) {
+          htmlOutput.push(pText);
+        } else {
+          htmlOutput.push(`<p>${formatInline(pText)}</p>`);
+        }
       }
       paragraphBuffer = [];
     }
@@ -100,6 +143,15 @@ export function renderMarkdownToHtml(markdown: string): string {
     const rawLine = lines[i];
     const trimmed = rawLine.trim();
 
+    // Check for direct block math placeholder
+    if (trimmed.startsWith('FLINTMATHBLOCKPLACEHOLDER')) {
+      flushParagraph();
+      flushList();
+      flushTable();
+      htmlOutput.push(trimmed);
+      continue;
+    }
+
     // Code blocks
     if (trimmed.startsWith('```') || trimmed.startsWith('~~~')) {
       if (inCodeBlock) {
@@ -144,7 +196,11 @@ export function renderMarkdownToHtml(markdown: string): string {
       flushTable();
       const level = headingMatch[1].length;
       const hText = headingMatch[2].trim();
-      htmlOutput.push(`<h${level}>${formatInline(hText)}</h${level}>`);
+      const anchor = hText
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/(^-|-$)/g, '');
+      htmlOutput.push(`<h${level} id="${anchor}">${formatInline(hText)}</h${level}>`);
       continue;
     }
 
@@ -258,5 +314,15 @@ export function renderMarkdownToHtml(markdown: string): string {
     );
   }
 
-  return htmlOutput.join('\n');
+  let finalHtml = htmlOutput.join('\n');
+
+  // Restore math spans
+  for (const span of mathSpans) {
+    const replacement = span.isBlock
+      ? `<div class="flint-math-block" data-math="${escapeHtml(span.content)}"></div>`
+      : `<span class="flint-math-inline" data-math="${escapeHtml(span.content)}"></span>`;
+    finalHtml = finalHtml.split(span.placeholder).join(replacement);
+  }
+
+  return finalHtml;
 }

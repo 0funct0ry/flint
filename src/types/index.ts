@@ -83,3 +83,8 @@ export interface RenameResult {
   links_updated: number;
 }
 
+export interface RenderResult {
+  html: string;
+  headings: HeadingItem[];
+}
+

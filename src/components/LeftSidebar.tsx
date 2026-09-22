@@ -11,6 +11,9 @@ export interface LeftSidebarProps {
   currentNotePath: string;
   onSelectNote: (path: string) => void;
   headings: HeadingItem[];
+  isEmpty?: boolean;
+  error?: string | null;
+  onCreateNote?: () => void;
 }
 
 export const LeftSidebar: React.FC<LeftSidebarProps> = ({
@@ -20,6 +23,9 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   currentNotePath,
   onSelectNote,
   headings,
+  isEmpty = false,
+  error = null,
+  onCreateNote,
 }) => {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set(['projects', 'projects/payments', 'archive', 'reading', 'guides'])
@@ -89,7 +95,8 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
     return items.map((item) => {
       const isExpanded = expandedFolders.has(item.path);
       const isSelected = currentNotePath === item.path;
-      const isFolder = item.isFolder;
+      const isFolder = item.is_folder;
+      const isNote = Boolean(item.is_note);
       const indentClass = depth === 0 ? '' : depth === 1 ? 'pl-[22px]' : depth === 2 ? 'pl-[36px]' : 'pl-[50px]';
 
       return (
@@ -101,13 +108,13 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
             onClick={() => {
               if (isFolder) {
                 toggleFolder(item.path);
-              } else if (item.isNote) {
+              } else if (isNote) {
                 onSelectNote(item.path);
               }
             }}
             className={`flex items-center gap-1.5 h-6 px-2.5 text-[var(--text-2)] cursor-default whitespace-nowrap select-none hover:bg-[var(--panel-2)] transition-colors ${indentClass} ${
               isSelected ? 'bg-[var(--sel)] text-[var(--text)] font-medium' : ''
-            } ${!item.isNote && !item.isFolder ? 'text-[var(--faint)]' : ''}`}
+            } ${!isNote && !isFolder ? 'text-[var(--faint)]' : ''}`}
           >
             {/* Twisty arrow */}
             <span className="w-3 text-[var(--faint)] text-[9px] text-center shrink-0">
@@ -120,7 +127,7 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
                 isSelected ? 'text-[var(--accent)]' : 'text-[var(--faint)]'
               }`}
             >
-              {isFolder ? '▤' : item.isNote ? '◦' : '◌'}
+              {isFolder ? '▤' : isNote ? '◦' : '◌'}
             </span>
 
             {/* Name */}
@@ -132,6 +139,7 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
       );
     });
   };
+
 
   return (
     <aside className="w-[236px] shrink-0 flex flex-col bg-[var(--panel)] border-r border-[var(--border)] min-h-0 select-none">
@@ -179,8 +187,31 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
       <div className="flex-1 overflow-auto py-1.5 min-h-0">
         {/* WORKSPACE TREE TAB */}
         {activeTab === 'tree' && (
-          <div role="tree" aria-label="Workspace file tree" tabIndex={0} className="focus:outline-none">
-            {renderTree(treeData)}
+          <div role="tree" aria-label="Workspace file tree" tabIndex={0} className="focus:outline-none h-full">
+            {error ? (
+              <div className="p-4 text-center">
+                <div className="text-xs text-[var(--spark)] mb-2 font-medium">
+                  {error}
+                </div>
+                <div className="text-[11px] text-[var(--muted)]">
+                  Check workspace path and folder permissions.
+                </div>
+              </div>
+            ) : isEmpty || treeData.length === 0 ? (
+              <div className="p-4 flex flex-col items-center justify-center text-center h-48">
+                <div className="text-xs text-[var(--muted)] mb-3 font-medium">
+                  Workspace is empty
+                </div>
+                <button
+                  onClick={onCreateNote}
+                  className="px-2.5 py-1 text-xs bg-[var(--accent)] text-white rounded-[5px] hover:opacity-90 font-medium transition-opacity"
+                >
+                  Create your first note
+                </button>
+              </div>
+            ) : (
+              renderTree(treeData)
+            )}
           </div>
         )}
 

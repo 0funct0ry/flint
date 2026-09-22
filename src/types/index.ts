@@ -39,11 +39,19 @@ export interface NoteFixture {
   lastModifiedAgo: string;
 }
 
+export interface WorkspaceInfo {
+  name: string;
+  path: string;
+  is_empty: boolean;
+}
+
 export interface TreeNodeItem {
   id: string;
   name: string;
   path: string;
-  isFolder: boolean;
+  is_folder: boolean;
   children?: TreeNodeItem[];
-  isNote?: boolean;
+  is_note?: boolean;
+  title?: string;
 }
+

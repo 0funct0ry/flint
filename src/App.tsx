@@ -7,11 +7,12 @@ import { StatusBar } from './components/StatusBar';
 import { CommandPalette } from './components/CommandPalette';
 import {
   FIXTURE_NOTES,
-  FIXTURE_TREE,
   FIXTURE_WORKSPACE_NAME,
   FIXTURE_ROOT_PATH,
 } from './fixtures/workspace';
 import { commandRegistry } from './commands/registry';
+import { TreeNodeItem, WorkspaceInfo } from './types';
+import { api } from './services/ipc';
 
 export const App: React.FC = () => {
   const [theme, setTheme] = useState<'light' | 'dark'>('dark');
@@ -19,6 +20,15 @@ export const App: React.FC = () => {
   const [leftTab, setLeftTab] = useState<LeftTab>('tree');
   const [leftSidebarVisible, setLeftSidebarVisible] = useState(true);
   const [rightSidebarVisible, setRightSidebarVisible] = useState(true);
+
+  // Live workspace state
+  const [workspaceInfo, setWorkspaceInfo] = useState<WorkspaceInfo>({
+    name: FIXTURE_WORKSPACE_NAME,
+    path: FIXTURE_ROOT_PATH,
+    is_empty: false,
+  });
+  const [treeData, setTreeData] = useState<TreeNodeItem[]>([]);
+  const [treeError, setTreeError] = useState<string | null>(null);
 
   // Active note state
   const [currentNotePath, setCurrentNotePath] = useState<string>(
@@ -36,10 +46,39 @@ export const App: React.FC = () => {
   const [history, setHistory] = useState<string[]>([currentNotePath]);
   const [historyIndex, setHistoryIndex] = useState(0);
 
+  // Load workspace and tree from real IPC on mount
+  useEffect(() => {
+    let mounted = true;
+
+    async function loadWorkspace() {
+      try {
+        const info = await api.workspaceOpen();
+        if (mounted) {
+          setWorkspaceInfo(info);
+        }
+        const tree = await api.workspaceTree(false);
+        if (mounted) {
+          setTreeData(tree);
+          setTreeError(null);
+        }
+      } catch (err: any) {
+        if (mounted) {
+          setTreeError(err?.message || String(err));
+        }
+      }
+    }
+
+    loadWorkspace();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   // Apply theme to html root
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
+
 
   // Mode cycle helper (⌘E)
   const cycleViewMode = useCallback(() => {
@@ -199,7 +238,7 @@ export const App: React.FC = () => {
   const currentNote =
     noteState[currentNotePath] || noteState['projects/payments/settlement.md'];
 
-  const breadcrumb = `${FIXTURE_ROOT_PATH}/${currentNotePath.replace(/^projects\//, '')}`;
+  const breadcrumb = `${workspaceInfo.name}/${currentNotePath.replace(/^projects\//, '')}`;
 
   // Content change handler
   const handleContentChange = (newContent: string) => {
@@ -236,10 +275,16 @@ export const App: React.FC = () => {
           <LeftSidebar
             activeTab={leftTab}
             onTabChange={setLeftTab}
-            treeData={FIXTURE_TREE}
+            treeData={treeData}
             currentNotePath={currentNotePath}
             onSelectNote={handleSelectNote}
             headings={currentNote.headings}
+            isEmpty={workspaceInfo.is_empty}
+            error={treeError}
+            onCreateNote={() => {
+              // Placeholder for note creation trigger
+              handleSelectNote('projects/payments/settlement.md');
+            }}
           />
         )}
 
@@ -270,7 +315,7 @@ export const App: React.FC = () => {
 
       {/* Status bar */}
       <StatusBar
-        workspaceName={FIXTURE_WORKSPACE_NAME}
+        workspaceName={workspaceInfo.name}
         noteCount={Object.keys(noteState).length}
         linkCount={12803}
         unresolvedCount={1}

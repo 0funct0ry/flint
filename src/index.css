@@ -148,12 +148,32 @@ button {
   color: var(--spark);
   border-bottom: 1px dotted var(--spark);
 }
-.reader-content ul, .reader-content ol {
-  margin: 0 0 13px 20px;
+.reader-content ul {
+  list-style-type: disc;
+  margin: 0 0 13px 0;
+  padding-left: 24px;
+}
+.reader-content ol {
+  list-style-type: decimal;
+  margin: 0 0 13px 0;
+  padding-left: 24px;
+}
+.reader-content ul ul {
+  list-style-type: circle;
+  margin-bottom: 0;
+}
+.reader-content ol ol {
+  list-style-type: lower-alpha;
+  margin-bottom: 0;
 }
 .reader-content li {
   margin: 0 0 5px;
   font-size: 14px;
+  line-height: 1.6;
+}
+.reader-content li.task-list-item {
+  list-style-type: none;
+  margin-left: -20px;
 }
 .reader-content code {
   font-family: var(--mono);
@@ -226,10 +246,18 @@ button {
 .cm-activeLine {
   background-color: var(--panel-2) !important;
 }
-.cm-selectionBackground, ::selection {
-  background: var(--sel) !important;
+.cm-cursor, .cm-dropCursor {
+  border-left-color: var(--text) !important;
+  border-left-width: 2px !important;
 }
-.cm-cursor {
-  border-left-color: var(--accent) !important;
-  border-left-width: 1.5px !important;
+[data-theme="dark"] .cm-cursor, [data-theme="dark"] .cm-dropCursor {
+  border-left-color: #FFFFFF !important;
+  box-shadow: 0 0 3px rgba(255, 255, 255, 0.4);
+}
+.cm-cursorLayer {
+  animation: cm-blink 1.2s ease-in-out infinite;
+}
+@keyframes cm-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
 }

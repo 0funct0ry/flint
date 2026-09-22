@@ -1,9 +1,12 @@
 use flint_core::{
-    bootstrap_workspace, build_workspace_tree, read_note, resolve_workspace_root,
-    write_note_atomic, Fingerprint, NoteContent, SafePath, TreeNodeItem, WorkspaceInfo,
+    bootstrap_workspace, build_workspace_tree, create_folder, create_note, delete_folder,
+    delete_path, duplicate_note, read_note, rename_path, resolve_workspace_root,
+    write_note_atomic, Fingerprint, NoteContent, NoteMeta, SafePath, TreeNodeItem, WorkspaceInfo,
 };
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Mutex;
 use tauri::State;
 
@@ -32,6 +35,13 @@ fn get_workspace_root(state: &State<AppState>) -> Result<PathBuf, String> {
             resolve_workspace_root(None, None, None, &current_dir).map_err(|e| e.to_string())
         }
     }
+}
+
+/// Result returned from note_rename (SPEC §11).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenameResult {
+    pub moved: bool,
+    pub links_updated: usize,
 }
 
 /// Open and initialize a workspace directory.
@@ -100,6 +110,115 @@ fn note_write(
     write_note_atomic(&root, &safe_path, &content, fingerprint.as_ref()).map_err(|e| e.to_string())
 }
 
+/// Create a new note at path (SPEC §11, M4).
+#[tauri::command]
+fn note_create(
+    path: String,
+    template: Option<String>,
+    state: State<AppState>,
+) -> Result<NoteMeta, String> {
+    let root = get_workspace_root(&state)?;
+    let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+    create_note(&root, &safe_path, template.as_deref()).map_err(|e| e.to_string())
+}
+
+/// Rename/move a note or folder (SPEC §11, M4).
+#[tauri::command]
+fn note_rename(
+    from: String,
+    to: String,
+    _rewrite_links: Option<bool>,
+    state: State<AppState>,
+) -> Result<RenameResult, String> {
+    let root = get_workspace_root(&state)?;
+    let from_safe = SafePath::resolve(&root, &from).map_err(|e| e.to_string())?;
+    let to_safe = SafePath::resolve(&root, &to).map_err(|e| e.to_string())?;
+
+    rename_path(&root, &from_safe, &to_safe).map_err(|e| e.to_string())?;
+
+    // Link rewriting is deferred to M8 per PROMPTS.md
+    Ok(RenameResult {
+        moved: true,
+        links_updated: 0,
+    })
+}
+
+/// Duplicate a note (SPEC §11, M4).
+#[tauri::command]
+fn note_duplicate(path: String, state: State<AppState>) -> Result<NoteMeta, String> {
+    let root = get_workspace_root(&state)?;
+    let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+    duplicate_note(&root, &safe_path).map_err(|e| e.to_string())
+}
+
+/// Delete a note (to OS trash by default, or permanently if permanent: true) (SPEC §10.3, §11, M4).
+#[tauri::command]
+fn note_delete(
+    path: String,
+    permanent: Option<bool>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let root = get_workspace_root(&state)?;
+    let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+    delete_path(&root, &safe_path, permanent.unwrap_or(false)).map_err(|e| e.to_string())
+}
+
+/// Create a new folder at path (SPEC §11, M4).
+#[tauri::command]
+fn folder_create(path: String, state: State<AppState>) -> Result<(), String> {
+    let root = get_workspace_root(&state)?;
+    let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+    create_folder(&root, &safe_path).map_err(|e| e.to_string())
+}
+
+/// Delete a folder (to OS trash by default, or permanently if permanent: true) (SPEC §11, M4).
+#[tauri::command]
+fn folder_delete(
+    path: String,
+    permanent: Option<bool>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let root = get_workspace_root(&state)?;
+    let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+    delete_folder(&root, &safe_path, permanent.unwrap_or(false)).map_err(|e| e.to_string())
+}
+
+/// Reveal a file or folder in the OS file manager (macOS Finder, Linux file manager, Windows Explorer) (SPEC §11, M4).
+#[tauri::command]
+fn reveal_in_file_manager(path: String, state: State<AppState>) -> Result<(), String> {
+    let root = get_workspace_root(&state)?;
+    let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+    let abs_path = safe_path.as_path();
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("-R")
+            .arg(abs_path)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("explorer")
+            .arg(format!("/select,\"{}\"", abs_path.display()))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let parent = abs_path.parent().unwrap_or(abs_path);
+        Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     run_with_workspace(None);
@@ -115,7 +234,14 @@ pub fn run_with_workspace(initial_path: Option<PathBuf>) {
             workspace_open,
             workspace_tree,
             note_read,
-            note_write
+            note_write,
+            note_create,
+            note_rename,
+            note_duplicate,
+            note_delete,
+            folder_create,
+            folder_delete,
+            reveal_in_file_manager
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

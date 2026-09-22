@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Fingerprint, NoteContent, TreeNodeItem, WorkspaceInfo } from "../types";
+import { Fingerprint, NoteContent, NoteMeta, RenameResult, TreeNodeItem, WorkspaceInfo } from "../types";
 import { FIXTURE_NOTES } from "../fixtures/workspace";
 
 export const isTauriEnvironment = (): boolean => {
@@ -8,6 +8,56 @@ export const isTauriEnvironment = (): boolean => {
 
 // Fallback in-memory storage for browser dev/test
 const browserMockStorage: Record<string, { content: string; hash: string; modified: number }> = {};
+const browserMockTree: TreeNodeItem[] = [
+  {
+    id: "projects",
+    name: "projects",
+    path: "projects",
+    is_folder: true,
+    children: [
+      {
+        id: "projects/payments",
+        name: "payments",
+        path: "projects/payments",
+        is_folder: true,
+        children: [
+          {
+            id: "projects/payments/settlement.md",
+            name: "settlement.md",
+            path: "projects/payments/settlement.md",
+            is_folder: false,
+            is_note: true,
+            title: "Settlement windows",
+          },
+          {
+            id: "projects/payments/rails.md",
+            name: "rails.md",
+            path: "projects/payments/rails.md",
+            is_folder: false,
+            is_note: true,
+            title: "Payment rails overview",
+          },
+          {
+            id: "projects/payments/bbps-flows.md",
+            name: "bbps-flows.md",
+            path: "projects/payments/bbps-flows.md",
+            is_folder: false,
+            is_note: true,
+            title: "BBPS transaction flows",
+          },
+        ],
+      },
+    ],
+  },
+  {
+    id: "daily.md",
+    name: "daily.md",
+    path: "daily.md",
+    is_folder: false,
+    is_note: true,
+    title: "Daily Log",
+  },
+];
 
 export const api = {
   async workspaceOpen(path?: string): Promise<WorkspaceInfo> {
@@ -25,56 +75,7 @@ export const api = {
     if (isTauriEnvironment()) {
       return await invoke<TreeNodeItem[]>("workspace_tree", { showNonNoteFiles });
     }
-    return [
-      {
-        id: "projects",
-        name: "projects",
-        path: "projects",
-        is_folder: true,
-        children: [
-          {
-            id: "projects/payments",
-            name: "payments",
-            path: "projects/payments",
-            is_folder: true,
-            children: [
-              {
-                id: "projects/payments/settlement.md",
-                name: "settlement.md",
-                path: "projects/payments/settlement.md",
-                is_folder: false,
-                is_note: true,
-                title: "Settlement windows",
-              },
-              {
-                id: "projects/payments/rails.md",
-                name: "rails.md",
-                path: "projects/payments/rails.md",
-                is_folder: false,
-                is_note: true,
-                title: "Payment rails overview",
-              },
-              {
-                id: "projects/payments/bbps-flows.md",
-                name: "bbps-flows.md",
-                path: "projects/payments/bbps-flows.md",
-                is_folder: false,
-                is_note: true,
-                title: "BBPS transaction flows",
-              },
-            ],
-          },
-        ],
-      },
-      {
-        id: "daily.md",
-        name: "daily.md",
-        path: "daily.md",
-        is_folder: false,
-        is_note: true,
-        title: "Daily Log",
-      },
-    ];
+    return JSON.parse(JSON.stringify(browserMockTree));
   },
 
   async noteRead(path: string): Promise<NoteContent> {
@@ -150,5 +151,93 @@ export const api = {
       content_hash: newHash,
     };
   },
-};
 
+  async noteCreate(path: string, template?: string): Promise<NoteMeta> {
+    if (isTauriEnvironment()) {
+      return await invoke<NoteMeta>("note_create", { path, template });
+    }
+
+    const content = template || "";
+    browserMockStorage[path] = {
+      content,
+      hash: "mock-hash-" + content.length + "-" + Date.now(),
+      modified: Date.now(),
+    };
+
+    const title = path.split("/").pop()?.replace(/\.md$/, "") || "Untitled";
+    return {
+      path,
+      title,
+      size_bytes: content.length,
+      modified_ms: Date.now(),
+      headings: [],
+      tags: [],
+    };
+  },
+
+  async noteRename(from: string, to: string, rewriteLinks?: boolean): Promise<RenameResult> {
+    if (isTauriEnvironment()) {
+      return await invoke<RenameResult>("note_rename", { from, to, rewriteLinks });
+    }
+
+    if (browserMockStorage[from]) {
+      browserMockStorage[to] = browserMockStorage[from];
+      delete browserMockStorage[from];
+    }
+
+    return {
+      moved: true,
+      links_updated: 0,
+    };
+  },
+
+  async noteDuplicate(path: string): Promise<NoteMeta> {
+    if (isTauriEnvironment()) {
+      return await invoke<NoteMeta>("note_duplicate", { path });
+    }
+
+    const stem = path.replace(/\.md$/, "");
+    const newPath = `${stem} 1.md`;
+    const sourceContent = browserMockStorage[path]?.content || FIXTURE_NOTES[path]?.content || "";
+
+    browserMockStorage[newPath] = {
+      content: sourceContent,
+      hash: "mock-hash-" + sourceContent.length + "-" + Date.now(),
+      modified: Date.now(),
+    };
+
+    return {
+      path: newPath,
+      title: newPath.split("/").pop()?.replace(/\.md$/, "") || "Untitled",
+      size_bytes: sourceContent.length,
+      modified_ms: Date.now(),
+      headings: [],
+      tags: [],
+    };
+  },
+
+  async noteDelete(path: string, permanent?: boolean): Promise<void> {
+    if (isTauriEnvironment()) {
+      return await invoke<void>("note_delete", { path, permanent });
+    }
+    delete browserMockStorage[path];
+  },
+
+  async folderCreate(path: string): Promise<void> {
+    if (isTauriEnvironment()) {
+      return await invoke<void>("folder_create", { path });
+    }
+  },
+
+  async folderDelete(path: string, permanent?: boolean): Promise<void> {
+    if (isTauriEnvironment()) {
+      return await invoke<void>("folder_delete", { path, permanent });
+    }
+  },
+
+  async revealInFileManager(path: string): Promise<void> {
+    if (isTauriEnvironment()) {
+      return await invoke<void>("reveal_in_file_manager", { path });
+    }
+  },
+};

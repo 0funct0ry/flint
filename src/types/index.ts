@@ -78,3 +78,8 @@ export interface TreeNodeItem {
   title?: string;
 }
 
+export interface RenameResult {
+  moved: boolean;
+  links_updated: number;
+}
+

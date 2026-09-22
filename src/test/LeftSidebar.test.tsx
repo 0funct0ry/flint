@@ -39,18 +39,33 @@ describe("LeftSidebar", () => {
     },
   ];
 
+  const defaultProps = {
+    activeTab: "tree" as const,
+    onTabChange: vi.fn(),
+    treeData: sampleTree,
+    currentNotePath: "projects/payments/settlement.md",
+    onSelectNote: vi.fn(),
+    headings: [],
+    onCreateNote: vi.fn(),
+    onCreateFolder: vi.fn(),
+    onRenameItem: vi.fn(),
+    onDuplicateNote: vi.fn(),
+    onDeleteItem: vi.fn(),
+    onMoveItem: vi.fn(),
+    onRevealInFileManager: vi.fn(),
+    onCopyRelativePath: vi.fn(),
+    inlineAction: null,
+    onCommitInlineAction: vi.fn(),
+    onCancelInlineAction: vi.fn(),
+  };
+
   it("renders tree nodes and responds to item selection", () => {
     const onSelect = vi.fn();
-    const onTabChange = vi.fn();
 
     render(
       <LeftSidebar
-        activeTab="tree"
-        onTabChange={onTabChange}
-        treeData={sampleTree}
-        currentNotePath="projects/payments/settlement.md"
+        {...defaultProps}
         onSelectNote={onSelect}
-        headings={[]}
       />
     );
 
@@ -65,12 +80,9 @@ describe("LeftSidebar", () => {
     const onCreate = vi.fn();
     render(
       <LeftSidebar
-        activeTab="tree"
-        onTabChange={() => {}}
+        {...defaultProps}
         treeData={[]}
         currentNotePath=""
-        onSelectNote={() => {}}
-        headings={[]}
         isEmpty={true}
         onCreateNote={onCreate}
       />
@@ -83,15 +95,53 @@ describe("LeftSidebar", () => {
     expect(onCreate).toHaveBeenCalledTimes(1);
   });
 
+  it("renders inline create input with live validation against invalid names", () => {
+    const onCommit = vi.fn();
+    const onCancel = vi.fn();
+
+    render(
+      <LeftSidebar
+        {...defaultProps}
+        inlineAction={{
+          type: "create-note",
+          targetPath: "",
+          initialValue: "my-note.md",
+        }}
+        onCommitInlineAction={onCommit}
+        onCancelInlineAction={onCancel}
+      />
+    );
+
+    const input = screen.getByPlaceholderText("note-name") as HTMLInputElement;
+    expect(input).toBeInTheDocument();
+
+    // Type empty name
+    fireEvent.change(input, { target: { value: "   " } });
+    expect(screen.getByText("Name cannot be empty")).toBeInTheDocument();
+
+    // Type name with slash
+    fireEvent.change(input, { target: { value: "sub/folder" } });
+    expect(screen.getByText("Name cannot contain path separators (/ or \\)")).toBeInTheDocument();
+
+    // Type reserved system name
+    fireEvent.change(input, { target: { value: "CON" } });
+    expect(screen.getByText('"CON" is a reserved system name')).toBeInTheDocument();
+
+    // Type duplicate name
+    fireEvent.change(input, { target: { value: "daily.md" } });
+    expect(screen.getByText("An item with this name already exists in this folder")).toBeInTheDocument();
+
+    // Valid name
+    fireEvent.change(input, { target: { value: "brand-new-note.md" } });
+    expect(screen.queryByText("An item with this name already exists in this folder")).not.toBeInTheDocument();
+  });
+
   it("renders error state when error is passed", () => {
     render(
       <LeftSidebar
-        activeTab="tree"
-        onTabChange={() => {}}
+        {...defaultProps}
         treeData={[]}
         currentNotePath=""
-        onSelectNote={() => {}}
-        headings={[]}
         error="Permission denied accessing /secret"
       />
     );

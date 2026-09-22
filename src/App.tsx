@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { TitleBar, ViewMode } from './components/TitleBar';
-import { LeftSidebar, LeftTab } from './components/LeftSidebar';
+import { LeftSidebar, LeftTab, InlineActionState } from './components/LeftSidebar';
 import { CenterPane } from './components/CenterPane';
 import { RightSidebar } from './components/RightSidebar';
 import { StatusBar } from './components/StatusBar';
 import { CommandPalette } from './components/CommandPalette';
 import { DiffViewer } from './components/DiffViewer';
+import { Toast, ToastMessage } from './components/Toast';
+import { DeleteConfirmModal } from './components/DeleteConfirmModal';
 import {
   FIXTURE_NOTES,
   FIXTURE_WORKSPACE_NAME,
@@ -32,8 +34,9 @@ export const App: React.FC = () => {
   const [treeData, setTreeData] = useState<TreeNodeItem[]>([]);
   const [treeError, setTreeError] = useState<string | null>(null);
 
-  // Active note path & state
+  // Active note path & selected folder state
   const [currentNotePath, setCurrentNotePath] = useState<string>('');
+  const [selectedFolderPath, setSelectedFolderPath] = useState<string>('');
   const [noteState, setNoteState] = useState<Record<string, NoteFixture>>(FIXTURE_NOTES);
   const [noteFingerprints, setNoteFingerprints] = useState<Record<string, Fingerprint>>({});
   const [isDirty, setIsDirty] = useState(false);
@@ -50,6 +53,40 @@ export const App: React.FC = () => {
   // Navigation history
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
+
+  // Inline tree action state (create-note, create-folder, rename)
+  const [inlineAction, setInlineAction] = useState<InlineActionState | null>(null);
+
+  // Toast notifications
+  const [toasts, setToasts] = useState<ToastMessage[]>([]);
+
+  const showToast = useCallback(
+    (message: string, actionLabel?: string, onAction?: () => void, duration = 4000) => {
+      const id = 'toast-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6);
+      setToasts((prev) => [...prev, { id, message, actionLabel, onAction, duration }]);
+      if (duration > 0) {
+        setTimeout(() => {
+          setToasts((prev) => prev.filter((t) => t.id !== id));
+        }, duration);
+      }
+    },
+    []
+  );
+
+  const dismissToast = useCallback((id: string) => {
+    setToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  // Delete modal confirmation state
+  const [deleteModalState, setDeleteModalState] = useState<{
+    isOpen: boolean;
+    itemPath: string;
+    isFolder: boolean;
+  }>({
+    isOpen: false,
+    itemPath: '',
+    isFolder: false,
+  });
 
   // Autosave timer reference (400ms debounce)
   const autosaveTimerRef = useRef<NodeJS.Timeout | null>(null);
@@ -68,6 +105,17 @@ export const App: React.FC = () => {
       isDirty,
     };
   }, [currentNotePath, noteState, noteFingerprints, isDirty]);
+
+  // Refresh workspace tree helper
+  const refreshTree = useCallback(async () => {
+    try {
+      const tree = await api.workspaceTree(false);
+      setTreeData(tree);
+      setTreeError(null);
+    } catch (err: any) {
+      setTreeError(err?.message || String(err));
+    }
+  }, []);
 
   // Load note via IPC
   const loadNote = useCallback(async (path: string) => {
@@ -253,8 +301,238 @@ export const App: React.FC = () => {
     }
   }, [history, historyIndex, isDirty, loadNote, saveNote]);
 
-  // Register commands in registry per SPEC §9.3
+  // Action handlers for tree
+  const handleStartCreateNote = useCallback((parentFolder?: string) => {
+    setLeftSidebarVisible(true);
+    setLeftTab('tree');
+    const folder = parentFolder !== undefined ? parentFolder : selectedFolderPath;
+    setInlineAction({
+      type: 'create-note',
+      targetPath: folder,
+      initialValue: 'Untitled.md',
+    });
+  }, [selectedFolderPath]);
+
+  const handleStartCreateFolder = useCallback((parentFolder?: string) => {
+    setLeftSidebarVisible(true);
+    setLeftTab('tree');
+    const folder = parentFolder !== undefined ? parentFolder : selectedFolderPath;
+    setInlineAction({
+      type: 'create-folder',
+      targetPath: folder,
+      initialValue: 'new-folder',
+    });
+  }, [selectedFolderPath]);
+
+  const handleStartRename = useCallback((itemPath: string, currentName: string) => {
+    const isFolder = !itemPath.endsWith('.md') && !itemPath.endsWith('.markdown');
+    setInlineAction({
+      type: 'rename',
+      targetPath: itemPath,
+      initialValue: currentName,
+      isFolder,
+    });
+  }, []);
+
+  const handleCommitInlineAction = useCallback(async (name: string) => {
+    if (!inlineAction) return;
+
+    try {
+      if (inlineAction.type === 'create-note') {
+        const noteFileName = name.endsWith('.md') || name.endsWith('.markdown') ? name : `${name}.md`;
+        const relativePath = inlineAction.targetPath ? `${inlineAction.targetPath}/${noteFileName}` : noteFileName;
+        const stem = noteFileName.replace(/\.md$/, '');
+        const template = `# ${stem}\n\n`;
+
+        await api.noteCreate(relativePath, template);
+        await refreshTree();
+        setInlineAction(null);
+        await handleSelectNote(relativePath);
+        showToast(`Created note "${noteFileName}"`);
+      } else if (inlineAction.type === 'create-folder') {
+        const relativePath = inlineAction.targetPath ? `${inlineAction.targetPath}/${name}` : name;
+        await api.folderCreate(relativePath);
+        await refreshTree();
+        setInlineAction(null);
+        setSelectedFolderPath(relativePath);
+        showToast(`Created folder "${name}"`);
+      } else if (inlineAction.type === 'rename') {
+        const fromPath = inlineAction.targetPath;
+        const parentDir = fromPath.split('/').slice(0, -1).join('/');
+        const isFolder = inlineAction.isFolder;
+        const finalName = !isFolder && !name.endsWith('.md') && !name.endsWith('.markdown') ? `${name}.md` : name;
+        const toPath = parentDir ? `${parentDir}/${finalName}` : finalName;
+
+        if (fromPath !== toPath) {
+          await api.noteRename(fromPath, toPath);
+          await refreshTree();
+
+          // If currently viewing the renamed note, update current path
+          if (currentNotePath === fromPath) {
+            setCurrentNotePath(toPath);
+            await loadNote(toPath);
+          } else if (currentNotePath.startsWith(`${fromPath}/`)) {
+            // Note inside a renamed folder
+            const sub = currentNotePath.slice(fromPath.length);
+            const newCurrent = `${toPath}${sub}`;
+            setCurrentNotePath(newCurrent);
+            await loadNote(newCurrent);
+          }
+
+          showToast(`Renamed to "${finalName}"`);
+        }
+        setInlineAction(null);
+      }
+    } catch (err: any) {
+      showToast(`Error: ${err?.message || String(err)}`);
+    }
+  }, [currentNotePath, handleSelectNote, inlineAction, loadNote, refreshTree, showToast]);
+
+  const handleDuplicateNote = useCallback(async (itemPath: string) => {
+    try {
+      const meta = await api.noteDuplicate(itemPath);
+      await refreshTree();
+      await handleSelectNote(meta.path);
+      showToast(`Duplicated to "${meta.path.split('/').pop()}"`);
+    } catch (err: any) {
+      showToast(`Failed to duplicate: ${err?.message || String(err)}`);
+    }
+  }, [handleSelectNote, refreshTree, showToast]);
+
+  const handleDeleteItem = useCallback(async (itemPath: string, isFolder: boolean, permanent: boolean) => {
+    if (permanent) {
+      setDeleteModalState({
+        isOpen: true,
+        itemPath,
+        isFolder,
+      });
+      return;
+    }
+
+    // Default: OS Trash
+    try {
+      if (isFolder) {
+        await api.folderDelete(itemPath, false);
+      } else {
+        await api.noteDelete(itemPath, false);
+      }
+
+      await refreshTree();
+      if (currentNotePath === itemPath || currentNotePath.startsWith(`${itemPath}/`)) {
+        setCurrentNotePath('');
+      }
+      showToast(`Moved "${itemPath.split('/').pop()}" to Trash`);
+    } catch (err: any) {
+      showToast(`Delete failed: ${err?.message || String(err)}`);
+    }
+  }, [currentNotePath, refreshTree, showToast]);
+
+  const handleConfirmPermanentDelete = useCallback(async () => {
+    const { itemPath, isFolder } = deleteModalState;
+    setDeleteModalState({ isOpen: false, itemPath: '', isFolder: false });
+
+    try {
+      if (isFolder) {
+        await api.folderDelete(itemPath, true);
+      } else {
+        await api.noteDelete(itemPath, true);
+      }
+
+      await refreshTree();
+      if (currentNotePath === itemPath || currentNotePath.startsWith(`${itemPath}/`)) {
+        setCurrentNotePath('');
+      }
+      showToast(`Permanently deleted "${itemPath.split('/').pop()}"`);
+    } catch (err: any) {
+      showToast(`Permanent delete failed: ${err?.message || String(err)}`);
+    }
+  }, [currentNotePath, deleteModalState, refreshTree, showToast]);
+
+  const handleMoveItem = useCallback(async (fromPath: string, toParentFolder: string) => {
+    const itemName = fromPath.split('/').pop()!;
+    const toPath = toParentFolder ? `${toParentFolder}/${itemName}` : itemName;
+
+    try {
+      await api.noteRename(fromPath, toPath);
+      await refreshTree();
+
+      if (currentNotePath === fromPath) {
+        setCurrentNotePath(toPath);
+      } else if (currentNotePath.startsWith(`${fromPath}/`)) {
+        const sub = currentNotePath.slice(fromPath.length);
+        setCurrentNotePath(`${toPath}${sub}`);
+      }
+
+      // Show toast with undo affordance
+      const folderDisplayName = toParentFolder || 'workspace root';
+      showToast(
+        `Moved "${itemName}" to ${folderDisplayName}`,
+        'Undo',
+        async () => {
+          try {
+            await api.noteRename(toPath, fromPath);
+            await refreshTree();
+            if (currentNotePath === toPath) {
+              setCurrentNotePath(fromPath);
+            }
+            showToast(`Restored "${itemName}" to original location`);
+          } catch (undoErr: any) {
+            showToast(`Undo failed: ${undoErr?.message || String(undoErr)}`);
+          }
+        },
+        6000
+      );
+    } catch (err: any) {
+      showToast(`Failed to move: ${err?.message || String(err)}`);
+    }
+  }, [currentNotePath, refreshTree, showToast]);
+
+  const handleRevealInFileManager = useCallback(async (itemPath: string) => {
+    try {
+      await api.revealInFileManager(itemPath);
+    } catch (err: any) {
+      showToast(`Could not reveal in file manager: ${err?.message || String(err)}`);
+    }
+  }, [showToast]);
+
+  const handleCopyRelativePath = useCallback((itemPath: string) => {
+    navigator.clipboard.writeText(itemPath);
+    showToast(`Copied path "${itemPath}" to clipboard`);
+  }, [showToast]);
+
+  const handleCloseNote = useCallback(async () => {
+    if (isDirty) {
+      await saveNote(false);
+    }
+    setCurrentNotePath('');
+  }, [isDirty, saveNote]);
+
+  // Register commands in registry per SPEC §9.3 & M4
   useEffect(() => {
+    commandRegistry.register({
+      id: 'file.new_note',
+      title: 'New note',
+      shortcut: '⌘N',
+      shortcutDisplay: '⌘N',
+      handler: () => handleStartCreateNote(),
+    });
+
+    commandRegistry.register({
+      id: 'file.new_folder',
+      title: 'New folder',
+      shortcut: '⌘⇧N',
+      shortcutDisplay: '⌘⇧N',
+      handler: () => handleStartCreateFolder(),
+    });
+
+    commandRegistry.register({
+      id: 'file.close',
+      title: 'Close active note',
+      shortcut: '⌘W',
+      shortcutDisplay: '⌘W',
+      handler: () => handleCloseNote(),
+    });
+
     commandRegistry.register({
       id: 'palette.notes',
       title: 'Search notes by name',
@@ -325,16 +603,7 @@ export const App: React.FC = () => {
       title: 'Toggle light / dark theme',
       handler: () => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark')),
     });
-
-    commandRegistry.register({
-      id: 'dev.trigger_conflict_banner',
-      title: 'Trigger external-change conflict banner (demo)',
-      handler: () => {
-        setDiskVersionContent('# Disk Title\n\nExternal version changed on disk.');
-        setShowConflictBanner(true);
-      },
-    });
-  }, [cycleViewMode, saveNote]);
+  }, [cycleViewMode, handleCloseNote, handleStartCreateFolder, handleStartCreateNote, saveNote]);
 
   // Global keydown listeners
   useEffect(() => {
@@ -342,7 +611,16 @@ export const App: React.FC = () => {
       const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
       const mod = isMac ? e.metaKey : e.ctrlKey;
 
-      if (mod && e.key.toLowerCase() === 'p' && !e.shiftKey) {
+      if (mod && e.key.toLowerCase() === 'n' && !e.shiftKey) {
+        e.preventDefault();
+        handleStartCreateNote();
+      } else if (mod && e.key.toLowerCase() === 'n' && e.shiftKey) {
+        e.preventDefault();
+        handleStartCreateFolder();
+      } else if (mod && e.key.toLowerCase() === 'w') {
+        e.preventDefault();
+        handleCloseNote();
+      } else if (mod && e.key.toLowerCase() === 'p' && !e.shiftKey) {
         e.preventDefault();
         setPaletteMode('notes');
         setPaletteOpen(true);
@@ -377,7 +655,7 @@ export const App: React.FC = () => {
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [cycleViewMode, handleBack, handleForward, saveNote]);
+  }, [cycleViewMode, handleBack, handleCloseNote, handleForward, handleStartCreateFolder, handleStartCreateNote, saveNote]);
 
   const currentNote = currentNotePath
     ? noteState[currentNotePath] ||
@@ -461,9 +739,19 @@ export const App: React.FC = () => {
             headings={currentNote.headings}
             isEmpty={workspaceInfo.is_empty}
             error={treeError}
-            onCreateNote={() => {
-              handleSelectNote('projects/payments/settlement.md');
-            }}
+            selectedFolderPath={selectedFolderPath}
+            onSelectFolder={setSelectedFolderPath}
+            onCreateNote={handleStartCreateNote}
+            onCreateFolder={handleStartCreateFolder}
+            onRenameItem={handleStartRename}
+            onDuplicateNote={handleDuplicateNote}
+            onDeleteItem={handleDeleteItem}
+            onMoveItem={handleMoveItem}
+            onRevealInFileManager={handleRevealInFileManager}
+            onCopyRelativePath={handleCopyRelativePath}
+            inlineAction={inlineAction}
+            onCommitInlineAction={handleCommitInlineAction}
+            onCancelInlineAction={() => setInlineAction(null)}
           />
         )}
 
@@ -475,6 +763,7 @@ export const App: React.FC = () => {
           onSaveNow={() => saveNote(false)}
           onBlurSave={() => saveNote(false)}
           onNavigateRelative={handleSelectNote}
+          onCloseNote={handleCloseNote}
           showConflictBanner={showConflictBanner}
           onKeepVersion={() => {
             // Force overwrite on disk
@@ -525,6 +814,19 @@ export const App: React.FC = () => {
         onKeepVersion={() => saveNote(true)}
         onLoadFromDisk={() => loadNote(currentNotePath)}
       />
+
+      {/* Permanent Delete Confirmation Modal */}
+      <DeleteConfirmModal
+        isOpen={deleteModalState.isOpen}
+        itemName={deleteModalState.itemPath}
+        isFolder={deleteModalState.isFolder}
+        message={`Are you sure you want to permanently delete this ${deleteModalState.isFolder ? 'folder' : 'note'}? This action cannot be undone.`}
+        onConfirm={handleConfirmPermanentDelete}
+        onCancel={() => setDeleteModalState({ isOpen: false, itemPath: '', isFolder: false })}
+      />
+
+      {/* Toast Notification Container with Undo */}
+      <Toast toasts={toasts} onDismiss={dismissToast} />
     </div>
   );
 };

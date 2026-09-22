@@ -54,6 +54,12 @@ pub enum NoteError {
     Path(#[from] PathError),
     #[error("Note not found: {0}")]
     NotFound(String),
+    #[error("File or folder already exists: {0}")]
+    AlreadyExists(String),
+    #[error("Target is a directory, not a note: {0}")]
+    IsADirectory(String),
+    #[error("Target is a file, not a directory: {0}")]
+    NotADirectory(String),
     #[error("Conflict detected: note on disk was modified externally")]
     Conflict {
         expected: Option<Box<Fingerprint>>,
@@ -61,6 +67,8 @@ pub enum NoteError {
     },
     #[error("File is not a valid UTF-8 note: {0}")]
     EncodingError(String),
+    #[error("Failed to delete item: {0}")]
+    DeleteFailed(String),
     #[error("I/O error: {0}")]
     Io(String),
 }
@@ -582,6 +590,218 @@ pub fn write_note_atomic(
     compute_fingerprint(target_path, &posix, bytes)
 }
 
+/// Create a new note at the given safe path, optionally with template content (SPEC §11, M4).
+pub fn create_note(
+    _root: &Path,
+    safe_path: &SafePath,
+    template_content: Option<&str>,
+) -> Result<NoteMeta, NoteError> {
+    let abs_path = safe_path.as_path();
+    if abs_path.exists() {
+        return Err(NoteError::AlreadyExists(safe_path.to_posix_string()));
+    }
+
+    if let Some(parent) = abs_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| NoteError::Io(e.to_string()))?;
+        }
+    }
+
+    let initial_content = template_content.unwrap_or("");
+    fs::write(abs_path, initial_content.as_bytes()).map_err(|e| NoteError::Io(e.to_string()))?;
+
+    let posix = safe_path.to_posix_string();
+    let (front_matter_raw, _, tags) = parse_front_matter(initial_content);
+    let _ = front_matter_raw;
+    let title = resolve_note_title(initial_content, safe_path.as_relative_path());
+    let headings = extract_headings(initial_content);
+    let meta = fs::metadata(abs_path).map_err(|e| NoteError::Io(e.to_string()))?;
+    let modified_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    Ok(NoteMeta {
+        path: posix,
+        title,
+        size_bytes: meta.len(),
+        modified_ms,
+        headings,
+        tags,
+    })
+}
+
+/// Recursively copy a directory or file (used for cross-device moves).
+fn copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if src.is_dir() {
+        fs::create_dir_all(dst)?;
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let entry_path = entry.path();
+            let dest_child = dst.join(entry.file_name());
+            copy_recursive(&entry_path, &dest_child)?;
+        }
+    } else {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(src, dst)?;
+    }
+    Ok(())
+}
+
+/// Rename/move a note or folder with fallback to copy-and-remove on cross-device link errors (SPEC §11, M4).
+pub fn rename_path(
+    _root: &Path,
+    from_safe: &SafePath,
+    to_safe: &SafePath,
+) -> Result<(), NoteError> {
+    let from_abs = from_safe.as_path();
+    let to_abs = to_safe.as_path();
+
+    if !from_abs.exists() {
+        return Err(NoteError::NotFound(from_safe.to_posix_string()));
+    }
+    if to_abs.exists() {
+        return Err(NoteError::AlreadyExists(to_safe.to_posix_string()));
+    }
+
+    if let Some(parent) = to_abs.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| NoteError::Io(e.to_string()))?;
+        }
+    }
+
+    // Try standard fs::rename
+    match fs::rename(from_abs, to_abs) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Check for cross-device link error (EXDEV on Unix)
+            let is_cross_device = e.raw_os_error() == Some(18); // EXDEV is 18 on Linux/macOS
+            if is_cross_device {
+                copy_recursive(from_abs, to_abs).map_err(|err| NoteError::Io(err.to_string()))?;
+                if from_abs.is_dir() {
+                    fs::remove_dir_all(from_abs).map_err(|err| NoteError::Io(err.to_string()))?;
+                } else {
+                    fs::remove_file(from_abs).map_err(|err| NoteError::Io(err.to_string()))?;
+                }
+                Ok(())
+            } else {
+                Err(NoteError::Io(e.to_string()))
+            }
+        }
+    }
+}
+
+/// Duplicate an existing note, generating a non-colliding copy name (e.g. `<stem> 1.md` or `<stem> copy.md`).
+pub fn duplicate_note(
+    root: &Path,
+    safe_path: &SafePath,
+) -> Result<NoteMeta, NoteError> {
+    let abs_path = safe_path.as_path();
+    if !abs_path.exists() {
+        return Err(NoteError::NotFound(safe_path.to_posix_string()));
+    }
+    if abs_path.is_dir() {
+        return Err(NoteError::IsADirectory(safe_path.to_posix_string()));
+    }
+
+    let content = fs::read_to_string(abs_path).map_err(|e| NoteError::Io(e.to_string()))?;
+    let parent_rel = safe_path.as_relative_path().parent().unwrap_or_else(|| Path::new(""));
+    let stem = safe_path
+        .as_relative_path()
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("note");
+    let ext = safe_path
+        .as_relative_path()
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("md");
+
+    // Find next available duplicate name
+    let mut candidate_name = format!("{} 1.{}", stem, ext);
+    let mut candidate_rel = if parent_rel.as_os_str().is_empty() {
+        candidate_name.clone()
+    } else {
+        format!("{}/{}", to_posix_path(parent_rel), candidate_name)
+    };
+
+    let mut counter = 1;
+    while resolve_in_workspace(root, &candidate_rel).map(|p| p.exists()).unwrap_or(false) {
+        counter += 1;
+        candidate_name = format!("{} {}.{}", stem, counter, ext);
+        candidate_rel = if parent_rel.as_os_str().is_empty() {
+            candidate_name.clone()
+        } else {
+            format!("{}/{}", to_posix_path(parent_rel), candidate_name)
+        };
+    }
+
+    let target_safe = SafePath::resolve(root, &candidate_rel)?;
+    create_note(root, &target_safe, Some(&content))
+}
+
+/// Delete a file or note. If `permanent` is false, moves to OS trash (SPEC §10.3, M4).
+pub fn delete_path(
+    _root: &Path,
+    safe_path: &SafePath,
+    permanent: bool,
+) -> Result<(), NoteError> {
+    let abs_path = safe_path.as_path();
+    if !abs_path.exists() {
+        return Err(NoteError::NotFound(safe_path.to_posix_string()));
+    }
+
+    if permanent {
+        if abs_path.is_dir() {
+            fs::remove_dir_all(abs_path).map_err(|e| NoteError::Io(e.to_string()))?;
+        } else {
+            fs::remove_file(abs_path).map_err(|e| NoteError::Io(e.to_string()))?;
+        }
+    } else {
+        trash::delete(abs_path).map_err(|e| NoteError::DeleteFailed(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Create a new folder at the given safe path (SPEC §11, M4).
+pub fn create_folder(
+    _root: &Path,
+    safe_path: &SafePath,
+) -> Result<(), NoteError> {
+    let abs_path = safe_path.as_path();
+    if abs_path.exists() {
+        return Err(NoteError::AlreadyExists(safe_path.to_posix_string()));
+    }
+    fs::create_dir_all(abs_path).map_err(|e| NoteError::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Delete a folder. If `permanent` is false, moves to OS trash (SPEC §11, M4).
+pub fn delete_folder(
+    _root: &Path,
+    safe_path: &SafePath,
+    permanent: bool,
+) -> Result<(), NoteError> {
+    let abs_path = safe_path.as_path();
+    if !abs_path.exists() {
+        return Err(NoteError::NotFound(safe_path.to_posix_string()));
+    }
+    if !abs_path.is_dir() {
+        return Err(NoteError::NotADirectory(safe_path.to_posix_string()));
+    }
+
+    if permanent {
+        fs::remove_dir_all(abs_path).map_err(|e| NoteError::Io(e.to_string()))?;
+    } else {
+        trash::delete(abs_path).map_err(|e| NoteError::DeleteFailed(e.to_string()))?;
+    }
+    Ok(())
+}
+
 /// Resolve note title following SPEC §5.3:
 /// 1. YAML front-matter `title:`
 /// 2. First level-1 heading `# ...`
@@ -1067,6 +1287,113 @@ mod tests {
         let note = read_note(root, &large_path).unwrap();
         assert_eq!(note.content.len(), large_content.len());
         assert_eq!(note.meta.title, "Large Note");
+    }
+
+    #[test]
+    fn test_create_note_and_create_folder() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // 1. Create note in root
+        let note_path = SafePath::resolve(root, "my-note.md").unwrap();
+        let meta = create_note(root, &note_path, Some("# My Note\n\nBody text")).unwrap();
+        assert_eq!(meta.path, "my-note.md");
+        assert_eq!(meta.title, "My Note");
+        assert!(root.join("my-note.md").exists());
+
+        // Re-creating should fail with AlreadyExists
+        let err = create_note(root, &note_path, None);
+        assert!(matches!(err, Err(NoteError::AlreadyExists(_))));
+
+        // 2. Create nested note (auto-creates parent folder)
+        let nested_note = SafePath::resolve(root, "sub/dir/nested.md").unwrap();
+        let nested_meta = create_note(root, &nested_note, Some("---\ntitle: Nested\n---\n")).unwrap();
+        assert_eq!(nested_meta.title, "Nested");
+        assert!(root.join("sub/dir/nested.md").exists());
+
+        // 3. Create folder
+        let folder_path = SafePath::resolve(root, "my-folder").unwrap();
+        create_folder(root, &folder_path).unwrap();
+        assert!(root.join("my-folder").is_dir());
+
+        // Re-creating folder should fail with AlreadyExists
+        let err_folder = create_folder(root, &folder_path);
+        assert!(matches!(err_folder, Err(NoteError::AlreadyExists(_))));
+    }
+
+    #[test]
+    fn test_rename_and_move_note_and_folder() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Create initial note and folder
+        let from_note = SafePath::resolve(root, "original.md").unwrap();
+        create_note(root, &from_note, Some("# Content")).unwrap();
+
+        let to_note = SafePath::resolve(root, "renamed.md").unwrap();
+        rename_path(root, &from_note, &to_note).unwrap();
+        assert!(!root.join("original.md").exists());
+        assert!(root.join("renamed.md").exists());
+
+        // Move note into a subfolder
+        let folder = SafePath::resolve(root, "docs").unwrap();
+        create_folder(root, &folder).unwrap();
+
+        let moved_note = SafePath::resolve(root, "docs/renamed.md").unwrap();
+        rename_path(root, &to_note, &moved_note).unwrap();
+        assert!(!root.join("renamed.md").exists());
+        assert!(root.join("docs/renamed.md").exists());
+
+        // Rename folder
+        let renamed_folder = SafePath::resolve(root, "documentation").unwrap();
+        rename_path(root, &folder, &renamed_folder).unwrap();
+        assert!(!root.join("docs").exists());
+        assert!(root.join("documentation/renamed.md").exists());
+    }
+
+    #[test]
+    fn test_duplicate_note_naming() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let note = SafePath::resolve(root, "spec.md").unwrap();
+        create_note(root, &note, Some("# Spec Note")).unwrap();
+
+        // First duplicate -> spec 1.md
+        let dup1 = duplicate_note(root, &note).unwrap();
+        assert_eq!(dup1.path, "spec 1.md");
+        assert!(root.join("spec 1.md").exists());
+
+        // Second duplicate -> spec 2.md
+        let dup2 = duplicate_note(root, &note).unwrap();
+        assert_eq!(dup2.path, "spec 2.md");
+        assert!(root.join("spec 2.md").exists());
+
+        // Nested duplicate
+        let nested = SafePath::resolve(root, "nested/plan.md").unwrap();
+        create_note(root, &nested, Some("# Plan")).unwrap();
+        let dup_nested = duplicate_note(root, &nested).unwrap();
+        assert_eq!(dup_nested.path, "nested/plan 1.md");
+        assert!(root.join("nested/plan 1.md").exists());
+    }
+
+    #[test]
+    fn test_delete_path_and_folder_permanent() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let note = SafePath::resolve(root, "delete-me.md").unwrap();
+        create_note(root, &note, Some("Text")).unwrap();
+
+        delete_path(root, &note, true).unwrap();
+        assert!(!root.join("delete-me.md").exists());
+
+        let folder = SafePath::resolve(root, "delete-folder/sub").unwrap();
+        create_folder(root, &folder).unwrap();
+
+        let top_folder = SafePath::resolve(root, "delete-folder").unwrap();
+        delete_folder(root, &top_folder, true).unwrap();
+        assert!(!root.join("delete-folder").exists());
     }
 }
 

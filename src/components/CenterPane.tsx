@@ -17,6 +17,7 @@ export interface CenterPaneProps {
   onSaveNow?: () => void;
   onBlurSave?: () => void;
   onNavigateRelative: (target: string) => void;
+  onCloseNote?: () => void;
   showConflictBanner: boolean;
   onKeepVersion: () => void;
   onLoadFromDisk: () => void;
@@ -52,7 +53,7 @@ function handleListContinuation(view: EditorView): boolean {
   const line = state.doc.lineAt(state.selection.main.head);
   const text = line.text;
 
-  // Check for unordered list item (- , * , + ) or ordered list item (1. , 2. ) or task list (- [ ] )
+  // Check for task list (- [ ] )
   const taskMatch = text.match(/^(\s*)([-*+]\s+\[[ xX]\]\s+)(.*)$/);
   if (taskMatch) {
     const [, indent, , rest] = taskMatch;
@@ -67,6 +68,7 @@ function handleListContinuation(view: EditorView): boolean {
     return true;
   }
 
+  // Check for bullet list (- , * , + )
   const listMatch = text.match(/^(\s*)([-*+]\s+)(.*)$/);
   if (listMatch) {
     const [, indent, prefix, rest] = listMatch;
@@ -80,6 +82,7 @@ function handleListContinuation(view: EditorView): boolean {
     return true;
   }
 
+  // Check for numbered list (1. )
   const numMatch = text.match(/^(\s*)(\d+)\.\s+(.*)$/);
   if (numMatch) {
     const [, indent, numStr, rest] = numMatch;
@@ -127,6 +130,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   onSaveNow,
   onBlurSave,
   onNavigateRelative,
+  onCloseNote,
   showConflictBanner,
   onKeepVersion,
   onLoadFromDisk,
@@ -146,80 +150,113 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   const onBlurSaveRef = useRef(onBlurSave);
   onBlurSaveRef.current = onBlurSave;
 
+  // Track the note path currently loaded in the editor instance
+  const loadedNotePathRef = useRef<string>('');
+
   // Initialize CodeMirror 6 editor instance with full SPEC §8.2 extension suite
   useEffect(() => {
     if (!editorContainerRef.current) return;
+    if (!note.path) {
+      if (editorViewRef.current) {
+        editorViewRef.current.destroy();
+        editorViewRef.current = null;
+      }
+      loadedNotePathRef.current = '';
+      return;
+    }
 
-    const formattingKeymap = [
-      {
-        key: 'Mod-b',
-        run: (view: EditorView) => wrapSelection(view, '**', '**', 'bold text'),
-      },
-      {
-        key: 'Mod-i',
-        run: (view: EditorView) => wrapSelection(view, '*', '*', 'italic text'),
-      },
-      {
-        key: 'Mod-k',
-        run: (view: EditorView) => wrapSelection(view, '[', '](https://)', 'link text'),
-      },
-      {
-        key: 'Mod-s',
-        run: () => {
-          if (onSaveNowRef.current) {
-            onSaveNowRef.current();
-          }
-          return true;
+    // If switching to a new note, create/re-create editor
+    if (loadedNotePathRef.current !== note.path || !editorViewRef.current) {
+      if (editorViewRef.current) {
+        editorViewRef.current.destroy();
+      }
+
+      const formattingKeymap = [
+        {
+          key: 'Mod-b',
+          run: (view: EditorView) => wrapSelection(view, '**', '**', 'bold text'),
         },
-      },
-      {
-        key: 'Mod-f',
-        run: openSearchPanel,
-      },
-      {
-        key: 'Enter',
-        run: handleListContinuation,
-      },
-      {
-        key: 'Tab',
-        run: handleTabKey,
-      },
-    ];
-
-    const startState = EditorState.create({
-      doc: note.content,
-      extensions: [
-        history(),
-        bracketMatching(),
-        highlightActiveLine(),
-        EditorView.lineWrapping,
-        markdown(),
-        Prec.high(keymap.of(formattingKeymap)),
-        keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap]),
-        EditorView.updateListener.of((update) => {
-          if (update.docChanged) {
-            onContentChangeRef.current(update.state.doc.toString());
-          }
-          if (update.focusChanged && !update.view.hasFocus) {
-            if (onBlurSaveRef.current) {
-              onBlurSaveRef.current();
+        {
+          key: 'Mod-i',
+          run: (view: EditorView) => wrapSelection(view, '*', '*', 'italic text'),
+        },
+        {
+          key: 'Mod-k',
+          run: (view: EditorView) => wrapSelection(view, '[', '](https://)', 'link text'),
+        },
+        {
+          key: 'Mod-s',
+          run: () => {
+            if (onSaveNowRef.current) {
+              onSaveNowRef.current();
             }
-          }
-        }),
-      ],
-    });
+            return true;
+          },
+        },
+        {
+          key: 'Mod-f',
+          run: openSearchPanel,
+        },
+        {
+          key: 'Enter',
+          run: handleListContinuation,
+        },
+        {
+          key: 'Tab',
+          run: handleTabKey,
+        },
+      ];
 
-    const view = new EditorView({
-      state: startState,
-      parent: editorContainerRef.current,
-    });
+      const startState = EditorState.create({
+        doc: note.content,
+        extensions: [
+          history(),
+          bracketMatching(),
+          highlightActiveLine(),
+          EditorView.lineWrapping,
+          markdown(),
+          Prec.high(keymap.of(formattingKeymap)),
+          keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap]),
+          EditorView.updateListener.of((update) => {
+            if (update.docChanged) {
+              onContentChangeRef.current(update.state.doc.toString());
+            }
+            if (update.focusChanged && !update.view.hasFocus) {
+              if (onBlurSaveRef.current) {
+                onBlurSaveRef.current();
+              }
+            }
+          }),
+        ],
+      });
 
-    editorViewRef.current = view;
+      const view = new EditorView({
+        state: startState,
+        parent: editorContainerRef.current,
+      });
 
+      editorViewRef.current = view;
+      loadedNotePathRef.current = note.path;
+    } else {
+      // Same note: if external reload happened (e.g. disk load), synchronize if doc changed externally
+      const currentDoc = editorViewRef.current.state.doc.toString();
+      if (currentDoc !== note.content && !isDirty) {
+        editorViewRef.current.dispatch({
+          changes: { from: 0, to: currentDoc.length, insert: note.content },
+        });
+      }
+    }
+  }, [note.path, note.content, isDirty]);
+
+  // Clean up on unmount
+  useEffect(() => {
     return () => {
-      view.destroy();
+      if (editorViewRef.current) {
+        editorViewRef.current.destroy();
+        editorViewRef.current = null;
+      }
     };
-  }, [note.path, note.content]);
+  }, []);
 
   // Handle reader link clicks
   const handleReaderClick = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -253,6 +290,18 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
           {note.path || 'No note open'}
         </span>
         {note.path && <span className="text-[var(--faint)] text-[11px]">· {note.lastModifiedAgo}</span>}
+
+        {/* Close Note Tab Button */}
+        {note.path && (
+          <button
+            onClick={onCloseNote}
+            className="ml-1 p-0.5 rounded hover:bg-[var(--panel-2)] hover:text-[var(--text)] text-[var(--muted)] transition-colors text-xs flex items-center justify-center w-4 h-4"
+            title="Close tab (⌘W)"
+            aria-label="Close note"
+          >
+            ✕
+          </button>
+        )}
 
         {/* History navigation affordances */}
         <div className="ml-auto flex items-center gap-0.5">

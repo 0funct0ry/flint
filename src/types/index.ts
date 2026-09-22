@@ -25,6 +25,29 @@ export interface BacklinkGroup {
   occurrences: BacklinkOccurrence[];
 }
 
+export interface Fingerprint {
+  path: string;
+  size_bytes: number;
+  modified_ms: number;
+  content_hash: string;
+}
+
+export interface NoteMeta {
+  path: string;
+  title: string;
+  size_bytes: number;
+  modified_ms: number;
+  headings: HeadingItem[];
+  tags: string[];
+}
+
+export interface NoteContent {
+  content: string;
+  meta: NoteMeta;
+  fingerprint: Fingerprint;
+  front_matter_raw?: string | null;
+}
+
 export interface NoteFixture {
   path: string;
   title: string;

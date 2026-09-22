@@ -97,7 +97,12 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
       const isSelected = currentNotePath === item.path;
       const isFolder = item.is_folder;
       const isNote = Boolean(item.is_note);
-      const indentClass = depth === 0 ? '' : depth === 1 ? 'pl-[22px]' : depth === 2 ? 'pl-[36px]' : 'pl-[50px]';
+
+      // Icon colors and specific highlights matching the screenshot
+      const isGitIgnore = item.name === '.gitignore';
+      const isMarkdownDoc = item.name.endsWith('.md');
+      const isSpecialFolder = item.name === 'crates' || item.name === 'src';
+      const isGreenFolder = item.name === '.flint';
 
       return (
         <React.Fragment key={item.id}>
@@ -112,26 +117,96 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
                 onSelectNote(item.path);
               }
             }}
-            className={`flex items-center gap-1.5 h-6 px-2.5 text-[var(--text-2)] cursor-default whitespace-nowrap select-none hover:bg-[var(--panel-2)] transition-colors ${indentClass} ${
-              isSelected ? 'bg-[var(--sel)] text-[var(--text)] font-medium' : ''
-            } ${!isNote && !isFolder ? 'text-[var(--faint)]' : ''}`}
+            style={{ paddingLeft: `${depth * 14 + 10}px` }}
+            className={`group flex items-center gap-2 h-[26px] pr-2 text-[var(--text-2)] cursor-pointer whitespace-nowrap select-none rounded-[4px] mx-1 hover:bg-[var(--panel-2)] transition-colors ${
+              isSelected ? 'bg-[#2b3040] text-[#ffffff] font-medium' : ''
+            } ${!isNote && !isFolder ? 'text-[var(--text-2)] opacity-80' : ''}`}
           >
-            {/* Twisty arrow */}
-            <span className="w-3 text-[var(--faint)] text-[9px] text-center shrink-0">
-              {isFolder ? (isExpanded ? '▾' : '▸') : ''}
+            {/* Folder / File Icon (without caret) */}
+            <span className="w-4 h-4 flex items-center justify-center shrink-0">
+              {isFolder ? (
+                /* Clean outlined folder icon matching screenshot */
+                <svg
+                  width="15"
+                  height="15"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke={isExpanded ? 'var(--text)' : 'currentColor'}
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="opacity-80 group-hover:opacity-100"
+                >
+                  <path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.93a2 2 0 0 1-1.66-.9l-.82-1.2A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13c0 1.1.9 2 2 2Z" />
+                </svg>
+              ) : isGitIgnore ? (
+                /* Git branch / ignore icon */
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="opacity-85"
+                >
+                  <line x1="6" y1="3" x2="6" y2="15" />
+                  <circle cx="18" cy="6" r="3" />
+                  <circle cx="6" cy="18" r="3" />
+                  <path d="M18 9a9 9 0 0 1-9 9" />
+                </svg>
+              ) : isMarkdownDoc ? (
+                /* Book / Doc markdown icon */
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="opacity-85"
+                >
+                  <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z" />
+                  <path d="M6 6h10" />
+                  <path d="M6 10h10" />
+                </svg>
+              ) : (
+                /* Clean file outline */
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="opacity-60"
+                >
+                  <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z" />
+                  <polyline points="14 2 14 8 20 8" />
+                </svg>
+              )}
             </span>
 
-            {/* Glyph icon */}
+            {/* Name with subtle colors like in the screenshot */}
             <span
-              className={`w-[13px] shrink-0 text-xs ${
-                isSelected ? 'text-[var(--accent)]' : 'text-[var(--faint)]'
+              className={`truncate text-[13px] leading-none ${
+                isSpecialFolder
+                  ? 'text-[#f6c177]'
+                  : isGreenFolder
+                  ? 'text-[#a6da95]'
+                  : isSelected
+                  ? 'text-white'
+                  : 'text-[var(--text-2)] group-hover:text-[var(--text)]'
               }`}
             >
-              {isFolder ? '▤' : isNote ? '◦' : '◌'}
+              {item.name}
             </span>
-
-            {/* Name */}
-            <span className="truncate text-[12.5px]">{item.name}</span>
           </div>
 
           {isFolder && isExpanded && item.children && renderTree(item.children, depth + 1)}

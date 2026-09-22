@@ -1,8 +1,10 @@
 import React, { useEffect, useRef } from 'react';
-import { EditorState } from '@codemirror/state';
+import { EditorSelection, EditorState, Prec } from '@codemirror/state';
 import { EditorView, keymap, highlightActiveLine } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
+import { searchKeymap, openSearchPanel } from '@codemirror/search';
+import { bracketMatching } from '@codemirror/language';
 import { ViewMode } from './TitleBar';
 import { NoteFixture } from '../types';
 import { ConflictBanner } from './ConflictBanner';
@@ -12,6 +14,8 @@ export interface CenterPaneProps {
   viewMode: ViewMode;
   isDirty: boolean;
   onContentChange: (newContent: string) => void;
+  onSaveNow?: () => void;
+  onBlurSave?: () => void;
   onNavigateRelative: (target: string) => void;
   showConflictBanner: boolean;
   onKeepVersion: () => void;
@@ -21,11 +25,107 @@ export interface CenterPaneProps {
   onForward: () => void;
 }
 
+/**
+ * Format markdown selection helper for bold (**text**), italic (*text*), link ([text](url))
+ */
+function wrapSelection(view: EditorView, before: string, after: string, placeholder = '') {
+  const { state, dispatch } = view;
+  const changes = state.changeByRange((range) => {
+    const selected = state.sliceDoc(range.from, range.to) || placeholder;
+    const insert = `${before}${selected}${after}`;
+    return {
+      changes: { from: range.from, to: range.to, insert },
+      range: range.empty
+        ? EditorSelection.range(range.from + before.length, range.from + before.length + placeholder.length)
+        : EditorSelection.range(range.from, range.from + insert.length),
+    };
+  });
+  dispatch(changes);
+  return true;
+}
+
+/**
+ * Handle Markdown list continuation on Enter
+ */
+function handleListContinuation(view: EditorView): boolean {
+  const { state } = view;
+  const line = state.doc.lineAt(state.selection.main.head);
+  const text = line.text;
+
+  // Check for unordered list item (- , * , + ) or ordered list item (1. , 2. ) or task list (- [ ] )
+  const taskMatch = text.match(/^(\s*)([-*+]\s+\[[ xX]\]\s+)(.*)$/);
+  if (taskMatch) {
+    const [, indent, , rest] = taskMatch;
+    if (!rest.trim()) {
+      // Empty item -> remove prefix
+      view.dispatch({
+        changes: { from: line.from, to: line.to, insert: '' },
+      });
+      return true;
+    }
+    view.dispatch(state.replaceSelection(`\n${indent}- [ ] `));
+    return true;
+  }
+
+  const listMatch = text.match(/^(\s*)([-*+]\s+)(.*)$/);
+  if (listMatch) {
+    const [, indent, prefix, rest] = listMatch;
+    if (!rest.trim()) {
+      view.dispatch({
+        changes: { from: line.from, to: line.to, insert: '' },
+      });
+      return true;
+    }
+    view.dispatch(state.replaceSelection(`\n${indent}${prefix}`));
+    return true;
+  }
+
+  const numMatch = text.match(/^(\s*)(\d+)\.\s+(.*)$/);
+  if (numMatch) {
+    const [, indent, numStr, rest] = numMatch;
+    if (!rest.trim()) {
+      view.dispatch({
+        changes: { from: line.from, to: line.to, insert: '' },
+      });
+      return true;
+    }
+    const nextNum = parseInt(numStr, 10) + 1;
+    view.dispatch(state.replaceSelection(`\n${indent}${nextNum}. `));
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Table alignment helper on Tab key inside Markdown tables
+ */
+function handleTabKey(view: EditorView): boolean {
+  const { state } = view;
+  const line = state.doc.lineAt(state.selection.main.head);
+  if (line.text.trim().startsWith('|')) {
+    // Inside a markdown table row: jump to next pipe or insert aligned cell
+    const pos = state.selection.main.head;
+    const nextPipe = line.text.indexOf('|', pos - line.from);
+    if (nextPipe !== -1 && line.from + nextPipe + 2 <= line.to) {
+      view.dispatch({
+        selection: { anchor: line.from + nextPipe + 2 },
+      });
+      return true;
+    }
+  }
+  // Default tab insertion
+  view.dispatch(state.replaceSelection('  '));
+  return true;
+}
+
 export const CenterPane: React.FC<CenterPaneProps> = ({
   note,
   viewMode,
   isDirty,
   onContentChange,
+  onSaveNow,
+  onBlurSave,
   onNavigateRelative,
   showConflictBanner,
   onKeepVersion,
@@ -40,21 +140,70 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   const onContentChangeRef = useRef(onContentChange);
   onContentChangeRef.current = onContentChange;
 
-  // Initialize CodeMirror 6 editor instance
+  const onSaveNowRef = useRef(onSaveNow);
+  onSaveNowRef.current = onSaveNow;
+
+  const onBlurSaveRef = useRef(onBlurSave);
+  onBlurSaveRef.current = onBlurSave;
+
+  // Initialize CodeMirror 6 editor instance with full SPEC §8.2 extension suite
   useEffect(() => {
     if (!editorContainerRef.current) return;
+
+    const formattingKeymap = [
+      {
+        key: 'Mod-b',
+        run: (view: EditorView) => wrapSelection(view, '**', '**', 'bold text'),
+      },
+      {
+        key: 'Mod-i',
+        run: (view: EditorView) => wrapSelection(view, '*', '*', 'italic text'),
+      },
+      {
+        key: 'Mod-k',
+        run: (view: EditorView) => wrapSelection(view, '[', '](https://)', 'link text'),
+      },
+      {
+        key: 'Mod-s',
+        run: () => {
+          if (onSaveNowRef.current) {
+            onSaveNowRef.current();
+          }
+          return true;
+        },
+      },
+      {
+        key: 'Mod-f',
+        run: openSearchPanel,
+      },
+      {
+        key: 'Enter',
+        run: handleListContinuation,
+      },
+      {
+        key: 'Tab',
+        run: handleTabKey,
+      },
+    ];
 
     const startState = EditorState.create({
       doc: note.content,
       extensions: [
         history(),
-        keymap.of([...defaultKeymap, ...historyKeymap]),
-        markdown(),
+        bracketMatching(),
         highlightActiveLine(),
         EditorView.lineWrapping,
+        markdown(),
+        Prec.high(keymap.of(formattingKeymap)),
+        keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap]),
         EditorView.updateListener.of((update) => {
           if (update.docChanged) {
             onContentChangeRef.current(update.state.doc.toString());
+          }
+          if (update.focusChanged && !update.view.hasFocus) {
+            if (onBlurSaveRef.current) {
+              onBlurSaveRef.current();
+            }
           }
         }),
       ],
@@ -101,9 +250,9 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
 
         {/* Note path */}
         <span className="font-mono text-[11.5px] text-[var(--text-2)] truncate">
-          {note.path}
+          {note.path || 'No note open'}
         </span>
-        <span className="text-[var(--faint)] text-[11px]">· {note.lastModifiedAgo}</span>
+        {note.path && <span className="text-[var(--faint)] text-[11px]">· {note.lastModifiedAgo}</span>}
 
         {/* History navigation affordances */}
         <div className="ml-auto flex items-center gap-0.5">
@@ -139,23 +288,34 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       />
 
       {/* Center View Area (Edit, Read, or Split) */}
-      <div className="flex-1 flex min-h-0">
-        {/* CodeMirror Editor Pane */}
-        {(viewMode === 'edit' || viewMode === 'split') && (
+      {!note.path ? (
+        <div className="flex-1 flex flex-col items-center justify-center text-center p-6 bg-[var(--canvas)]">
+          <div className="text-sm font-medium text-[var(--muted)] mb-2">No note selected</div>
+          <div className="text-xs text-[var(--faint)]">Select a note from the sidebar or press ⌘P to open one.</div>
+        </div>
+      ) : (
+        <div className="flex-1 flex min-h-0">
+          {/* CodeMirror Editor Pane: Always mounted, styled according to viewMode */}
           <div
             className={`h-full min-w-0 overflow-auto ${
-              viewMode === 'split' ? 'w-1/2 border-r border-[var(--border)]' : 'w-full'
+              viewMode === 'edit'
+                ? 'w-full block'
+                : viewMode === 'split'
+                ? 'w-1/2 border-r border-[var(--border)] block'
+                : 'hidden'
             }`}
           >
             <div ref={editorContainerRef} className="h-full" />
           </div>
-        )}
 
-        {/* Pre-baked Reader Pane */}
-        {(viewMode === 'read' || viewMode === 'split') && (
+          {/* Reader Pane: Mounted and toggled via CSS */}
           <div
             className={`h-full min-w-0 overflow-auto bg-[var(--canvas)] ${
-              viewMode === 'split' ? 'w-1/2' : 'w-full'
+              viewMode === 'read'
+                ? 'w-full block'
+                : viewMode === 'split'
+                ? 'w-1/2 block'
+                : 'hidden'
             }`}
             onClick={handleReaderClick}
           >
@@ -164,8 +324,8 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
               dangerouslySetInnerHTML={{ __html: note.renderedHtml }}
             />
           </div>
-        )}
-      </div>
+        </div>
+      )}
     </main>
   );
 };

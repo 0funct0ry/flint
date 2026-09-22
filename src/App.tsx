@@ -1,18 +1,20 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { TitleBar, ViewMode } from './components/TitleBar';
 import { LeftSidebar, LeftTab } from './components/LeftSidebar';
 import { CenterPane } from './components/CenterPane';
 import { RightSidebar } from './components/RightSidebar';
 import { StatusBar } from './components/StatusBar';
 import { CommandPalette } from './components/CommandPalette';
+import { DiffViewer } from './components/DiffViewer';
 import {
   FIXTURE_NOTES,
   FIXTURE_WORKSPACE_NAME,
   FIXTURE_ROOT_PATH,
 } from './fixtures/workspace';
 import { commandRegistry } from './commands/registry';
-import { TreeNodeItem, WorkspaceInfo } from './types';
+import { Fingerprint, NoteContent, NoteFixture, TreeNodeItem, WorkspaceInfo } from './types';
 import { api } from './services/ipc';
+import { renderMarkdownToHtml } from './services/markdown';
 
 export const App: React.FC = () => {
   const [theme, setTheme] = useState<'light' | 'dark'>('dark');
@@ -30,23 +32,128 @@ export const App: React.FC = () => {
   const [treeData, setTreeData] = useState<TreeNodeItem[]>([]);
   const [treeError, setTreeError] = useState<string | null>(null);
 
-  // Active note state
-  const [currentNotePath, setCurrentNotePath] = useState<string>(
-    'projects/payments/settlement.md'
-  );
-  const [noteState, setNoteState] = useState(FIXTURE_NOTES);
+  // Active note path & state
+  const [currentNotePath, setCurrentNotePath] = useState<string>('');
+  const [noteState, setNoteState] = useState<Record<string, NoteFixture>>(FIXTURE_NOTES);
+  const [noteFingerprints, setNoteFingerprints] = useState<Record<string, Fingerprint>>({});
   const [isDirty, setIsDirty] = useState(false);
+
+  // Conflict handling state
   const [showConflictBanner, setShowConflictBanner] = useState(false);
+  const [diskVersionContent, setDiskVersionContent] = useState<string>('');
+  const [diffViewerOpen, setDiffViewerOpen] = useState(false);
 
   // Palette modal state
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteMode, setPaletteMode] = useState<'notes' | 'commands'>('notes');
 
   // Navigation history
-  const [history, setHistory] = useState<string[]>([currentNotePath]);
-  const [historyIndex, setHistoryIndex] = useState(0);
+  const [history, setHistory] = useState<string[]>([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
 
-  // Load workspace and tree from real IPC on mount
+  // Autosave timer reference (400ms debounce)
+  const autosaveTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const currentNoteRef = useRef<{ path: string; content: string; fingerprint?: Fingerprint; isDirty: boolean }>({
+    path: currentNotePath,
+    content: noteState[currentNotePath]?.content || '',
+    fingerprint: noteFingerprints[currentNotePath],
+    isDirty: false,
+  });
+
+  useEffect(() => {
+    currentNoteRef.current = {
+      path: currentNotePath,
+      content: noteState[currentNotePath]?.content || '',
+      fingerprint: noteFingerprints[currentNotePath],
+      isDirty,
+    };
+  }, [currentNotePath, noteState, noteFingerprints, isDirty]);
+
+  // Load note via IPC
+  const loadNote = useCallback(async (path: string) => {
+    if (!path) return;
+    try {
+      const noteContent: NoteContent = await api.noteRead(path);
+      setNoteFingerprints((prev) => ({
+        ...prev,
+        [path]: noteContent.fingerprint,
+      }));
+
+      const renderedHtml = renderMarkdownToHtml(noteContent.content);
+
+      setNoteState((prev) => {
+        const existing = prev[path] || FIXTURE_NOTES[path] || {
+          path,
+          title: noteContent.meta.title,
+          folder: path.split('/').slice(0, -1).join('/'),
+          tags: noteContent.meta.tags,
+          content: noteContent.content,
+          renderedHtml,
+          headings: noteContent.meta.headings,
+          outgoingLinks: [],
+          backlinks: [],
+          lastModifiedAgo: 'just now',
+        };
+
+        return {
+          ...prev,
+          [path]: {
+            ...existing,
+            title: noteContent.meta.title,
+            tags: noteContent.meta.tags,
+            headings: noteContent.meta.headings,
+            content: noteContent.content,
+            renderedHtml,
+          },
+        };
+      });
+
+      setIsDirty(false);
+      setShowConflictBanner(false);
+    } catch (err) {
+      console.warn(`Failed to read note ${path}:`, err);
+    }
+  }, []);
+
+  // Save note via IPC
+  const saveNote = useCallback(
+    async (force = false) => {
+      const { path, content, fingerprint, isDirty: dirty } = currentNoteRef.current;
+      if (!path || (!dirty && !force)) return;
+
+      try {
+        const newFingerprint = await api.noteWrite(
+          path,
+          content,
+          force ? undefined : fingerprint
+        );
+
+        setNoteFingerprints((prev) => ({
+          ...prev,
+          [path]: newFingerprint,
+        }));
+        setIsDirty(false);
+        setShowConflictBanner(false);
+      } catch (err: any) {
+        const errMsg = err?.message || String(err);
+        if (errMsg.toLowerCase().includes('conflict')) {
+          // Note changed on disk externally
+          setShowConflictBanner(true);
+          try {
+            const diskNote = await api.noteRead(path);
+            setDiskVersionContent(diskNote.content);
+          } catch {
+            setDiskVersionContent('');
+          }
+        } else {
+          console.error(`Error saving note ${path}:`, err);
+        }
+      }
+    },
+    []
+  );
+
+  // Load workspace and tree from real IPC once on mount
   useEffect(() => {
     let mounted = true;
 
@@ -74,11 +181,24 @@ export const App: React.FC = () => {
     };
   }, []);
 
+  // Window blur / beforeunload save
+  useEffect(() => {
+    const handleBlur = () => {
+      saveNote(false);
+    };
+
+    window.addEventListener('blur', handleBlur);
+    window.addEventListener('beforeunload', handleBlur);
+    return () => {
+      window.removeEventListener('blur', handleBlur);
+      window.removeEventListener('beforeunload', handleBlur);
+    };
+  }, [saveNote]);
+
   // Apply theme to html root
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
-
 
   // Mode cycle helper (⌘E)
   const cycleViewMode = useCallback(() => {
@@ -91,34 +211,47 @@ export const App: React.FC = () => {
 
   // Note selection
   const handleSelectNote = useCallback(
-    (path: string) => {
+    async (path: string) => {
       if (path === currentNotePath) return;
-      if (noteState[path]) {
-        setCurrentNotePath(path);
-        setHistory((prev) => [...prev.slice(0, historyIndex + 1), path]);
-        setHistoryIndex((prev) => prev + 1);
-        setIsDirty(false);
+
+      // Save previous note if dirty before navigating
+      if (isDirty) {
+        await saveNote(false);
       }
+
+      setCurrentNotePath(path);
+      setHistory((prev) => [...prev.slice(0, historyIndex + 1), path]);
+      setHistoryIndex((prev) => prev + 1);
+
+      await loadNote(path);
     },
-    [currentNotePath, historyIndex, noteState]
+    [currentNotePath, historyIndex, isDirty, loadNote, saveNote]
   );
 
   // History back / forward
-  const handleBack = useCallback(() => {
+  const handleBack = useCallback(async () => {
     if (historyIndex > 0) {
+      if (isDirty) {
+        await saveNote(false);
+      }
       const target = history[historyIndex - 1];
       setHistoryIndex(historyIndex - 1);
       setCurrentNotePath(target);
+      await loadNote(target);
     }
-  }, [history, historyIndex]);
+  }, [history, historyIndex, isDirty, loadNote, saveNote]);
 
-  const handleForward = useCallback(() => {
+  const handleForward = useCallback(async () => {
     if (historyIndex < history.length - 1) {
+      if (isDirty) {
+        await saveNote(false);
+      }
       const target = history[historyIndex + 1];
       setHistoryIndex(historyIndex + 1);
       setCurrentNotePath(target);
+      await loadNote(target);
     }
-  }, [history, historyIndex]);
+  }, [history, historyIndex, isDirty, loadNote, saveNote]);
 
   // Register commands in registry per SPEC §9.3
   useEffect(() => {
@@ -156,6 +289,14 @@ export const App: React.FC = () => {
     });
 
     commandRegistry.register({
+      id: 'file.save',
+      title: 'Save note now',
+      shortcut: '⌘S',
+      shortcutDisplay: '⌘S',
+      handler: () => saveNote(false),
+    });
+
+    commandRegistry.register({
       id: 'view.cycle_mode',
       title: 'Cycle view mode (edit / read / split)',
       shortcut: '⌘E',
@@ -187,10 +328,13 @@ export const App: React.FC = () => {
 
     commandRegistry.register({
       id: 'dev.trigger_conflict_banner',
-      title: 'Trigger external-change conflict banner (fixture demo)',
-      handler: () => setShowConflictBanner(true),
+      title: 'Trigger external-change conflict banner (demo)',
+      handler: () => {
+        setDiskVersionContent('# Disk Title\n\nExternal version changed on disk.');
+        setShowConflictBanner(true);
+      },
     });
-  }, [cycleViewMode]);
+  }, [cycleViewMode, saveNote]);
 
   // Global keydown listeners
   useEffect(() => {
@@ -227,29 +371,65 @@ export const App: React.FC = () => {
         handleForward();
       } else if (mod && e.key.toLowerCase() === 's') {
         e.preventDefault();
-        setIsDirty(false);
+        saveNote(false);
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [cycleViewMode, handleBack, handleForward]);
+  }, [cycleViewMode, handleBack, handleForward, saveNote]);
 
-  const currentNote =
-    noteState[currentNotePath] || noteState['projects/payments/settlement.md'];
+  const currentNote = currentNotePath
+    ? noteState[currentNotePath] ||
+      FIXTURE_NOTES[currentNotePath] || {
+        path: currentNotePath,
+        title: currentNotePath.split('/').pop()?.replace(/\.md$/, '') || 'Untitled',
+        folder: currentNotePath.split('/').slice(0, -1).join('/'),
+        tags: [],
+        content: '',
+        headings: [],
+        outgoingLinks: [],
+        backlinks: [],
+        renderedHtml: '',
+        lastModifiedAgo: 'just now',
+      }
+    : {
+        path: '',
+        title: '',
+        folder: '',
+        tags: [],
+        content: '',
+        headings: [],
+        outgoingLinks: [],
+        backlinks: [],
+        renderedHtml: '',
+        lastModifiedAgo: '',
+      };
 
-  const breadcrumb = `${workspaceInfo.name}/${currentNotePath.replace(/^projects\//, '')}`;
+  const breadcrumb = currentNotePath
+    ? `${workspaceInfo.name}/${currentNotePath.replace(/^projects\//, '')}`
+    : workspaceInfo.name;
 
-  // Content change handler
+  // Content change handler with 400ms debounced autosave
   const handleContentChange = (newContent: string) => {
     setIsDirty(true);
+    const renderedHtml = renderMarkdownToHtml(newContent);
     setNoteState((prev) => ({
       ...prev,
       [currentNotePath]: {
         ...prev[currentNotePath],
         content: newContent,
+        renderedHtml,
       },
     }));
+
+    // Debounce autosave 400ms
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+    }
+    autosaveTimerRef.current = setTimeout(() => {
+      saveNote(false);
+    }, 400);
   };
 
   return (
@@ -282,7 +462,6 @@ export const App: React.FC = () => {
             isEmpty={workspaceInfo.is_empty}
             error={treeError}
             onCreateNote={() => {
-              // Placeholder for note creation trigger
               handleSelectNote('projects/payments/settlement.md');
             }}
           />
@@ -293,16 +472,20 @@ export const App: React.FC = () => {
           viewMode={viewMode}
           isDirty={isDirty}
           onContentChange={handleContentChange}
+          onSaveNow={() => saveNote(false)}
+          onBlurSave={() => saveNote(false)}
           onNavigateRelative={handleSelectNote}
           showConflictBanner={showConflictBanner}
-          onKeepVersion={() => setShowConflictBanner(false)}
+          onKeepVersion={() => {
+            // Force overwrite on disk
+            saveNote(true);
+          }}
           onLoadFromDisk={() => {
-            setShowConflictBanner(false);
-            setIsDirty(false);
+            // Reload note from disk discarding buffer
+            loadNote(currentNotePath);
           }}
           onShowDifferences={() => {
-            alert('Diff view: External version differs from buffer.');
-            setShowConflictBanner(false);
+            setDiffViewerOpen(true);
           }}
           onBack={handleBack}
           onForward={handleForward}
@@ -331,6 +514,18 @@ export const App: React.FC = () => {
         onSelectNote={handleSelectNote}
         initialMode={paletteMode}
       />
+
+      {/* Conflict Diff Viewer */}
+      <DiffViewer
+        isOpen={diffViewerOpen}
+        onClose={() => setDiffViewerOpen(false)}
+        notePath={currentNotePath}
+        bufferContent={currentNote.content}
+        diskContent={diskVersionContent}
+        onKeepVersion={() => saveNote(true)}
+        onLoadFromDisk={() => loadNote(currentNotePath)}
+      />
     </div>
   );
 };
+

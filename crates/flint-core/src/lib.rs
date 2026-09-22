@@ -29,6 +29,42 @@ pub struct HeadingItem {
     pub anchor: String,
 }
 
+/// A fingerprint of a note on disk for safe concurrent edit conflict detection (SPEC §8.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fingerprint {
+    pub path: NotePath,
+    pub size_bytes: u64,
+    pub modified_ms: u64,
+    pub content_hash: String,
+}
+
+/// The loaded content, metadata, and fingerprint of a note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoteContent {
+    pub content: String,
+    pub meta: NoteMeta,
+    pub fingerprint: Fingerprint,
+    pub front_matter_raw: Option<String>,
+}
+
+/// Error type for note reading and writing operations.
+#[derive(Debug, thiserror::Error, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub enum NoteError {
+    #[error("Path error: {0}")]
+    Path(#[from] PathError),
+    #[error("Note not found: {0}")]
+    NotFound(String),
+    #[error("Conflict detected: note on disk was modified externally")]
+    Conflict {
+        expected: Option<Box<Fingerprint>>,
+        actual: Option<Box<Fingerprint>>,
+    },
+    #[error("File is not a valid UTF-8 note: {0}")]
+    EncodingError(String),
+    #[error("I/O error: {0}")]
+    Io(String),
+}
+
 /// A link from a source note pointing to a target note or external URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
@@ -270,6 +306,280 @@ pub fn is_note_path(path: &Path) -> bool {
     } else {
         false
     }
+}
+
+/// Parse YAML front matter and body separation.
+/// If front matter exists at byte 0 (`---`), returns `(Some(raw_front_matter), body, tags)`.
+pub fn parse_front_matter(content: &str) -> (Option<String>, &str, Vec<String>) {
+    if let Some(rest) = content
+        .strip_prefix("---\n")
+        .or_else(|| content.strip_prefix("---\r\n"))
+    {
+        if let Some(end_idx) = rest.find("\n---").or_else(|| rest.find("\r\n---")) {
+            let raw_fm = &rest[..end_idx];
+            let after_end = &rest[end_idx..];
+            let body = if let Some(b) = after_end.strip_prefix("\n---\n") {
+                b
+            } else if let Some(b) = after_end.strip_prefix("\n---\r\n") {
+                b
+            } else if let Some(b) = after_end.strip_prefix("\r\n---\r\n") {
+                b
+            } else if let Some(b) = after_end.strip_prefix("\r\n---\n") {
+                b
+            } else if let Some(b) = after_end.strip_prefix("\n---") {
+                b
+            } else if let Some(b) = after_end.strip_prefix("\r\n---") {
+                b
+            } else {
+                after_end
+            };
+
+            // Parse tags from front-matter
+            let mut tags = Vec::new();
+            let mut in_tags_list = false;
+            for line in raw_fm.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("tags:") {
+                    let val = trimmed.strip_prefix("tags:").unwrap().trim();
+                    if val.starts_with('[') && val.ends_with(']') {
+                        let inner = &val[1..val.len() - 1];
+                        for item in inner.split(',') {
+                            let t = item.trim().trim_matches('"').trim_matches('\'').trim();
+                            if !t.is_empty() {
+                                tags.push(t.to_string());
+                            }
+                        }
+                    } else if val.is_empty() {
+                        in_tags_list = true;
+                    } else {
+                        tags.push(val.to_string());
+                    }
+                } else if in_tags_list {
+                    if let Some(t) = trimmed.strip_prefix("- ") {
+                        let tag = t.trim().trim_matches('"').trim_matches('\'').trim();
+                        if !tag.is_empty() {
+                            tags.push(tag.to_string());
+                        }
+                    } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                        in_tags_list = false;
+                    }
+                }
+            }
+
+            return (Some(raw_fm.to_string()), body, tags);
+        }
+    }
+    (None, content, Vec::new())
+}
+
+/// Extract heading outline from note Markdown content.
+pub fn extract_headings(content: &str) -> Vec<HeadingItem> {
+    let mut headings = Vec::new();
+    let mut in_code_block = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix('#') {
+            let mut level = 1u8;
+            let mut chars = rest.chars();
+            while let Some(c) = chars.next() {
+                if c == '#' {
+                    level += 1;
+                    if level > 6 {
+                        break;
+                    }
+                } else if c.is_whitespace() {
+                    let text = chars.as_str().trim();
+                    if !text.is_empty() {
+                        // Generate slug anchor
+                        let anchor = text
+                            .to_lowercase()
+                            .chars()
+                            .map(|ch| if ch.is_alphanumeric() { ch } else { '-' })
+                            .collect::<String>()
+                            .split('-')
+                            .filter(|s| !s.is_empty())
+                            .collect::<Vec<_>>()
+                            .join("-");
+
+                        headings.push(HeadingItem {
+                            level,
+                            text: text.to_string(),
+                            anchor,
+                        });
+                    }
+                    break;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    headings
+}
+
+/// Fast simple 64-bit hash (FNV-1a) formatted as hex string.
+fn hash_bytes(bytes: &[u8]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", hash)
+}
+
+/// Compute a note fingerprint from its metadata and raw content bytes.
+pub fn compute_fingerprint(
+    file_path: &Path,
+    posix_path: &str,
+    content_bytes: &[u8],
+) -> Result<Fingerprint, NoteError> {
+    let (size_bytes, modified_ms) = if file_path.exists() {
+        let meta = fs::metadata(file_path).map_err(|e| NoteError::Io(e.to_string()))?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        (meta.len(), mtime)
+    } else {
+        (content_bytes.len() as u64, 0)
+    };
+
+    Ok(Fingerprint {
+        path: posix_path.to_string(),
+        size_bytes,
+        modified_ms,
+        content_hash: hash_bytes(content_bytes),
+    })
+}
+
+/// Read note content and metadata safely using the path guard (SPEC §8.3, §11).
+pub fn read_note(_root: &Path, safe_path: &SafePath) -> Result<NoteContent, NoteError> {
+    let abs_path = safe_path.as_path();
+    if !abs_path.exists() {
+        return Err(NoteError::NotFound(safe_path.to_posix_string()));
+    }
+
+    let bytes = fs::read(abs_path).map_err(|e| NoteError::Io(e.to_string()))?;
+    let content =
+        String::from_utf8(bytes.clone()).map_err(|e| NoteError::EncodingError(e.to_string()))?;
+
+    let posix = safe_path.to_posix_string();
+    let fingerprint = compute_fingerprint(abs_path, &posix, &bytes)?;
+
+    let (front_matter_raw, _, tags) = parse_front_matter(&content);
+    let title = resolve_note_title(&content, safe_path.as_relative_path());
+    let headings = extract_headings(&content);
+
+    let meta = NoteMeta {
+        path: posix,
+        title,
+        size_bytes: fingerprint.size_bytes,
+        modified_ms: fingerprint.modified_ms,
+        headings,
+        tags,
+    };
+
+    Ok(NoteContent {
+        content,
+        meta,
+        fingerprint,
+        front_matter_raw,
+    })
+}
+
+/// Atomically write note content to disk with fingerprint conflict detection (SPEC §8.3, §10.3).
+///
+/// Steps:
+/// 1. If file already exists and `expected_fingerprint` is provided, compare current on-disk state
+///    with `expected_fingerprint`. If different, return `NoteError::Conflict`.
+/// 2. Write to `<filename>.flint-tmp` in the same directory.
+/// 3. Call `sync_all()` (`fsync`).
+/// 4. Rename temp file to target file atomically.
+/// 5. Return the new `Fingerprint`.
+pub fn write_note_atomic(
+    root: &Path,
+    safe_path: &SafePath,
+    new_content: &str,
+    expected_fingerprint: Option<&Fingerprint>,
+) -> Result<Fingerprint, NoteError> {
+    let _ = root;
+    let target_path = safe_path.as_path();
+    let posix = safe_path.to_posix_string();
+
+    // Check for conflict if expected fingerprint provided
+    if let Some(expected) = expected_fingerprint {
+        if target_path.exists() {
+            let current_bytes = fs::read(target_path).map_err(|e| NoteError::Io(e.to_string()))?;
+            let current_fp = compute_fingerprint(target_path, &posix, &current_bytes)?;
+
+            // If hash or size or modified timestamp differs from expected
+            if current_fp.content_hash != expected.content_hash {
+                return Err(NoteError::Conflict {
+                    expected: Some(Box::new(expected.clone())),
+                    actual: Some(Box::new(current_fp)),
+                });
+            }
+        } else {
+            // File was deleted on disk externally
+            return Err(NoteError::Conflict {
+                expected: Some(Box::new(expected.clone())),
+                actual: None,
+            });
+        }
+    }
+
+    // Ensure parent directory exists
+    if let Some(parent) = target_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| NoteError::Io(e.to_string()))?;
+        }
+    }
+
+    // Atomic write pattern: write to temp file in same dir, fsync, rename
+    let file_name = target_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("note.md");
+    let temp_name = format!("{}.flint-tmp", file_name);
+    let temp_path = match target_path.parent() {
+        Some(p) => p.join(temp_name),
+        None => target_path.with_file_name(temp_name),
+    };
+
+    {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_path)
+            .map_err(|e| NoteError::Io(e.to_string()))?;
+
+        file.write_all(new_content.as_bytes())
+            .map_err(|e| NoteError::Io(e.to_string()))?;
+        file.sync_all().map_err(|e| NoteError::Io(e.to_string()))?;
+    }
+
+    // Rename temp file to target
+    fs::rename(&temp_path, target_path).map_err(|e| {
+        let _ = fs::remove_file(&temp_path);
+        NoteError::Io(e.to_string())
+    })?;
+
+    // Compute updated fingerprint
+    let bytes = new_content.as_bytes();
+    compute_fingerprint(target_path, &posix, bytes)
 }
 
 /// Resolve note title following SPEC §5.3:
@@ -658,6 +968,105 @@ mod tests {
         // Tree with non-notes
         let tree_with_all = build_workspace_tree(root, true).unwrap();
         assert_eq!(tree_with_all.len(), 3); // projects/, daily.md, LICENSE
+    }
+
+    #[test]
+    fn test_note_read_and_write_atomic_and_fingerprint() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let safe_path = SafePath::resolve(root, "notes/test.md").unwrap();
+        let initial_content = "---\ntitle: Safe Note\nauthor: Alice\ncustom_field: preserve_me\ntags: [tag1, tag2]\n---\n# Safe Note\n\nContent here.\n";
+
+        // Initial write
+        let fp1 = write_note_atomic(root, &safe_path, initial_content, None).unwrap();
+        assert_eq!(fp1.path, "notes/test.md");
+        assert!(fp1.size_bytes > 0);
+
+        // Read note
+        let note = read_note(root, &safe_path).unwrap();
+        assert_eq!(note.content, initial_content);
+        assert_eq!(note.meta.title, "Safe Note");
+        assert_eq!(note.meta.tags, vec!["tag1".to_string(), "tag2".to_string()]);
+        assert_eq!(note.meta.headings.len(), 1);
+        assert_eq!(note.meta.headings[0].text, "Safe Note");
+        assert_eq!(note.fingerprint.content_hash, fp1.content_hash);
+        assert!(note.front_matter_raw.is_some());
+        assert!(note
+            .front_matter_raw
+            .unwrap()
+            .contains("custom_field: preserve_me"));
+
+        // Valid edit with expected fingerprint
+        let edited_content = "---\ntitle: Safe Note\nauthor: Alice\ncustom_field: preserve_me\ntags: [tag1, tag2]\n---\n# Safe Note\n\nUpdated content!\n";
+        let fp2 = write_note_atomic(root, &safe_path, edited_content, Some(&fp1)).unwrap();
+        assert_ne!(fp1.content_hash, fp2.content_hash);
+
+        // External change conflict detection:
+        // Attempting to save with outdated fp1 should fail with Conflict error
+        let conflict_content = "Attempted overwrite with stale fingerprint";
+        let err = write_note_atomic(root, &safe_path, conflict_content, Some(&fp1));
+        assert!(matches!(err, Err(NoteError::Conflict { .. })));
+
+        // Attempting to save with expected fingerprint on deleted file should also fail
+        fs::remove_file(safe_path.as_path()).unwrap();
+        let err_del = write_note_atomic(root, &safe_path, conflict_content, Some(&fp2));
+        assert!(matches!(err_del, Err(NoteError::Conflict { .. })));
+    }
+
+    #[test]
+    fn test_note_empty_crlf_and_no_trailing_newline() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // 1. Empty note
+        let empty_path = SafePath::resolve(root, "empty.md").unwrap();
+        let fp_empty = write_note_atomic(root, &empty_path, "", None).unwrap();
+        assert_eq!(fp_empty.size_bytes, 0);
+        let note_empty = read_note(root, &empty_path).unwrap();
+        assert_eq!(note_empty.content, "");
+        assert_eq!(note_empty.meta.title, "empty");
+
+        // 2. CRLF endings note
+        let crlf_path = SafePath::resolve(root, "crlf.md").unwrap();
+        let crlf_content = "---\r\ntitle: Windows Note\r\ntags:\r\n  - win\r\n---\r\n# Windows Heading\r\n\r\nLine 1\r\nLine 2\r\n";
+        let fp_crlf = write_note_atomic(root, &crlf_path, crlf_content, None).unwrap();
+        let note_crlf = read_note(root, &crlf_path).unwrap();
+        assert_eq!(note_crlf.content, crlf_content);
+        assert_eq!(note_crlf.meta.title, "Windows Note");
+        assert_eq!(note_crlf.meta.tags, vec!["win".to_string()]);
+        assert_eq!(note_crlf.meta.headings.len(), 1);
+        assert_eq!(note_crlf.fingerprint.content_hash, fp_crlf.content_hash);
+
+        // 3. No trailing newline
+        let nonl_path = SafePath::resolve(root, "nonl.md").unwrap();
+        let nonl_content = "# No Newline\nEnd of file right here";
+        let _ = write_note_atomic(root, &nonl_path, nonl_content, None).unwrap();
+        let note_nonl = read_note(root, &nonl_path).unwrap();
+        assert_eq!(note_nonl.content, nonl_content);
+        assert_eq!(note_nonl.meta.title, "No Newline");
+    }
+
+    #[test]
+    fn test_large_5mb_note() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let large_path = SafePath::resolve(root, "large.md").unwrap();
+
+        // Generate ~5 MB text
+        let mut large_content = String::with_capacity(5 * 1024 * 1024 + 100);
+        large_content.push_str("# Large Note\n\n");
+        let paragraph = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\n";
+        while large_content.len() < 5 * 1024 * 1024 {
+            large_content.push_str(paragraph);
+        }
+
+        let fp = write_note_atomic(root, &large_path, &large_content, None).unwrap();
+        assert!(fp.size_bytes >= 5 * 1024 * 1024);
+
+        let note = read_note(root, &large_path).unwrap();
+        assert_eq!(note.content.len(), large_content.len());
+        assert_eq!(note.meta.title, "Large Note");
     }
 }
 

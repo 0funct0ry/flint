@@ -104,10 +104,11 @@ button {
   background: var(--muted);
 }
 
-/* Reader styling per SPEC §9.2 */
+/* Reader styling */
 .reader-content {
-  padding: 26px 34px 40vh;
-  max-width: 68ch;
+  padding: 26px 36px 40vh;
+  width: 100%;
+  max-width: 100%;
   color: var(--text-2);
   user-select: text;
 }

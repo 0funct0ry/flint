@@ -1,5 +1,6 @@
 use flint_core::{
-    bootstrap_workspace, build_workspace_tree, resolve_workspace_root, TreeNodeItem, WorkspaceInfo,
+    bootstrap_workspace, build_workspace_tree, read_note, resolve_workspace_root,
+    write_note_atomic, Fingerprint, NoteContent, SafePath, TreeNodeItem, WorkspaceInfo,
 };
 use std::env;
 use std::path::PathBuf;
@@ -14,6 +15,21 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             active_workspace: Mutex::new(None),
+        }
+    }
+}
+
+/// Helper to obtain the active workspace root or fallback to current dir.
+fn get_workspace_root(state: &State<AppState>) -> Result<PathBuf, String> {
+    let lock = state
+        .active_workspace
+        .lock()
+        .map_err(|e| format!("Lock error: {}", e))?;
+    match lock.as_ref() {
+        Some(p) => Ok(p.clone()),
+        None => {
+            let current_dir = env::current_dir().map_err(|e| e.to_string())?;
+            resolve_workspace_root(None, None, None, &current_dir).map_err(|e| e.to_string())
         }
     }
 }
@@ -58,22 +74,30 @@ fn workspace_tree(
     show_non_note_files: Option<bool>,
     state: State<AppState>,
 ) -> Result<Vec<TreeNodeItem>, String> {
-    let root = {
-        let lock = state
-            .active_workspace
-            .lock()
-            .map_err(|e| format!("Lock error: {}", e))?;
-        match lock.as_ref() {
-            Some(p) => p.clone(),
-            None => {
-                let current_dir = env::current_dir().map_err(|e| e.to_string())?;
-                resolve_workspace_root(None, None, None, &current_dir).map_err(|e| e.to_string())?
-            }
-        }
-    };
-
+    let root = get_workspace_root(&state)?;
     let show_non_notes = show_non_note_files.unwrap_or(false);
     build_workspace_tree(&root, show_non_notes).map_err(|e| e.to_string())
+}
+
+/// Read a note's content, metadata, and fingerprint safely (SPEC §8.3, §11).
+#[tauri::command]
+fn note_read(path: String, state: State<AppState>) -> Result<NoteContent, String> {
+    let root = get_workspace_root(&state)?;
+    let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+    read_note(&root, &safe_path).map_err(|e| e.to_string())
+}
+
+/// Atomically write a note with fingerprint conflict detection (SPEC §8.3, §10.3, §11).
+#[tauri::command]
+fn note_write(
+    path: String,
+    content: String,
+    fingerprint: Option<Fingerprint>,
+    state: State<AppState>,
+) -> Result<Fingerprint, String> {
+    let root = get_workspace_root(&state)?;
+    let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+    write_note_atomic(&root, &safe_path, &content, fingerprint.as_ref()).map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -87,7 +111,12 @@ pub fn run_with_workspace(initial_path: Option<PathBuf>) {
     };
     tauri::Builder::default()
         .manage(state)
-        .invoke_handler(tauri::generate_handler![workspace_open, workspace_tree])
+        .invoke_handler(tauri::generate_handler![
+            workspace_open,
+            workspace_tree,
+            note_read,
+            note_write
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

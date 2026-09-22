@@ -41,3 +41,5 @@ pnpm-debug.log*
 internal-docs/
 .agents/
 .idea/
+SAMPLE.md
+.flint/

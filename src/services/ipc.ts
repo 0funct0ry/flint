@@ -1,5 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Fingerprint, LinkItem, NoteContent, NoteMeta, RenameResult, RenderResult, TreeNodeItem, WorkspaceInfo } from "../types";
+import {
+  BacklinkGroup,
+  Fingerprint,
+  LinkItem,
+  NoteContent,
+  NoteMeta,
+  RenameResult,
+  RenderResult,
+  TreeNodeItem,
+  WorkspaceInfo,
+  WorkspaceStats,
+} from "../types";
 import { FIXTURE_NOTES } from "../fixtures/workspace";
 import { renderMarkdownToHtml } from "./markdown";
 
@@ -303,6 +314,70 @@ export const api = {
     return links;
   },
 
+  async linksBacklinks(path: string): Promise<BacklinkGroup[]> {
+    if (isTauriEnvironment()) {
+      return await invoke<BacklinkGroup[]>("links_backlinks", { path });
+    }
+
+    // Mock backlinks for browser dev
+    const note = FIXTURE_NOTES[path];
+    if (note && note.backlinks) {
+      return note.backlinks;
+    }
+    return [];
+  },
+
+  async workspaceStats(): Promise<WorkspaceStats> {
+    if (isTauriEnvironment()) {
+      return await invoke<WorkspaceStats>("workspace_stats");
+    }
+
+    const noteCount = Object.keys(FIXTURE_NOTES).length;
+    let linkCount = 0;
+    let unresolvedCount = 0;
+    Object.values(FIXTURE_NOTES).forEach((n) => {
+      linkCount += n.outgoingLinks.length;
+      unresolvedCount += n.outgoingLinks.filter((l) => !l.resolved && !l.raw_target?.startsWith('http')).length;
+    });
+
+    return {
+      note_count: noteCount,
+      link_count: linkCount,
+      unresolved_count: unresolvedCount,
+    };
+  },
+
+  async indexUnresolved(): Promise<LinkItem[]> {
+    if (isTauriEnvironment()) {
+      return await invoke<LinkItem[]>("index_unresolved");
+    }
+
+    const unresolved: LinkItem[] = [];
+    Object.values(FIXTURE_NOTES).forEach((n) => {
+      n.outgoingLinks.forEach((l) => {
+        if (!l.resolved && !l.raw_target?.startsWith('http')) {
+          unresolved.push(l);
+        }
+      });
+    });
+    return unresolved;
+  },
+
+  async indexNotes(): Promise<NoteMeta[]> {
+    if (isTauriEnvironment()) {
+      return await invoke<NoteMeta[]>("index_notes");
+    }
+
+    return Object.values(FIXTURE_NOTES).map((n) => ({
+      path: n.path,
+      title: n.title,
+      size_bytes: n.content.length,
+      modified_ms: Date.now(),
+      headings: n.headings,
+      tags: n.tags,
+    }));
+  },
+
   async openExternal(url: string): Promise<void> {
     if (isTauriEnvironment()) {
       return await invoke<void>("open_external", { url });
@@ -310,4 +385,5 @@ export const api = {
     window.open(url, "_blank", "noopener,noreferrer");
   },
 };
+
 

@@ -1,24 +1,26 @@
 use flint_core::{
     bootstrap_workspace, build_workspace_tree, create_folder, create_note, delete_folder,
     delete_path, duplicate_note, read_note, rename_path, render_note_markdown,
-    resolve_workspace_root, write_note_atomic, Fingerprint, NoteContent, NoteMeta, RenderResult,
-    SafePath, TreeNodeItem, WorkspaceInfo,
+    resolve_workspace_root, write_note_atomic, BacklinkGroup, Fingerprint, Index, Link,
+    NoteContent, NoteMeta, RenderResult, SafePath, TreeNodeItem, WorkspaceInfo, WorkspaceStats,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Mutex;
-use tauri::State;
+use std::sync::{Arc, Mutex, RwLock};
+use tauri::{AppHandle, Emitter, State};
 
 pub struct AppState {
     pub active_workspace: Mutex<Option<PathBuf>>,
+    pub index: Arc<RwLock<Index>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
             active_workspace: Mutex::new(None),
+            index: Arc::new(RwLock::new(Index::new())),
         }
     }
 }
@@ -38,6 +40,13 @@ fn get_workspace_root(state: &State<AppState>) -> Result<PathBuf, String> {
     }
 }
 
+/// Progress payload emitted during indexing (SPEC §6.2, §11).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexProgressPayload {
+    pub indexed: usize,
+    pub total: usize,
+}
+
 /// Result returned from note_rename (SPEC §11).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenameResult {
@@ -45,9 +54,13 @@ pub struct RenameResult {
     pub links_updated: usize,
 }
 
-/// Open and initialize a workspace directory.
+/// Open and initialize a workspace directory with background indexing (SPEC §6.2, §11).
 #[tauri::command]
-fn workspace_open(path: Option<String>, state: State<AppState>) -> Result<WorkspaceInfo, String> {
+fn workspace_open(
+    path: Option<String>,
+    app_handle: AppHandle,
+    state: State<AppState>,
+) -> Result<WorkspaceInfo, String> {
     let current_dir = env::current_dir().map_err(|e| e.to_string())?;
     let path_buf = path.map(PathBuf::from);
 
@@ -73,8 +86,29 @@ fn workspace_open(path: Option<String>, state: State<AppState>) -> Result<Worksp
     };
 
     if let Ok(mut lock) = state.active_workspace.lock() {
-        *lock = Some(root);
+        *lock = Some(root.clone());
     }
+
+    // Spawn background indexing task per SPEC §6.2
+    let root_clone = root.clone();
+    let index_arc = Arc::clone(&state.index);
+    let app_handle_clone = app_handle.clone();
+
+    std::thread::spawn(move || {
+        let handle_for_progress = app_handle_clone.clone();
+        let build_result = Index::build_from_workspace(&root_clone, move |indexed, total| {
+            let _ =
+                handle_for_progress.emit("index:progress", IndexProgressPayload { indexed, total });
+        });
+
+        if let Ok(new_index) = build_result {
+            let stats = new_index.get_stats();
+            if let Ok(mut lock) = index_arc.write() {
+                *lock = new_index;
+            }
+            let _ = app_handle_clone.emit("index:ready", stats);
+        }
+    });
 
     Ok(info)
 }
@@ -98,7 +132,7 @@ fn note_read(path: String, state: State<AppState>) -> Result<NoteContent, String
     read_note(&root, &safe_path).map_err(|e| e.to_string())
 }
 
-/// Atomically write a note with fingerprint conflict detection (SPEC §8.3, §10.3, §11).
+/// Atomically write a note with fingerprint conflict detection and incremental index update (SPEC §8.3, §10.3, §11).
 #[tauri::command]
 fn note_write(
     path: String,
@@ -108,10 +142,18 @@ fn note_write(
 ) -> Result<Fingerprint, String> {
     let root = get_workspace_root(&state)?;
     let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
-    write_note_atomic(&root, &safe_path, &content, fingerprint.as_ref()).map_err(|e| e.to_string())
+    let fp = write_note_atomic(&root, &safe_path, &content, fingerprint.as_ref())
+        .map_err(|e| e.to_string())?;
+
+    // Incremental index update per SPEC §6.2
+    if let Ok(mut lock) = state.index.write() {
+        lock.insert_or_update_note(&root, &safe_path, &content);
+    }
+
+    Ok(fp)
 }
 
-/// Create a new note at path (SPEC §11, M4).
+/// Create a new note at path and update index (SPEC §11, M4).
 #[tauri::command]
 fn note_create(
     path: String,
@@ -120,7 +162,15 @@ fn note_create(
 ) -> Result<NoteMeta, String> {
     let root = get_workspace_root(&state)?;
     let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
-    create_note(&root, &safe_path, template.as_deref()).map_err(|e| e.to_string())
+    let meta = create_note(&root, &safe_path, template.as_deref()).map_err(|e| e.to_string())?;
+
+    // Incremental index update per SPEC §6.2
+    if let Ok(mut lock) = state.index.write() {
+        let content = template.as_deref().unwrap_or("");
+        lock.insert_or_update_note(&root, &safe_path, content);
+    }
+
+    Ok(meta)
 }
 
 /// Rename/move a note or folder (SPEC §11, M4).
@@ -137,6 +187,16 @@ fn note_rename(
 
     rename_path(&root, &from_safe, &to_safe).map_err(|e| e.to_string())?;
 
+    // Update index on rename
+    if let Ok(mut lock) = state.index.write() {
+        lock.remove_note(Some(&root), &from_safe.to_posix_string());
+        if to_safe.as_path().is_file() {
+            if let Ok(content) = std::fs::read_to_string(to_safe.as_path()) {
+                lock.insert_or_update_note(&root, &to_safe, &content);
+            }
+        }
+    }
+
     // Link rewriting is deferred to M8 per PROMPTS.md
     Ok(RenameResult {
         moved: true,
@@ -149,7 +209,17 @@ fn note_rename(
 fn note_duplicate(path: String, state: State<AppState>) -> Result<NoteMeta, String> {
     let root = get_workspace_root(&state)?;
     let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
-    duplicate_note(&root, &safe_path).map_err(|e| e.to_string())
+    let meta = duplicate_note(&root, &safe_path).map_err(|e| e.to_string())?;
+
+    if let Ok(safe_dup) = SafePath::resolve(&root, &meta.path) {
+        if let Ok(content) = std::fs::read_to_string(safe_dup.as_path()) {
+            if let Ok(mut lock) = state.index.write() {
+                lock.insert_or_update_note(&root, &safe_dup, &content);
+            }
+        }
+    }
+
+    Ok(meta)
 }
 
 /// Delete a note (to OS trash by default, or permanently if permanent: true) (SPEC §10.3, §11, M4).
@@ -161,7 +231,13 @@ fn note_delete(
 ) -> Result<(), String> {
     let root = get_workspace_root(&state)?;
     let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
-    delete_path(&root, &safe_path, permanent.unwrap_or(false)).map_err(|e| e.to_string())
+    delete_path(&root, &safe_path, permanent.unwrap_or(false)).map_err(|e| e.to_string())?;
+
+    if let Ok(mut lock) = state.index.write() {
+        lock.remove_note(Some(&root), &safe_path.to_posix_string());
+    }
+
+    Ok(())
 }
 
 /// Create a new folder at path (SPEC §11, M4).
@@ -256,6 +332,46 @@ fn links_outgoing(
     flint_core::links_outgoing(&root, &safe_path, content.as_deref()).map_err(|e| e.to_string())
 }
 
+/// Retrieve backlinks for a note from the in-memory index (SPEC §6.4, §11, M7).
+#[tauri::command]
+fn links_backlinks(path: String, state: State<AppState>) -> Result<Vec<BacklinkGroup>, String> {
+    let lock = state
+        .index
+        .read()
+        .map_err(|e| format!("Index read error: {}", e))?;
+    Ok(lock.get_backlinks(&path))
+}
+
+/// Retrieve live workspace statistics from the in-memory index (SPEC §6.1, §11, M7).
+#[tauri::command]
+fn workspace_stats(state: State<AppState>) -> Result<WorkspaceStats, String> {
+    let lock = state
+        .index
+        .read()
+        .map_err(|e| format!("Index read error: {}", e))?;
+    Ok(lock.get_stats())
+}
+
+/// Retrieve all unresolved links across the workspace (M7).
+#[tauri::command]
+fn index_unresolved(state: State<AppState>) -> Result<Vec<Link>, String> {
+    let lock = state
+        .index
+        .read()
+        .map_err(|e| format!("Index read error: {}", e))?;
+    Ok(lock.get_unresolved_links())
+}
+
+/// Retrieve all indexed notes metadata (M7).
+#[tauri::command]
+fn index_notes(state: State<AppState>) -> Result<Vec<NoteMeta>, String> {
+    let lock = state
+        .index
+        .read()
+        .map_err(|e| format!("Index read error: {}", e))?;
+    Ok(lock.get_note_list())
+}
+
 /// Open an external URL in the default system browser (SPEC §6.3, §11, M6).
 #[tauri::command]
 fn open_external(url: String) -> Result<(), String> {
@@ -304,12 +420,17 @@ pub fn run() {
 pub fn run_with_workspace(initial_path: Option<PathBuf>) {
     let state = AppState {
         active_workspace: Mutex::new(initial_path),
+        index: Arc::new(RwLock::new(Index::new())),
     };
     tauri::Builder::default()
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             workspace_open,
             workspace_tree,
+            workspace_stats,
+            links_backlinks,
+            index_unresolved,
+            index_notes,
             note_read,
             note_write,
             note_create,

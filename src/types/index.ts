@@ -20,10 +20,23 @@ export interface BacklinkOccurrence {
 }
 
 export interface BacklinkGroup {
-  sourcePath: string;
-  sourceTitle: string;
+  source_path?: string;
+  sourcePath?: string;
+  source_title?: string;
+  sourceTitle?: string;
   folder: string;
   occurrences: BacklinkOccurrence[];
+}
+
+export interface WorkspaceStats {
+  note_count: number;
+  link_count: number;
+  unresolved_count: number;
+}
+
+export interface IndexProgressEvent {
+  indexed: number;
+  total: number;
 }
 
 export interface Fingerprint {

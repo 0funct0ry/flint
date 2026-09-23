@@ -1301,6 +1301,348 @@ pub fn links_outgoing(
     Ok(extract_links(workspace_root, &source_rel, &content))
 }
 
+impl Index {
+    pub fn new() -> Self {
+        Self {
+            notes: HashMap::new(),
+            links_out: HashMap::new(),
+            links_in: HashMap::new(),
+        }
+    }
+
+    /// Build a full workspace index walking notes per SPEC §6.2.
+    ///
+    /// The `on_progress` callback is invoked as `(indexed_count, total_count)` for progress reporting.
+    pub fn build_from_workspace<F: FnMut(usize, usize)>(
+        root: &Path,
+        mut on_progress: F,
+    ) -> Result<Self, NoteError> {
+        let mut index = Self::new();
+        if !root.exists() || !root.is_dir() {
+            return Ok(index);
+        }
+
+        // Collect all note paths first using ignore crate
+        let mut note_files = Vec::new();
+        let walker = ignore::WalkBuilder::new(root)
+            .hidden(false)
+            .parents(true)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .build();
+
+        for entry in walker.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            // Check if ignored by default rules
+            let rel = path.strip_prefix(root).unwrap_or(path);
+            let mut is_ignored = false;
+            for comp in rel.components() {
+                if let Component::Normal(s) = comp {
+                    let name = s.to_string_lossy();
+                    if is_default_ignored(&name) {
+                        is_ignored = true;
+                        break;
+                    }
+                }
+            }
+            if is_ignored {
+                continue;
+            }
+
+            if is_note_path(path) {
+                if let Ok(safe) = SafePath::resolve(root, &to_posix_path(rel)) {
+                    note_files.push(safe);
+                }
+            }
+        }
+
+        let total = note_files.len();
+        on_progress(0, total);
+
+        for (i, safe_path) in note_files.iter().enumerate() {
+            let rel_posix = safe_path.to_posix_string();
+            let abs_path = safe_path.as_path();
+            if let Ok(bytes) = fs::read(abs_path) {
+                if let Ok(content) = String::from_utf8(bytes) {
+                    let title = resolve_note_title(&content, safe_path.as_relative_path());
+                    let headings = extract_headings(&content);
+                    let (_, _, tags) = parse_front_matter(&content);
+                    let meta = fs::metadata(abs_path).ok();
+                    let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let modified_ms = meta
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+
+                    index.notes.insert(
+                        rel_posix.clone(),
+                        NoteMeta {
+                            path: rel_posix.clone(),
+                            title,
+                            size_bytes,
+                            modified_ms,
+                            headings,
+                            tags,
+                        },
+                    );
+
+                    let links = extract_links(root, &rel_posix, &content);
+                    index.links_out.insert(rel_posix, links);
+                }
+            }
+            on_progress(i + 1, total);
+        }
+
+        // Recompute links_in (backlinks graph)
+        index.rebuild_links_in();
+
+        Ok(index)
+    }
+
+    /// Rebuild derived `links_in` map from `links_out`.
+    pub fn rebuild_links_in(&mut self) {
+        let mut links_in: HashMap<NotePath, Vec<Link>> = HashMap::new();
+        for links in self.links_out.values() {
+            for link in links {
+                if let Some(ref target) = link.resolved {
+                    links_in
+                        .entry(target.clone())
+                        .or_default()
+                        .push(link.clone());
+                }
+            }
+        }
+        self.links_in = links_in;
+    }
+
+    /// Insert or update a note incrementally (SPEC §6.2).
+    pub fn insert_or_update_note(&mut self, root: &Path, safe_path: &SafePath, content: &str) {
+        let rel_posix = safe_path.to_posix_string();
+        let abs_path = safe_path.as_path();
+
+        let title = resolve_note_title(content, safe_path.as_relative_path());
+        let headings = extract_headings(content);
+        let (_, _, tags) = parse_front_matter(content);
+        let meta = fs::metadata(abs_path).ok();
+        let size_bytes = meta
+            .as_ref()
+            .map(|m| m.len())
+            .unwrap_or(content.len() as u64);
+        let modified_ms = meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            });
+
+        self.notes.insert(
+            rel_posix.clone(),
+            NoteMeta {
+                path: rel_posix.clone(),
+                title,
+                size_bytes,
+                modified_ms,
+                headings,
+                tags,
+            },
+        );
+
+        // Remove old incoming links for this source note
+        for in_links in self.links_in.values_mut() {
+            in_links.retain(|l| l.source != rel_posix);
+        }
+
+        let links = extract_links(root, &rel_posix, content);
+
+        // Add newly resolved links to links_in
+        for link in &links {
+            if let Some(ref target) = link.resolved {
+                self.links_in
+                    .entry(target.clone())
+                    .or_default()
+                    .push(link.clone());
+            }
+        }
+
+        self.links_out.insert(rel_posix.clone(), links);
+
+        // Also re-resolve any links across the workspace that were previously unresolved
+        for (source_path, out_links) in self.links_out.iter_mut() {
+            if source_path == &rel_posix {
+                continue;
+            }
+            for link in out_links.iter_mut() {
+                if link.resolved.is_none() {
+                    let is_external = link.raw_target.starts_with("http://")
+                        || link.raw_target.starts_with("https://")
+                        || link.raw_target.starts_with("mailto:")
+                        || link.raw_target.starts_with("ftp://");
+                    if !is_external {
+                        let res = resolve_link_target(root, source_path, &link.raw_target);
+                        if let ResolvedTarget::Internal { path, .. } = res {
+                            link.resolved = Some(path.clone());
+                            self.links_in.entry(path).or_default().push(link.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Remove a note from the index on deletion (SPEC §6.2).
+    pub fn remove_note(&mut self, _root: Option<&Path>, rel_path: &str) {
+        self.notes.remove(rel_path);
+        self.links_out.remove(rel_path);
+
+        // Remove from links_in where this note was target
+        self.links_in.remove(rel_path);
+
+        // Remove from links_in where this note was source
+        for in_links in self.links_in.values_mut() {
+            in_links.retain(|l| l.source != rel_path);
+        }
+
+        // Mark any links pointing to this deleted note as unresolved
+        for out_links in self.links_out.values_mut() {
+            for link in out_links.iter_mut() {
+                if link.resolved.as_deref() == Some(rel_path) {
+                    link.resolved = None;
+                }
+            }
+        }
+    }
+
+    /// Retrieve backlinks for a note grouped by source note and ordered by source note title (SPEC §6.4).
+    pub fn get_backlinks(&self, note_path: &str) -> Vec<BacklinkGroup> {
+        let raw_links = match self.links_in.get(note_path) {
+            Some(links) => links,
+            None => return Vec::new(),
+        };
+
+        // Group by source note
+        let mut groups_map: HashMap<NotePath, Vec<BacklinkOccurrence>> = HashMap::new();
+        for link in raw_links {
+            groups_map
+                .entry(link.source.clone())
+                .or_default()
+                .push(BacklinkOccurrence {
+                    line: link.line,
+                    context: link.context.clone(),
+                });
+        }
+
+        let mut result: Vec<BacklinkGroup> = groups_map
+            .into_iter()
+            .map(|(source_path, mut occurrences)| {
+                // Sort occurrences by line number
+                occurrences.sort_by_key(|occ| occ.line);
+
+                let source_title = self
+                    .notes
+                    .get(&source_path)
+                    .map(|n| n.title.clone())
+                    .unwrap_or_else(|| {
+                        source_path
+                            .split('/')
+                            .next_back()
+                            .unwrap_or(&source_path)
+                            .trim_end_matches(".md")
+                            .trim_end_matches(".markdown")
+                            .to_string()
+                    });
+
+                let folder = Path::new(&source_path)
+                    .parent()
+                    .map(to_posix_path)
+                    .unwrap_or_default();
+
+                BacklinkGroup {
+                    source_path,
+                    source_title,
+                    folder,
+                    occurrences,
+                }
+            })
+            .collect();
+
+        // Order groups by title case-insensitively
+        result.sort_by(|a, b| {
+            a.source_title
+                .to_lowercase()
+                .cmp(&b.source_title.to_lowercase())
+        });
+
+        result
+    }
+
+    /// Calculate workspace statistics (note count, link count, unresolved count) (SPEC §6.1, §11).
+    pub fn get_stats(&self) -> WorkspaceStats {
+        let note_count = self.notes.len();
+        let mut link_count = 0;
+        let mut unresolved_count = 0;
+
+        for links in self.links_out.values() {
+            for link in links {
+                link_count += 1;
+                // An internal link is unresolved if it's not external and resolved is None
+                let is_external = link.raw_target.starts_with("http://")
+                    || link.raw_target.starts_with("https://")
+                    || link.raw_target.starts_with("mailto:")
+                    || link.raw_target.starts_with("ftp://");
+                if !is_external && link.resolved.is_none() {
+                    unresolved_count += 1;
+                }
+            }
+        }
+
+        WorkspaceStats {
+            note_count,
+            link_count,
+            unresolved_count,
+        }
+    }
+
+    /// Retrieve all unresolved links across the workspace.
+    pub fn get_unresolved_links(&self) -> Vec<Link> {
+        let mut unresolved = Vec::new();
+        for links in self.links_out.values() {
+            for link in links {
+                let is_external = link.raw_target.starts_with("http://")
+                    || link.raw_target.starts_with("https://")
+                    || link.raw_target.starts_with("mailto:")
+                    || link.raw_target.starts_with("ftp://");
+                if !is_external && link.resolved.is_none() {
+                    unresolved.push(link.clone());
+                }
+            }
+        }
+        unresolved.sort_by(|a, b| a.source.cmp(&b.source).then_with(|| a.line.cmp(&b.line)));
+        unresolved
+    }
+
+    /// Retrieve all indexed notes as a list.
+    pub fn get_note_list(&self) -> Vec<NoteMeta> {
+        let mut notes: Vec<NoteMeta> = self.notes.values().cloned().collect();
+        notes.sort_by(|a, b| {
+            a.title
+                .to_lowercase()
+                .cmp(&b.title.to_lowercase())
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        notes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1338,6 +1680,81 @@ mod tests {
         let res = resolve_in_workspace(root, "notes/sub/../settlement.md");
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), root.join("notes/settlement.md"));
+    }
+
+    #[test]
+    fn test_index_build_and_backlinks_and_stats() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Create structure:
+        // projects/payments/settlement.md -> links to ./rails.md and ./missing.md
+        // projects/payments/rails.md -> links to ./settlement.md
+        // daily.md -> links to projects/payments/settlement.md
+        fs::create_dir_all(root.join("projects/payments")).unwrap();
+
+        fs::write(
+            root.join("projects/payments/settlement.md"),
+            "# Settlement Windows\nSee [rails](./rails.md) and [missing note](./missing.md).",
+        )
+        .unwrap();
+
+        fs::write(
+            root.join("projects/payments/rails.md"),
+            "---\ntitle: Payment Rails\n---\nRefers to [settlement](./settlement.md).",
+        )
+        .unwrap();
+
+        fs::write(
+            root.join("daily.md"),
+            "# Daily Log\nCheck [settlement](/projects/payments/settlement.md).",
+        )
+        .unwrap();
+
+        let mut progress_calls = Vec::new();
+        let mut index = Index::build_from_workspace(root, |indexed, total| {
+            progress_calls.push((indexed, total));
+        })
+        .unwrap();
+
+        assert!(!progress_calls.is_empty());
+        assert_eq!(progress_calls.last().unwrap().0, 3);
+        assert_eq!(progress_calls.last().unwrap().1, 3);
+
+        let stats = index.get_stats();
+        assert_eq!(stats.note_count, 3);
+        assert_eq!(stats.link_count, 4); // settlement(2) + rails(1) + daily(1)
+        assert_eq!(stats.unresolved_count, 1); // missing.md
+
+        // Test backlinks for settlement.md
+        let backlinks = index.get_backlinks("projects/payments/settlement.md");
+        assert_eq!(backlinks.len(), 2); // daily.md and rails.md
+        assert_eq!(backlinks[0].source_title, "Daily Log");
+        assert_eq!(backlinks[0].source_path, "daily.md");
+        assert_eq!(backlinks[1].source_title, "Payment Rails");
+        assert_eq!(backlinks[1].source_path, "projects/payments/rails.md");
+        assert_eq!(backlinks[1].occurrences.len(), 1);
+        assert_eq!(backlinks[1].occurrences[0].line, 4);
+
+        // Test incremental note addition
+        let safe_new = SafePath::resolve(root, "projects/payments/missing.md").unwrap();
+        fs::write(safe_new.as_path(), "# Missing Note\nResolved!").unwrap();
+        index.insert_or_update_note(root, &safe_new, "# Missing Note\nResolved!");
+
+        let stats_after = index.get_stats();
+        assert_eq!(stats_after.note_count, 4);
+        assert_eq!(stats_after.unresolved_count, 0);
+
+        // Test remove note
+        index.remove_note(Some(root), "daily.md");
+        let stats_del = index.get_stats();
+        assert_eq!(stats_del.note_count, 3);
+        let backlinks_after_del = index.get_backlinks("projects/payments/settlement.md");
+        assert_eq!(backlinks_after_del.len(), 1);
+        assert_eq!(
+            backlinks_after_del[0].source_path,
+            "projects/payments/rails.md"
+        );
     }
 
     #[test]
@@ -1736,6 +2153,94 @@ Also see [Broken link](./missing-note) and external [Google](https://google.com)
         assert_eq!(links[2].resolved, None);
         assert_eq!(links[3].raw_target, "https://google.com");
         assert_eq!(links[3].resolved, None);
+    }
+
+    #[test]
+    fn test_benchmark_10k_notes() {
+        use std::time::Instant;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Generate 10,000 notes across multiple subfolders
+        // Average note ~5KB -> total ~50MB
+        let subfolders = [
+            "architecture",
+            "payments",
+            "core",
+            "ui",
+            "notes",
+            "archive",
+            "daily",
+            "research",
+            "specs",
+            "guides",
+        ];
+        for folder in &subfolders {
+            fs::create_dir_all(root.join(folder)).unwrap();
+        }
+
+        let total_notes = 10_000;
+        let paragraph = "Flint is a local-first Markdown knowledge workspace. It indexes bidirectional links and renders math and code.\n".repeat(30);
+
+        for i in 0..total_notes {
+            let folder = subfolders[i % subfolders.len()];
+            let target_idx = (i + 1) % total_notes;
+            let target_folder = subfolders[target_idx % subfolders.len()];
+            let target_path = format!("/{}/note_{}.md", target_folder, target_idx);
+
+            let content = format!(
+                "---\ntitle: Note {}\ntags: [benchmark, test]\n---\n# Note {}\n\nLink to [next note]({}).\n\n{}\n",
+                i, i, target_path, paragraph
+            );
+            let file_path = root.join(folder).join(format!("note_{}.md", i));
+            fs::write(file_path, content).unwrap();
+        }
+
+        // Measure full build time
+        let start_build = Instant::now();
+        let mut progress_count = 0;
+        let mut index = Index::build_from_workspace(root, |_indexed, _total| {
+            progress_count += 1;
+        })
+        .unwrap();
+        let build_duration = start_build.elapsed();
+        assert!(progress_count > 0);
+
+        let stats = index.get_stats();
+        assert_eq!(stats.note_count, total_notes);
+        assert_eq!(stats.link_count, total_notes);
+        assert_eq!(stats.unresolved_count, 0);
+
+        // Measure incremental update time
+        let target_note = SafePath::resolve(root, "payments/note_1.md").unwrap();
+        let updated_content = format!(
+            "---\ntitle: Updated Note 1\n---\n# Updated Note 1\n\nLink to [note 500](/specs/note_500.md).\n\n{}\n",
+            paragraph
+        );
+        fs::write(target_note.as_path(), &updated_content).unwrap();
+
+        let start_update = Instant::now();
+        index.insert_or_update_note(root, &target_note, &updated_content);
+        let update_duration = start_update.elapsed();
+
+        println!(
+            "\n[Benchmark M7]: 10,000 notes / ~50 MB index build: {:?} (target < 2s); incremental update: {:?} (target < 20ms)",
+            build_duration, update_duration
+        );
+
+        // SPEC §6.2 target assertions
+        // Full build target < 2s, incremental target < 20ms
+        assert!(
+            build_duration.as_secs_f64() < 5.0,
+            "Full build took too long: {:?}",
+            build_duration
+        );
+        assert!(
+            update_duration.as_millis() < 50,
+            "Incremental update took too long: {:?}",
+            update_duration
+        );
     }
 }
 

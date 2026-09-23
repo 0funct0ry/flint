@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { NoteFixture } from '../types';
+import { NoteFixture, NoteMeta } from '../types';
 import { commandRegistry, Command } from '../commands/registry';
 
 export interface CommandPaletteProps {
   isOpen: boolean;
   onClose: () => void;
   notes: Record<string, NoteFixture>;
+  indexedNotes?: NoteMeta[];
   onSelectNote: (path: string) => void;
   initialMode?: 'notes' | 'commands';
 }
@@ -24,6 +25,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   isOpen,
   onClose,
   notes,
+  indexedNotes = [],
   onSelectNote,
   initialMode = 'notes',
 }) => {
@@ -67,7 +69,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
           },
         }));
     } else {
-      const noteList = Object.values(notes);
+      const noteList: Array<{ path: string; title: string }> = indexedNotes.length > 0
+        ? indexedNotes.map((n) => ({ path: n.path, title: n.title }))
+        : Object.values(notes).map((n) => ({ path: n.path, title: n.title }));
+
       const filtered = noteList.filter(
         (n) =>
           n.title.toLowerCase().includes(cleanQuery) ||
@@ -86,7 +91,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         },
       }));
     }
-  }, [isCommandMode, cleanQuery, notes, onClose, onSelectNote]);
+  }, [isCommandMode, cleanQuery, notes, indexedNotes, onClose, onSelectNote]);
 
   // Keyboard navigation inside palette
   const handleKeyDown = (e: React.KeyboardEvent) => {

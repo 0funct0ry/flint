@@ -7,6 +7,8 @@ export interface StatusBarProps {
   unresolvedCount: number;
   cursorLine?: number;
   cursorCol?: number;
+  indexingProgress?: { indexed: number; total: number } | null;
+  onClickUnresolved?: () => void;
 }
 
 export const StatusBar: React.FC<StatusBarProps> = ({
@@ -16,6 +18,8 @@ export const StatusBar: React.FC<StatusBarProps> = ({
   unresolvedCount,
   cursorLine = 1,
   cursorCol = 1,
+  indexingProgress = null,
+  onClickUnresolved,
 }) => {
   return (
     <footer className="flex items-center gap-3.5 h-6 shrink-0 px-3 border-t border-[var(--border)] bg-[var(--panel-2)] text-[11.5px] text-[var(--muted)] font-mono select-none">
@@ -23,9 +27,24 @@ export const StatusBar: React.FC<StatusBarProps> = ({
       <span>{noteCount.toLocaleString()} notes</span>
       <span>{linkCount.toLocaleString()} links</span>
       {unresolvedCount > 0 ? (
-        <span className="text-[var(--spark)]">{unresolvedCount} unresolved</span>
+        <button
+          onClick={onClickUnresolved}
+          className="text-[var(--spark)] hover:underline cursor-pointer bg-transparent border-0 p-0 font-mono text-[11.5px]"
+          title="Click to view all unresolved links"
+        >
+          {unresolvedCount} unresolved
+        </button>
       ) : (
         <span>0 unresolved</span>
+      )}
+
+      {indexingProgress && (
+        <div className="flex items-center gap-1.5 text-[var(--accent)] text-[11px]">
+          <span className="animate-spin inline-block">◐</span>
+          <span>
+            Indexing {indexingProgress.indexed} / {indexingProgress.total}
+          </span>
+        </div>
       )}
 
       <div className="ml-auto flex items-center gap-3.5">
@@ -42,3 +61,4 @@ export const StatusBar: React.FC<StatusBarProps> = ({
     </footer>
   );
 };
+

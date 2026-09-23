@@ -8,7 +8,7 @@ import { searchKeymap, openSearchPanel } from '@codemirror/search';
 import { bracketMatching } from '@codemirror/language';
 import { autocompletion, CompletionContext, CompletionResult } from '@codemirror/autocomplete';
 import { ViewMode } from './TitleBar';
-import { NoteFixture, TreeNodeItem } from '../types';
+import { NoteFixture, NoteMeta, TreeNodeItem } from '../types';
 import { ConflictBanner } from './ConflictBanner';
 
 export interface CenterPaneProps {
@@ -31,6 +31,7 @@ export interface CenterPaneProps {
   onHeadingInView?: (anchor: string) => void;
   scrollToAnchor?: string | null;
   treeData?: TreeNodeItem[];
+  indexedNotes?: NoteMeta[];
   savedScrollTop?: number;
   savedCursorPos?: number;
   onScrollOrCursorChange?: (scrollTop: number, cursorPos: number) => void;
@@ -218,6 +219,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   onHeadingInView,
   scrollToAnchor,
   treeData = [],
+  indexedNotes = [],
   savedScrollTop,
   savedCursorPos,
   onScrollOrCursorChange,
@@ -247,6 +249,9 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
 
   const treeDataRef = useRef(treeData);
   treeDataRef.current = treeData;
+
+  const indexedNotesRef = useRef(indexedNotes);
+  indexedNotesRef.current = indexedNotes;
 
   const onScrollOrCursorChangeRef = useRef(onScrollOrCursorChange);
   onScrollOrCursorChangeRef.current = onScrollOrCursorChange;
@@ -426,7 +431,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       return;
     }
 
-    // Link autocomplete completion source
+    // Link autocomplete completion source (SPEC §6.3, M7)
     const linkCompletionSource = (context: CompletionContext): CompletionResult | null => {
       const line = context.state.doc.lineAt(context.pos);
       const lineBefore = line.text.slice(0, context.pos - line.from);
@@ -435,7 +440,14 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       const openBracketMatch = /\[([^\]]*)$/.exec(lineBefore);
       const openParenMatch = /\]\(([^)]*)$/.exec(lineBefore);
 
-      const notes = getAllNotePaths(treeDataRef.current);
+      const notes = indexedNotesRef.current && indexedNotesRef.current.length > 0
+        ? indexedNotesRef.current.map((n) => ({
+            path: n.path,
+            title: n.title,
+            name: n.path.split('/').pop() || n.path,
+          }))
+        : getAllNotePaths(treeDataRef.current);
+
       if (openParenMatch) {
         const typed = openParenMatch[1];
         const from = context.pos - typed.length;

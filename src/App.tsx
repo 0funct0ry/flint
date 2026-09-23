@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { listen } from '@tauri-apps/api/event';
 import { TitleBar, ViewMode } from './components/TitleBar';
 import { LeftSidebar, LeftTab, InlineActionState } from './components/LeftSidebar';
 import { CenterPane } from './components/CenterPane';
@@ -8,14 +9,25 @@ import { CommandPalette } from './components/CommandPalette';
 import { DiffViewer } from './components/DiffViewer';
 import { Toast, ToastMessage } from './components/Toast';
 import { DeleteConfirmModal } from './components/DeleteConfirmModal';
+import { UnresolvedLinksModal } from './components/UnresolvedLinksModal';
 import {
   FIXTURE_NOTES,
   FIXTURE_WORKSPACE_NAME,
   FIXTURE_ROOT_PATH,
 } from './fixtures/workspace';
 import { commandRegistry } from './commands/registry';
-import { Fingerprint, NoteContent, NoteFixture, TreeNodeItem, WorkspaceInfo } from './types';
-import { api } from './services/ipc';
+import {
+  Fingerprint,
+  IndexProgressEvent,
+  LinkItem,
+  NoteContent,
+  NoteFixture,
+  NoteMeta,
+  TreeNodeItem,
+  WorkspaceInfo,
+  WorkspaceStats,
+} from './types';
+import { api, isTauriEnvironment } from './services/ipc';
 import { renderMarkdownToHtml } from './services/markdown';
 
 interface HistoryEntry {
@@ -39,6 +51,17 @@ export const App: React.FC = () => {
   });
   const [treeData, setTreeData] = useState<TreeNodeItem[]>([]);
   const [treeError, setTreeError] = useState<string | null>(null);
+
+  // Indexing and Stats state (SPEC §6.1, §6.2, M7)
+  const [workspaceStats, setWorkspaceStats] = useState<WorkspaceStats>({
+    note_count: Object.keys(FIXTURE_NOTES).length,
+    link_count: 12,
+    unresolved_count: 1,
+  });
+  const [indexingProgress, setIndexingProgress] = useState<IndexProgressEvent | null>(null);
+  const [indexedNotes, setIndexedNotes] = useState<NoteMeta[]>([]);
+  const [unresolvedLinks, setUnresolvedLinks] = useState<LinkItem[]>([]);
+  const [unresolvedModalOpen, setUnresolvedModalOpen] = useState(false);
 
   // Active note path & selected folder state
   const [currentNotePath, setCurrentNotePath] = useState<string>('');
@@ -133,6 +156,20 @@ export const App: React.FC = () => {
     }
   }, []);
 
+  // Refresh workspace stats helper (SPEC §6.1, M7)
+  const refreshStats = useCallback(async () => {
+    try {
+      const stats = await api.workspaceStats();
+      setWorkspaceStats(stats);
+      const notes = await api.indexNotes();
+      setIndexedNotes(notes);
+      const unresolved = await api.indexUnresolved();
+      setUnresolvedLinks(unresolved);
+    } catch (err) {
+      console.warn('Failed to fetch workspace stats / index:', err);
+    }
+  }, []);
+
   // Load note via IPC
   const loadNote = useCallback(async (path: string) => {
     if (!path) return;
@@ -165,6 +202,14 @@ export const App: React.FC = () => {
         console.warn(`Failed to extract links for ${path}:`, err);
       }
 
+      // Fetch real backlinks from index via IPC (M7)
+      let backlinks: any[] = [];
+      try {
+        backlinks = await api.linksBacklinks(path);
+      } catch (err) {
+        console.warn(`Failed to fetch backlinks for ${path}:`, err);
+      }
+
       setNoteState((prev) => {
         const existing = prev[path] || FIXTURE_NOTES[path] || {
           path,
@@ -175,7 +220,7 @@ export const App: React.FC = () => {
           renderedHtml,
           headings,
           outgoingLinks,
-          backlinks: [],
+          backlinks,
           lastModifiedAgo: 'just now',
         };
 
@@ -189,6 +234,7 @@ export const App: React.FC = () => {
             content: noteContent.content,
             renderedHtml,
             outgoingLinks,
+            backlinks,
           },
         };
       });
@@ -219,6 +265,18 @@ export const App: React.FC = () => {
         }));
         setIsDirty(false);
         setShowConflictBanner(false);
+
+        // Update stats and backlinks after save (M7)
+        refreshStats();
+        if (currentNotePath) {
+          api.linksBacklinks(currentNotePath).then((bls) => {
+            setNoteState((prev) => {
+              const cur = prev[currentNotePath];
+              if (!cur) return prev;
+              return { ...prev, [currentNotePath]: { ...cur, backlinks: bls } };
+            });
+          });
+        }
       } catch (err: any) {
         const errMsg = err?.message || String(err);
         if (errMsg.toLowerCase().includes('conflict')) {
@@ -235,10 +293,10 @@ export const App: React.FC = () => {
         }
       }
     },
-    []
+    [currentNotePath, refreshStats]
   );
 
-  // Load workspace and tree from real IPC once on mount
+  // Load workspace, tree, and listen to index events on mount (SPEC §6.2, §11, M7)
   useEffect(() => {
     let mounted = true;
 
@@ -253,6 +311,7 @@ export const App: React.FC = () => {
           setTreeData(tree);
           setTreeError(null);
         }
+        await refreshStats();
       } catch (err: any) {
         if (mounted) {
           setTreeError(err?.message || String(err));
@@ -261,10 +320,37 @@ export const App: React.FC = () => {
     }
 
     loadWorkspace();
+
+    // Listen to Tauri index events if in desktop environment
+    let unlistenProgress: (() => void) | undefined;
+    let unlistenReady: (() => void) | undefined;
+
+    if (isTauriEnvironment()) {
+      listen<IndexProgressEvent>('index:progress', (event) => {
+        if (mounted) {
+          setIndexingProgress(event.payload);
+        }
+      }).then((unsub) => {
+        unlistenProgress = unsub;
+      });
+
+      listen<WorkspaceStats>('index:ready', (event) => {
+        if (mounted) {
+          setWorkspaceStats(event.payload);
+          setIndexingProgress(null);
+          refreshStats();
+        }
+      }).then((unsub) => {
+        unlistenReady = unsub;
+      });
+    }
+
     return () => {
       mounted = false;
+      if (unlistenProgress) unlistenProgress();
+      if (unlistenReady) unlistenReady();
     };
-  }, []);
+  }, [refreshStats]);
 
   // Window blur / beforeunload save
   useEffect(() => {
@@ -348,25 +434,34 @@ export const App: React.FC = () => {
     [currentNotePath, history, historyIndex, isDirty, loadNote, saveNote]
   );
 
-  // Create broken note target and navigate to it (SPEC §6.3, M6)
+  // Create broken note target and navigate to it (SPEC §6.3, M6, M7)
   const handleCreateBrokenNote = useCallback(
-    async (rawPath: string) => {
+    async (rawPath: string, sourcePath?: string) => {
       try {
-        const cleanPath = rawPath.endsWith('.md') || rawPath.endsWith('.markdown')
-          ? rawPath
-          : `${rawPath}.md`;
-        const stem = cleanPath.split('/').pop()?.replace(/\.md$/, '') || 'Untitled';
+        let cleanPath = rawPath.split('#')[0].replace(/^\.\//, '');
+        if (!cleanPath.endsWith('.md') && !cleanPath.endsWith('.markdown')) {
+          cleanPath = `${cleanPath}.md`;
+        }
+        // If sourcePath provided and cleanPath is relative
+        let targetPath = cleanPath;
+        if (sourcePath && !rawPath.startsWith('/')) {
+          const folder = sourcePath.split('/').slice(0, -1).join('/');
+          targetPath = folder ? `${folder}/${cleanPath}` : cleanPath;
+        }
+
+        const stem = targetPath.split('/').pop()?.replace(/\.md$/, '') || 'Untitled';
         const templateContent = `# ${stem}\n\n`;
 
-        await api.noteCreate(cleanPath, templateContent);
+        await api.noteCreate(targetPath, templateContent);
         await refreshTree();
-        showToast(`Created note "${cleanPath}"`);
-        await handleSelectNote(cleanPath);
+        await refreshStats();
+        showToast(`Created note "${targetPath}"`);
+        await handleSelectNote(targetPath);
       } catch (err: any) {
         showToast(`Failed to create note: ${err?.message || String(err)}`);
       }
     },
-    [handleSelectNote, refreshTree, showToast]
+    [handleSelectNote, refreshStats, refreshTree, showToast]
   );
 
   // Open external URL in system browser (SPEC §6.3, M6)
@@ -939,6 +1034,7 @@ export const App: React.FC = () => {
           onHeadingInView={(anchor) => setActiveHeadingAnchor(anchor)}
           scrollToAnchor={scrollToAnchor}
           treeData={treeData}
+          indexedNotes={indexedNotes}
           savedScrollTop={activeScrollTop}
           savedCursorPos={activeCursorPos}
           onScrollOrCursorChange={(scrollTop, cursorPos) => {
@@ -957,14 +1053,16 @@ export const App: React.FC = () => {
         )}
       </div>
 
-      {/* Status bar */}
+      {/* Status bar (SPEC §6.1, §6.2, §9.1, M7) */}
       <StatusBar
         workspaceName={workspaceInfo.name}
-        noteCount={Object.keys(noteState).length}
-        linkCount={12803}
-        unresolvedCount={1}
-        cursorLine={10}
-        cursorCol={42}
+        noteCount={workspaceStats.note_count}
+        linkCount={workspaceStats.link_count}
+        unresolvedCount={workspaceStats.unresolved_count}
+        indexingProgress={indexingProgress}
+        onClickUnresolved={() => setUnresolvedModalOpen(true)}
+        cursorLine={1}
+        cursorCol={1}
       />
 
       {/* Command Palette Modal */}
@@ -972,8 +1070,20 @@ export const App: React.FC = () => {
         isOpen={paletteOpen}
         onClose={() => setPaletteOpen(false)}
         notes={noteState}
+        indexedNotes={indexedNotes}
         onSelectNote={handleSelectNote}
         initialMode={paletteMode}
+      />
+
+      {/* Unresolved Links Modal (M7) */}
+      <UnresolvedLinksModal
+        isOpen={unresolvedModalOpen}
+        onClose={() => setUnresolvedModalOpen(false)}
+        unresolvedLinks={unresolvedLinks}
+        onNavigateToSource={handleSelectNote}
+        onCreateMissingNote={(rawTarget, sourcePath) => {
+          handleCreateBrokenNote(rawTarget, sourcePath);
+        }}
       />
 
       {/* Conflict Diff Viewer */}

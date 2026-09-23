@@ -43,34 +43,41 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
             No backlinks for this note.
           </div>
         ) : (
-          note.backlinks.map((group) => (
-            <div key={group.sourcePath} className="mb-2">
-              <div className="flex items-baseline gap-1.5 px-3 pt-1.5 pb-0.5">
-                <b
-                  onClick={() => onNavigate(group.sourcePath)}
-                  className="font-medium text-[12.5px] text-[var(--text)] hover:text-[var(--accent)] cursor-pointer truncate"
-                >
-                  {group.sourceTitle}
-                </b>
-                <i className="ml-auto not-italic text-[var(--faint)] text-[11px] font-mono">
-                  {group.folder || 'root'}
-                </i>
+          note.backlinks.map((group) => {
+            const sourcePath = group.source_path || group.sourcePath || '';
+            const sourceTitle = group.source_title || group.sourceTitle || sourcePath;
+            return (
+              <div key={sourcePath} className="mb-2">
+                <div className="flex items-baseline gap-1.5 px-3 pt-1.5 pb-0.5">
+                  <b
+                    onClick={() => onNavigate(sourcePath)}
+                    className="font-medium text-[12.5px] text-[var(--text)] hover:text-[var(--accent)] cursor-pointer truncate"
+                    title={sourcePath}
+                  >
+                    {sourceTitle}
+                  </b>
+                  <i className="ml-auto not-italic text-[var(--faint)] text-[11px] font-mono">
+                    {group.folder || 'root'}
+                  </i>
+                </div>
+                {group.occurrences.map((occ, idx) => (
+                  <a
+                    key={idx}
+                    href="#"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      onNavigate(sourcePath);
+                    }}
+                    className="block px-3 py-1 font-mono text-[11.5px] text-[var(--muted)] border-l-2 border-[var(--border)] ml-3 mb-1 hover:border-[var(--accent)] hover:text-[var(--text-2)] transition-colors truncate"
+                    title={`Line ${occ.line}: ${occ.context}`}
+                  >
+                    <span className="text-[var(--faint)] mr-1.5 text-[10px]">L{occ.line}</span>
+                    {occ.context}
+                  </a>
+                ))}
               </div>
-              {group.occurrences.map((occ, idx) => (
-                <a
-                  key={idx}
-                  href="#"
-                  onClick={(e) => {
-                    e.preventDefault();
-                    onNavigate(group.sourcePath);
-                  }}
-                  className="block px-3 py-1 font-mono text-[11.5px] text-[var(--muted)] border-l-2 border-[var(--border)] ml-3 mb-1 hover:border-[var(--accent)] hover:text-[var(--text-2)] transition-colors truncate"
-                >
-                  {occ.context}
-                </a>
-              ))}
-            </div>
-          ))
+            );
+          })
         )}
 
         {/* Outgoing Links Section */}

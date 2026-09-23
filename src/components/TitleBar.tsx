@@ -9,6 +9,10 @@ export interface TitleBarProps {
   onOpenPalette: () => void;
   onToggleTheme: () => void;
   theme: 'light' | 'dark';
+  leftSidebarVisible?: boolean;
+  onToggleLeftSidebar?: () => void;
+  rightSidebarVisible?: boolean;
+  onToggleRightSidebar?: () => void;
 }
 
 export const TitleBar: React.FC<TitleBarProps> = ({
@@ -18,6 +22,10 @@ export const TitleBar: React.FC<TitleBarProps> = ({
   onOpenPalette,
   onToggleTheme,
   theme,
+  leftSidebarVisible = true,
+  onToggleLeftSidebar,
+  rightSidebarVisible = true,
+  onToggleRightSidebar,
 }) => {
   const parts = breadcrumb.split('/');
   const root = parts[0] || 'projects';
@@ -93,6 +101,46 @@ export const TitleBar: React.FC<TitleBarProps> = ({
             </button>
           ))}
         </div>
+
+        {/* Left Sidebar Toggle Button */}
+        {onToggleLeftSidebar && (
+          <button
+            onClick={onToggleLeftSidebar}
+            className={`w-[26px] h-[24px] grid place-items-center rounded-[5px] transition-colors text-xs ${
+              leftSidebarVisible
+                ? 'text-[var(--text)] bg-[var(--panel)]'
+                : 'text-[var(--muted)] hover:bg-[var(--panel)] hover:text-[var(--text)]'
+            }`}
+            title={`${leftSidebarVisible ? 'Hide' : 'Show'} left sidebar (⌘B)`}
+            aria-label={`${leftSidebarVisible ? 'Hide' : 'Show'} left sidebar`}
+            aria-pressed={leftSidebarVisible}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
+              <line x1="9" x2="9" y1="3" y2="21" />
+            </svg>
+          </button>
+        )}
+
+        {/* Right Sidebar Toggle Button */}
+        {onToggleRightSidebar && (
+          <button
+            onClick={onToggleRightSidebar}
+            className={`w-[26px] h-[24px] grid place-items-center rounded-[5px] transition-colors text-xs ${
+              rightSidebarVisible
+                ? 'text-[var(--text)] bg-[var(--panel)]'
+                : 'text-[var(--muted)] hover:bg-[var(--panel)] hover:text-[var(--text)]'
+            }`}
+            title={`${rightSidebarVisible ? 'Hide' : 'Show'} links sidebar (⌘⌥B)`}
+            aria-label={`${rightSidebarVisible ? 'Hide' : 'Show'} links sidebar`}
+            aria-pressed={rightSidebarVisible}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
+              <line x1="15" x2="15" y1="3" y2="21" />
+            </svg>
+          </button>
+        )}
 
         {/* Theme Toggle */}
         <button

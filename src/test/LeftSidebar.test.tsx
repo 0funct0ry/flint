@@ -148,4 +148,16 @@ describe("LeftSidebar", () => {
 
     expect(screen.getByText("Permission denied accessing /secret")).toBeInTheDocument();
   });
+
+  it("renders search tab controls and empty query state", () => {
+    render(
+      <LeftSidebar
+        {...defaultProps}
+        activeTab="search"
+      />
+    );
+
+    expect(screen.getByPlaceholderText("Search in workspace...")).toBeInTheDocument();
+    expect(screen.getByText("Type a query to search across all notes.")).toBeInTheDocument();
+  });
 });

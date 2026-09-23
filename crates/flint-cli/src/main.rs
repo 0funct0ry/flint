@@ -265,16 +265,26 @@ fn run() -> Result<u8, (u8, String)> {
             )
             .map_err(map_ws_error)?;
 
+            let opts = flint_core::ContentSearchOptions::default();
+            let results = flint_core::search_content(&ws_root, &query, &opts)
+                .map_err(|e| (exit_codes::GENERIC_FAILURE, format!("Search failed: {}", e)))?;
+
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::json!({
-                        "query": query,
-                        "results": []
-                    })
+                    serde_json::to_string(&results).map_err(|e| {
+                        (
+                            exit_codes::GENERIC_FAILURE,
+                            format!("JSON serialization error: {}", e),
+                        )
+                    })?
                 );
             } else {
-                println!("Search query '{}' in {}", query, ws_root.display());
+                for group in &results {
+                    for hit in &group.matches {
+                        println!("{}:{}:{}", group.path, hit.line, hit.line_text);
+                    }
+                }
             }
             Ok(exit_codes::SUCCESS)
         }
@@ -297,7 +307,8 @@ fn run() -> Result<u8, (u8, String)> {
                 for item in items {
                     if item.is_note == Some(true) {
                         if let Some(folder_prefix) = filter_folder {
-                            if item.path.starts_with(folder_prefix) {
+                            let clean_prefix = folder_prefix.trim().trim_matches('/');
+                            if item.path.starts_with(clean_prefix) {
                                 acc.push(item.path.clone());
                             }
                         } else {
@@ -331,21 +342,47 @@ fn run() -> Result<u8, (u8, String)> {
             )
             .map_err(map_ws_error)?;
 
+            let report = flint_core::check_workspace_health(&ws_root)
+                .map_err(|e| (exit_codes::GENERIC_FAILURE, format!("Doctor failed: {}", e)))?;
+
             if cli.json {
                 println!(
                     "{}",
-                    serde_json::json!({
-                        "workspace": ws_root.display().to_string(),
-                        "broken_links": 0,
-                        "orphans": 0,
-                        "unreadable_files": 0
-                    })
+                    serde_json::to_string(&report).map_err(|e| {
+                        (
+                            exit_codes::GENERIC_FAILURE,
+                            format!("JSON serialization error: {}", e),
+                        )
+                    })?
                 );
             } else {
-                println!("Workspace health report for {}", ws_root.display());
-                println!("✓ 0 broken links");
-                println!("✓ 0 orphan notes");
-                println!("✓ 0 unreadable files");
+                println!("Workspace health report for {}", report.workspace);
+                if report.broken_links.is_empty() {
+                    println!("✓ 0 broken links");
+                } else {
+                    println!("✗ {} broken link(s):", report.broken_links.len());
+                    for bl in &report.broken_links {
+                        println!("  - in {}:{} -> {}", bl.source, bl.line, bl.raw_target);
+                    }
+                }
+
+                if report.orphan_notes.is_empty() {
+                    println!("✓ 0 orphan notes");
+                } else {
+                    println!("! {} orphan note(s):", report.orphan_notes.len());
+                    for o in &report.orphan_notes {
+                        println!("  - {}", o);
+                    }
+                }
+
+                if report.unreadable_files.is_empty() {
+                    println!("✓ 0 unreadable files");
+                } else {
+                    println!("✗ {} unreadable file(s):", report.unreadable_files.len());
+                    for u in &report.unreadable_files {
+                        println!("  - {}", u);
+                    }
+                }
             }
             Ok(exit_codes::SUCCESS)
         }

@@ -112,3 +112,42 @@ export interface NoteEventPayload {
   to?: string;
 }
 
+export interface NameHit {
+  path: string;
+  title: string;
+  score: number;
+  match_indices_title: number[];
+  match_indices_path: number[];
+}
+
+export interface ContentHit {
+  line: number;
+  col: number;
+  match_length: number;
+  line_text: string;
+}
+
+export interface ContentHitGroup {
+  path: string;
+  title: string;
+  matches: ContentHit[];
+}
+
+export interface ContentSearchOptions {
+  case_sensitive?: boolean;
+  whole_word?: boolean;
+  is_regex?: boolean;
+  folder_scope?: string;
+  includes?: string[];
+  excludes?: string[];
+}
+
+export interface DoctorReport {
+  workspace: string;
+  note_count: number;
+  link_count: number;
+  broken_links: LinkItem[];
+  orphan_notes: string[];
+  unreadable_files: string[];
+}
+

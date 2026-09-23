@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { TreeNodeItem, HeadingItem } from '../types';
-import { FIXTURE_NOTES } from '../fixtures/workspace';
+import { TreeNodeItem, HeadingItem, ContentHitGroup } from '../types';
+import { api } from '../services/ipc';
 import { ContextMenu, ContextMenuItem } from './ContextMenu';
 
 export type LeftTab = 'tree' | 'search' | 'outline';
@@ -17,7 +17,7 @@ export interface LeftSidebarProps {
   onTabChange: (tab: LeftTab) => void;
   treeData: TreeNodeItem[];
   currentNotePath: string;
-  onSelectNote: (path: string) => void;
+  onSelectNote: (path: string, targetLine?: number) => void;
   headings: HeadingItem[];
   isEmpty?: boolean;
   error?: string | null;
@@ -36,6 +36,7 @@ export interface LeftSidebarProps {
   onCancelInlineAction: () => void;
   activeHeadingAnchor?: string;
   onSelectHeading?: (anchor: string) => void;
+  onClose?: () => void;
 }
 
 export const LeftSidebar: React.FC<LeftSidebarProps> = ({
@@ -62,6 +63,7 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   onCancelInlineAction,
   activeHeadingAnchor,
   onSelectHeading,
+  onClose,
 }) => {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set(['projects', 'projects/payments', 'archive', 'reading', 'guides'])
@@ -103,11 +105,48 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   }, [inlineAction]);
 
   // Search panel state
-  const [searchQuery, setSearchQuery] = useState('settlement window');
-  const [caseSensitive, setCaseSensitive] = useState(true);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [caseSensitive, setCaseSensitive] = useState(false);
   const [wholeWord, setWholeWord] = useState(false);
   const [isRegex, setIsRegex] = useState(false);
   const [folderScope, setFolderScope] = useState(false);
+  const [searchHits, setSearchHits] = useState<ContentHitGroup[]>([]);
+  const [searchError, setSearchError] = useState<string | null>(null);
+  const [isSearching, setIsSearching] = useState(false);
+
+  // Debounced searchContent query (120ms debounce per PROMPTS.md / SPEC §8.2)
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      setSearchHits([]);
+      setSearchError(null);
+      setIsSearching(false);
+      return;
+    }
+
+    setIsSearching(true);
+    const timer = setTimeout(async () => {
+      try {
+        const folder = folderScope ? (selectedFolderPath || currentNotePath.split('/').slice(0, -1).join('/')) : undefined;
+        const results = await api.searchContent(searchQuery, {
+          case_sensitive: caseSensitive,
+          whole_word: wholeWord,
+          is_regex: isRegex,
+          folder_scope: folder || undefined,
+          includes: [],
+          excludes: [],
+        });
+        setSearchHits(results);
+        setSearchError(null);
+      } catch (err: any) {
+        setSearchHits([]);
+        setSearchError(err?.message || String(err));
+      } finally {
+        setIsSearching(false);
+      }
+    }, 120);
+
+    return () => clearTimeout(timer);
+  }, [searchQuery, caseSensitive, wholeWord, isRegex, folderScope, selectedFolderPath, currentNotePath]);
 
   const toggleFolder = (path: string) => {
     setExpandedFolders((prev) => {
@@ -345,45 +384,7 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
     setDraggedItem(null);
   };
 
-  // Compute search hits across fixture notes
-  const searchHits = React.useMemo(() => {
-    if (!searchQuery.trim()) return [];
-    const results: Array<{
-      notePath: string;
-      matches: Array<{ line: number; text: string; matchSpan: [number, number] }>;
-    }> = [];
 
-    Object.values(FIXTURE_NOTES).forEach((note) => {
-      const lines = note.content.split('\n');
-      const noteMatches: Array<{ line: number; text: string; matchSpan: [number, number] }> = [];
-
-      lines.forEach((line, idx) => {
-        let matchIdx = -1;
-        if (caseSensitive) {
-          matchIdx = line.indexOf(searchQuery);
-        } else {
-          matchIdx = line.toLowerCase().indexOf(searchQuery.toLowerCase());
-        }
-
-        if (matchIdx !== -1) {
-          noteMatches.push({
-            line: idx + 1,
-            text: line,
-            matchSpan: [matchIdx, matchIdx + searchQuery.length],
-          });
-        }
-      });
-
-      if (noteMatches.length > 0) {
-        results.push({
-          notePath: note.path,
-          matches: noteMatches,
-        });
-      }
-    });
-
-    return results;
-  }, [searchQuery, caseSensitive]);
 
   // Render recursive tree rows
   const renderTree = (items: TreeNodeItem[], depth = 0, currentParent = '') => {
@@ -659,6 +660,17 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
         >
           Outline
         </button>
+
+        {onClose && (
+          <button
+            onClick={onClose}
+            className="ml-auto mr-1.5 self-center w-5 h-5 flex items-center justify-center rounded text-[var(--muted)] hover:bg-[var(--panel-2)] hover:text-[var(--text)] transition-colors text-xs font-semibold"
+            title="Collapse sidebar (⌘B)"
+            aria-label="Collapse sidebar"
+          >
+            -
+          </button>
+        )}
       </div>
 
       {/* Pane Content */}
@@ -766,34 +778,62 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
             </div>
 
             <div className="flex-1 overflow-auto p-1">
-              {searchHits.length === 0 ? (
+              {searchError ? (
+                <div className="p-3 m-2 bg-[var(--danger-soft)]/20 border border-[var(--spark)] rounded-[5px]">
+                  <div className="text-[11.5px] font-semibold text-[var(--spark)] mb-1 flex items-center gap-1">
+                    <span>⚠</span> {isRegex ? 'Invalid Regular Expression' : 'Search Error'}
+                  </div>
+                  <div className="text-[11px] font-mono text-[var(--text-2)] break-words">
+                    {searchError}
+                  </div>
+                </div>
+              ) : isSearching ? (
                 <div className="p-4 text-center text-xs text-[var(--faint)]">
-                  No matching results found.
+                  Searching workspace...
+                </div>
+              ) : !searchQuery.trim() ? (
+                <div className="p-4 text-center text-xs text-[var(--faint)]">
+                  Type a query to search across all notes.
+                </div>
+              ) : searchHits.length === 0 ? (
+                <div className="p-4 text-center text-xs text-[var(--faint)]">
+                  No matching results found for "{searchQuery}".
                 </div>
               ) : (
                 searchHits.map((group) => (
-                  <div key={group.notePath} className="mb-2">
-                    <div className="px-2.5 py-1 text-[11.5px] font-medium text-[var(--muted)] truncate">
-                      {group.notePath} · {group.matches.length}
+                  <div key={group.path} className="mb-2">
+                    <div
+                      onClick={() => onSelectNote(group.path)}
+                      className="px-2.5 py-1 text-[11.5px] font-medium text-[var(--muted)] hover:text-[var(--text)] cursor-pointer truncate flex items-center justify-between"
+                      title={group.path}
+                    >
+                      <span className="truncate">{group.path}</span>
+                      <span className="text-[10.5px] font-mono text-[var(--faint)] ml-1 shrink-0">
+                        {group.matches.length}
+                      </span>
                     </div>
-                    {group.matches.map((hit, idx) => (
-                      <div
-                        key={idx}
-                        onClick={() => onSelectNote(group.notePath)}
-                        className="flex gap-2 px-2.5 py-1 text-[11.5px] font-mono text-[var(--text-2)] hover:bg-[var(--panel-2)] cursor-pointer truncate rounded"
-                      >
-                        <span className="text-[var(--faint)] min-w-[20px] text-right shrink-0">
-                          {hit.line}
-                        </span>
-                        <span className="truncate">
-                          {hit.text.slice(0, hit.matchSpan[0])}
-                          <mark className="bg-[rgba(201,138,46,0.28)] text-inherit rounded-sm px-0.5">
-                            {hit.text.slice(hit.matchSpan[0], hit.matchSpan[1])}
-                          </mark>
-                          {hit.text.slice(hit.matchSpan[1])}
-                        </span>
-                      </div>
-                    ))}
+                    {group.matches.map((hit, idx) => {
+                      const start = Math.max(0, hit.col - 1);
+                      const end = start + hit.match_length;
+                      return (
+                        <div
+                          key={idx}
+                          onClick={() => onSelectNote(group.path, hit.line)}
+                          className="flex gap-2 px-2.5 py-1 text-[11.5px] font-mono text-[var(--text-2)] hover:bg-[var(--panel-2)] cursor-pointer truncate rounded"
+                        >
+                          <span className="text-[var(--faint)] min-w-[20px] text-right shrink-0">
+                            {hit.line}
+                          </span>
+                          <span className="truncate">
+                            {hit.line_text.slice(0, start)}
+                            <mark className="bg-[rgba(201,138,46,0.28)] text-inherit rounded-sm px-0.5">
+                              {hit.line_text.slice(start, end)}
+                            </mark>
+                            {hit.line_text.slice(end)}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
                 ))
               )}

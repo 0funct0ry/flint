@@ -749,6 +749,39 @@ fn index_notes(state: State<AppState>) -> Result<Vec<NoteMeta>, String> {
     Ok(lock.get_note_list())
 }
 
+/// Search note names and paths fuzzily across the index (SPEC §7, M9).
+#[tauri::command]
+fn search_names(
+    query: String,
+    limit: Option<usize>,
+    state: State<AppState>,
+) -> Result<Vec<flint_core::NameHit>, String> {
+    let lock = state
+        .index
+        .read()
+        .map_err(|e| format!("Index read error: {}", e))?;
+    Ok(lock.search_names(&query, limit))
+}
+
+/// Search note content in parallel with options (SPEC §7, M9).
+#[tauri::command]
+fn search_content(
+    query: String,
+    options: Option<flint_core::ContentSearchOptions>,
+    state: State<AppState>,
+) -> Result<Vec<flint_core::ContentHitGroup>, String> {
+    let root = get_workspace_root(&state)?;
+    let opts = options.unwrap_or_default();
+    flint_core::search_content(&root, &query, &opts)
+}
+
+/// Run workspace doctor health diagnostics (SPEC §4, §13, M9).
+#[tauri::command]
+fn workspace_doctor(state: State<AppState>) -> Result<flint_core::DoctorReport, String> {
+    let root = get_workspace_root(&state)?;
+    flint_core::check_workspace_health(&root)
+}
+
 /// Open an external URL in the default system browser (SPEC §6.3, §11, M6).
 #[tauri::command]
 fn open_external(url: String) -> Result<(), String> {
@@ -810,6 +843,9 @@ pub fn run_with_workspace(initial_path: Option<PathBuf>) {
             links_backlinks,
             index_unresolved,
             index_notes,
+            search_names,
+            search_content,
+            workspace_doctor,
             note_read,
             note_write,
             note_create,

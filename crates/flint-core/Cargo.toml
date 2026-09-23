@@ -15,6 +15,9 @@ ignore.workspace = true
 pulldown-cmark.workspace = true
 ammonia.workspace = true
 syntect.workspace = true
+rayon.workspace = true
+regex.workspace = true
+globset.workspace = true
 
 [dev-dependencies]
 proptest = "1.6"

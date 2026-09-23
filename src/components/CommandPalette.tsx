@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { NoteFixture, NoteMeta } from '../types';
+import { NoteFixture, NoteMeta, NameHit } from '../types';
+import { api } from '../services/ipc';
 import { commandRegistry, Command } from '../commands/registry';
 
 export interface CommandPaletteProps {
@@ -47,15 +48,68 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     }
   }, [isOpen, initialMode]);
 
+  const [fuzzyNotes, setFuzzyNotes] = useState<PaletteItem[]>([]);
+
   // Build items based on query
   const isCommandMode = query.startsWith('>');
   const cleanQuery = isCommandMode ? query.slice(1).trim().toLowerCase() : query.trim().toLowerCase();
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!isCommandMode) {
+      api.searchNames(cleanQuery, 30)
+        .then((hits: NameHit[]) => {
+          if (cancelled) return;
+          const mapped: PaletteItem[] = hits.map((h: NameHit) => ({
+            id: h.path,
+            type: 'note',
+            title: h.title,
+            subtitle: h.path,
+            glyph: '◦',
+            onSelect: () => {
+              onSelectNote(h.path);
+              onClose();
+            },
+          }));
+          setFuzzyNotes(mapped);
+        })
+        .catch(() => {
+          if (cancelled) return;
+          const noteList: Array<{ path: string; title: string }> = indexedNotes.length > 0
+            ? indexedNotes.map((n) => ({ path: n.path, title: n.title }))
+            : Object.values(notes).map((n) => ({ path: n.path, title: n.title }));
+
+          const filtered = noteList.filter(
+            (n) =>
+              n.title.toLowerCase().includes(cleanQuery) ||
+              n.path.toLowerCase().includes(cleanQuery)
+          );
+
+          setFuzzyNotes(
+            filtered.slice(0, 30).map((n) => ({
+              id: n.path,
+              type: 'note',
+              title: n.title,
+              subtitle: n.path,
+              glyph: '◦',
+              onSelect: () => {
+                onSelectNote(n.path);
+                onClose();
+              },
+            }))
+          );
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [cleanQuery, isCommandMode, indexedNotes, notes, onClose, onSelectNote]);
 
   const items: PaletteItem[] = React.useMemo(() => {
     if (isCommandMode) {
       const allCommands: Command[] = commandRegistry.getAll();
       return allCommands
-        .filter((cmd) => cmd.title.toLowerCase().includes(cleanQuery))
+        .filter((cmd) => cmd.title.toLowerCase().includes(cleanQuery) || (cmd.shortcutDisplay || '').toLowerCase().includes(cleanQuery))
         .map((cmd) => ({
           id: cmd.id,
           type: 'command',
@@ -69,29 +123,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
           },
         }));
     } else {
-      const noteList: Array<{ path: string; title: string }> = indexedNotes.length > 0
-        ? indexedNotes.map((n) => ({ path: n.path, title: n.title }))
-        : Object.values(notes).map((n) => ({ path: n.path, title: n.title }));
-
-      const filtered = noteList.filter(
-        (n) =>
-          n.title.toLowerCase().includes(cleanQuery) ||
-          n.path.toLowerCase().includes(cleanQuery)
-      );
-
-      return filtered.slice(0, 30).map((n) => ({
-        id: n.path,
-        type: 'note',
-        title: n.title,
-        subtitle: n.path,
-        glyph: '◦',
-        onSelect: () => {
-          onSelectNote(n.path);
-          onClose();
-        },
-      }));
+      return fuzzyNotes;
     }
-  }, [isCommandMode, cleanQuery, notes, indexedNotes, onClose, onSelectNote]);
+  }, [isCommandMode, cleanQuery, fuzzyNotes, onClose]);
 
   // Keyboard navigation inside palette
   const handleKeyDown = (e: React.KeyboardEvent) => {

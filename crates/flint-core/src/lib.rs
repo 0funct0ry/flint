@@ -142,6 +142,61 @@ pub struct TreeNodeItem {
     pub title: Option<String>,
 }
 
+/// A search hit when matching note names or paths (SPEC §7, M9).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NameHit {
+    pub path: String,
+    pub title: String,
+    pub score: i64,
+    pub match_indices_title: Vec<usize>,
+    pub match_indices_path: Vec<usize>,
+}
+
+/// A line match inside a note's content (SPEC §7, M9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentHit {
+    pub line: u32,
+    pub col: u32,
+    pub match_length: usize,
+    pub line_text: String,
+}
+
+/// A group of content matches in a single note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentHitGroup {
+    pub path: String,
+    pub title: String,
+    pub matches: Vec<ContentHit>,
+}
+
+/// Content search options (SPEC §7, M9).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContentSearchOptions {
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub whole_word: bool,
+    #[serde(default)]
+    pub is_regex: bool,
+    #[serde(default)]
+    pub folder_scope: Option<String>,
+    #[serde(default)]
+    pub includes: Vec<String>,
+    #[serde(default)]
+    pub excludes: Vec<String>,
+}
+
+/// Health report returned by workspace doctor (SPEC §4, §13, M9).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub workspace: String,
+    pub note_count: usize,
+    pub link_count: usize,
+    pub broken_links: Vec<Link>,
+    pub orphan_notes: Vec<String>,
+    pub unreadable_files: Vec<String>,
+}
+
 /// Error type for path validation (SPEC §10.1).
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone, Serialize, Deserialize)]
 pub enum PathError {
@@ -1583,14 +1638,15 @@ impl Index {
             return Ok(index);
         }
 
-        // Collect all note paths first using ignore crate
+        // Collect all note paths first per SPEC §5.2
         let mut note_files = Vec::new();
         let walker = ignore::WalkBuilder::new(root)
             .hidden(false)
-            .parents(true)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
+            .parents(false)
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .require_git(false)
             .build();
 
         for entry in walker.flatten() {
@@ -1902,6 +1958,382 @@ impl Index {
         });
         notes
     }
+
+    /// Search note names and paths fuzzily across the index (SPEC §7, M9).
+    ///
+    /// Scored by:
+    /// - Exact match: +1000
+    /// - Prefix match: +500
+    /// - Word boundary match: +200
+    /// - Subsequence match: +10 per char, bonus for consecutive matches
+    /// - Path depth penalty: -10 per slash (shallower paths score higher)
+    pub fn search_names(&self, query: &str, limit: Option<usize>) -> Vec<NameHit> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            // Return top notes up to limit
+            let max = limit.unwrap_or(30);
+            return self
+                .get_note_list()
+                .into_iter()
+                .take(max)
+                .map(|n| NameHit {
+                    path: n.path,
+                    title: n.title,
+                    score: 0,
+                    match_indices_title: Vec::new(),
+                    match_indices_path: Vec::new(),
+                })
+                .collect();
+        }
+
+        let query_lower = trimmed.to_lowercase();
+        let query_chars: Vec<char> = query_lower.chars().collect();
+        let mut hits = Vec::new();
+
+        for note in self.notes.values() {
+            let title_lower = note.title.to_lowercase();
+            let path_lower = note.path.to_lowercase();
+
+            let title_match = fuzzy_match_subsequence(&query_chars, &title_lower);
+            let path_match = fuzzy_match_subsequence(&query_chars, &path_lower);
+
+            if let Some((score_title, indices_title)) = title_match {
+                let depth = note.path.matches('/').count() as i64;
+                let final_score = score_title + 50 - (depth * 5);
+                hits.push(NameHit {
+                    path: note.path.clone(),
+                    title: note.title.clone(),
+                    score: final_score,
+                    match_indices_title: indices_title,
+                    match_indices_path: Vec::new(),
+                });
+            } else if let Some((score_path, indices_path)) = path_match {
+                let depth = note.path.matches('/').count() as i64;
+                let final_score = score_path - (depth * 10);
+                hits.push(NameHit {
+                    path: note.path.clone(),
+                    title: note.title.clone(),
+                    score: final_score,
+                    match_indices_title: Vec::new(),
+                    match_indices_path: indices_path,
+                });
+            }
+        }
+
+        hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+
+        if let Some(l) = limit {
+            hits.truncate(l);
+        }
+
+        hits
+    }
+}
+
+/// Helper function to perform fuzzy subsequence matching and scoring.
+/// Returns Option<(score, match_indices)>
+fn fuzzy_match_subsequence(query_chars: &[char], target: &str) -> Option<(i64, Vec<usize>)> {
+    if query_chars.is_empty() {
+        return Some((0, Vec::new()));
+    }
+
+    let target_chars: Vec<char> = target.chars().collect();
+    if target_chars.is_empty() {
+        return None;
+    }
+
+    // Exact match check
+    let query_str: String = query_chars.iter().collect();
+    if target == query_str {
+        return Some((1000, (0..target.len()).collect()));
+    }
+
+    // Substring match check
+    if let Some(pos) = target.find(&query_str) {
+        let is_word_boundary = pos == 0
+            || target
+                .chars()
+                .nth(pos - 1)
+                .map(|c| !c.is_alphanumeric())
+                .unwrap_or(true);
+        let score = if pos == 0 {
+            500 + (query_chars.len() as i64 * 20)
+        } else if is_word_boundary {
+            300 + (query_chars.len() as i64 * 15)
+        } else {
+            150 + (query_chars.len() as i64 * 10)
+        };
+        return Some((score, (pos..pos + query_str.len()).collect()));
+    }
+
+    // Greedy subsequence match
+    let mut q_idx = 0;
+    let mut indices = Vec::with_capacity(query_chars.len());
+    let mut score = 0i64;
+    let mut last_match_idx = None;
+
+    for (t_idx, &tc) in target_chars.iter().enumerate() {
+        if q_idx < query_chars.len() && tc == query_chars[q_idx] {
+            indices.push(t_idx);
+            let mut char_score = 10;
+
+            // Bonus for consecutive matches
+            if let Some(prev) = last_match_idx {
+                if prev + 1 == t_idx {
+                    char_score += 15;
+                }
+            }
+
+            // Bonus for word boundaries (start of string or after non-alphanumeric)
+            if t_idx == 0 || (t_idx > 0 && !target_chars[t_idx - 1].is_alphanumeric()) {
+                char_score += 25;
+            }
+
+            score += char_score;
+            last_match_idx = Some(t_idx);
+            q_idx += 1;
+        }
+    }
+
+    if q_idx == query_chars.len() {
+        Some((score, indices))
+    } else {
+        None
+    }
+}
+
+/// Search note content in parallel using `rayon` with regex, whole word, case sensitivity, and glob filters (SPEC §7, M9).
+pub fn search_content(
+    root: &Path,
+    query: &str,
+    options: &ContentSearchOptions,
+) -> Result<Vec<ContentHitGroup>, String> {
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Prepare Regex pattern
+    let pattern_str = if options.is_regex {
+        if options.whole_word {
+            format!(r"\b(?:{})\b", query)
+        } else {
+            query.to_string()
+        }
+    } else {
+        let escaped = regex::escape(query);
+        if options.whole_word {
+            format!(r"\b{}\b", escaped)
+        } else {
+            escaped
+        }
+    };
+
+    let regex = regex::RegexBuilder::new(&pattern_str)
+        .case_insensitive(!options.case_sensitive)
+        .build()
+        .map_err(|e| format!("Invalid regex: {}", e))?;
+
+    // Build include / exclude glob matchers if specified
+    let include_builder = if !options.includes.is_empty() {
+        let mut builder = globset::GlobSetBuilder::new();
+        for inc in &options.includes {
+            let glob = globset::Glob::new(inc)
+                .map_err(|e| format!("Invalid include glob '{}': {}", inc, e))?;
+            builder.add(glob);
+        }
+        Some(builder.build().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+
+    let exclude_builder = if !options.excludes.is_empty() {
+        let mut builder = globset::GlobSetBuilder::new();
+        for exc in &options.excludes {
+            let glob = globset::Glob::new(exc)
+                .map_err(|e| format!("Invalid exclude glob '{}': {}", exc, e))?;
+            builder.add(glob);
+        }
+        Some(builder.build().map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+
+    // Collect note candidate paths per SPEC §5.2
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .parents(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .build();
+
+    let mut note_paths = Vec::new();
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if !path.is_file() || !is_note_path(path) {
+            continue;
+        }
+
+        let rel = path.strip_prefix(root).unwrap_or(path);
+
+        // Check if any component is default ignored
+        let mut is_ignored = false;
+        for comp in rel.components() {
+            if let Component::Normal(s) = comp {
+                let name = s.to_string_lossy();
+                if is_default_ignored(&name) {
+                    is_ignored = true;
+                    break;
+                }
+            }
+        }
+        if is_ignored {
+            continue;
+        }
+
+        let posix_rel = to_posix_path(rel);
+
+        // Check folder scope
+        if let Some(ref folder) = options.folder_scope {
+            let clean_folder = folder.trim().trim_matches('/');
+            if !clean_folder.is_empty()
+                && !posix_rel.starts_with(&format!("{}/", clean_folder))
+                && posix_rel != clean_folder
+            {
+                continue;
+            }
+        }
+
+        // Check include globs
+        if let Some(ref inc) = include_builder {
+            if !inc.is_match(&posix_rel) {
+                continue;
+            }
+        }
+
+        // Check exclude globs
+        if let Some(ref exc) = exclude_builder {
+            if exc.is_match(&posix_rel) {
+                continue;
+            }
+        }
+
+        if let Ok(safe) = SafePath::resolve(root, &posix_rel) {
+            note_paths.push(safe);
+        }
+    }
+
+    // Scan in parallel with rayon
+    use rayon::prelude::*;
+    let results: Vec<ContentHitGroup> = note_paths
+        .par_iter()
+        .filter_map(|safe_path| {
+            let abs_path = safe_path.as_path();
+            let posix = safe_path.to_posix_string();
+            let content = fs::read_to_string(abs_path).ok()?;
+            let title = resolve_note_title(&content, safe_path.as_relative_path());
+
+            let mut hits = Vec::new();
+            for (line_idx, line) in content.lines().enumerate() {
+                for mat in regex.find_iter(line) {
+                    hits.push(ContentHit {
+                        line: (line_idx + 1) as u32,
+                        col: (mat.start() + 1) as u32,
+                        match_length: mat.end() - mat.start(),
+                        line_text: line.to_string(),
+                    });
+                }
+            }
+
+            if !hits.is_empty() {
+                Some(ContentHitGroup {
+                    path: posix,
+                    title,
+                    matches: hits,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut sorted_results = results;
+    sorted_results.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(sorted_results)
+}
+
+/// Perform workspace health checks: broken links, orphan notes, unreadable files (SPEC §4, §13, M9).
+pub fn check_workspace_health(root: &Path) -> Result<DoctorReport, String> {
+    if !root.exists() || !root.is_dir() {
+        return Err(format!("Workspace directory not found: {}", root.display()));
+    }
+
+    let mut unreadable_files = Vec::new();
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .parents(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .build();
+
+    let mut _total_notes = 0;
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if path.is_file() && is_note_path(path) {
+            let rel = path.strip_prefix(root).unwrap_or(path);
+
+            // Check if ignored by default rules
+            let mut is_ignored = false;
+            for comp in rel.components() {
+                if let Component::Normal(s) = comp {
+                    let name = s.to_string_lossy();
+                    if is_default_ignored(&name) {
+                        is_ignored = true;
+                        break;
+                    }
+                }
+            }
+            if is_ignored {
+                continue;
+            }
+
+            _total_notes += 1;
+            if fs::read_to_string(path).is_err() {
+                unreadable_files.push(to_posix_path(rel));
+            }
+        }
+    }
+
+    let index = Index::build_from_workspace(root, |_, _| {})
+        .map_err(|e| format!("Index build error: {}", e))?;
+
+    let broken_links = index.get_unresolved_links();
+
+    // Find orphan notes: notes that have 0 incoming links and 0 outgoing links
+    let mut orphan_notes = Vec::new();
+    for note_path in index.notes.keys() {
+        let out_links_count = index.links_out.get(note_path).map(|l| l.len()).unwrap_or(0);
+        let in_links_count = index.links_in.get(note_path).map(|l| l.len()).unwrap_or(0);
+
+        if out_links_count == 0 && in_links_count == 0 {
+            orphan_notes.push(note_path.clone());
+        }
+    }
+    orphan_notes.sort();
+
+    let stats = index.get_stats();
+
+    Ok(DoctorReport {
+        workspace: root.display().to_string(),
+        note_count: stats.note_count,
+        link_count: stats.link_count,
+        broken_links,
+        orphan_notes,
+        unreadable_files,
+    })
 }
 
 #[cfg(test)]
@@ -2642,6 +3074,122 @@ Also [Unrelated link](https://example.com) and [Other Note](../other.md).
         // Verify projects/auth/login.md updated
         let updated_auth = fs::read_to_string(root.join("projects/auth/login.md")).unwrap();
         assert!(updated_auth.contains("[Settlement](../../core/settlement-engine.md)"));
+    }
+
+    #[test]
+    fn test_search_names_fuzzy_scoring() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("projects/payments")).unwrap();
+        fs::write(
+            root.join("projects/payments/settlement.md"),
+            "---\ntitle: Settlement Windows\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("projects/payments/rails.md"),
+            "---\ntitle: Payment Rails\n---\n",
+        )
+        .unwrap();
+        fs::write(root.join("daily.md"), "---\ntitle: Daily Log\n---\n").unwrap();
+
+        let index = Index::build_from_workspace(root, |_, _| {}).unwrap();
+
+        // Exact query
+        let hits = index.search_names("Settlement Windows", None);
+        assert!(!hits.is_empty());
+        assert_eq!(hits[0].path, "projects/payments/settlement.md");
+        assert!(hits[0].score >= 1000);
+
+        // Substring / fuzzy query
+        let hits_fuzzy = index.search_names("pay rail", None);
+        assert!(!hits_fuzzy.is_empty());
+        assert_eq!(hits_fuzzy[0].path, "projects/payments/rails.md");
+
+        // Path search
+        let hits_path = index.search_names("daily", None);
+        assert!(!hits_path.is_empty());
+        assert_eq!(hits_path[0].path, "daily.md");
+    }
+
+    #[test]
+    fn test_search_content_regex_and_options() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("projects/payments")).unwrap();
+        fs::create_dir_all(root.join("archive")).unwrap();
+
+        fs::write(
+            root.join("projects/payments/settlement.md"),
+            "# Settlement\nBBPS settles daily at 18:00.\nSecond window at 22:00.\n",
+        )
+        .unwrap();
+
+        fs::write(
+            root.join("archive/old_settlement.md"),
+            "# Old Settlement\nBBPS settles at 17:00.\n",
+        )
+        .unwrap();
+
+        // 1. Literal search
+        let opts = ContentSearchOptions::default();
+        let res = search_content(root, "settles", &opts).unwrap();
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].matches.len(), 1);
+
+        // 2. Folder scope
+        let opts_scoped = ContentSearchOptions {
+            folder_scope: Some("projects/payments".into()),
+            ..Default::default()
+        };
+        let res_scoped = search_content(root, "settles", &opts_scoped).unwrap();
+        assert_eq!(res_scoped.len(), 1);
+        assert_eq!(res_scoped[0].path, "projects/payments/settlement.md");
+
+        // 3. Regex search
+        let opts_regex = ContentSearchOptions {
+            is_regex: true,
+            ..Default::default()
+        };
+        let res_regex = search_content(root, r"\d{2}:\d{2}", &opts_regex).unwrap();
+        assert_eq!(res_regex.len(), 2);
+        let settlement_group = res_regex
+            .iter()
+            .find(|g| g.path == "projects/payments/settlement.md")
+            .unwrap();
+        assert_eq!(settlement_group.matches.len(), 2);
+
+        // 4. Invalid regex returns Err
+        let opts_invalid = ContentSearchOptions {
+            is_regex: true,
+            ..Default::default()
+        };
+        let res_invalid = search_content(root, "[unclosed-regex", &opts_invalid);
+        assert!(res_invalid.is_err());
+    }
+
+    #[test]
+    fn test_check_workspace_health_doctor() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(
+            root.join("notes/main.md"),
+            "# Main\nLink to [missing](./missing.md) and [orphan](./orphan.md).",
+        )
+        .unwrap();
+        fs::write(root.join("notes/orphan.md"), "# Orphan\nIsolated note.").unwrap();
+        fs::write(root.join("notes/lonely.md"), "# Lonely\nNo links at all.").unwrap();
+
+        let report = check_workspace_health(root).unwrap();
+        assert_eq!(report.note_count, 3);
+        assert_eq!(report.broken_links.len(), 1);
+        assert_eq!(report.broken_links[0].raw_target, "./missing.md");
+        assert_eq!(report.orphan_notes, vec!["notes/lonely.md".to_string()]);
+        assert!(report.unreadable_files.is_empty());
     }
 }
 

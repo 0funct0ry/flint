@@ -30,6 +30,7 @@ export interface CenterPaneProps {
   onForward: () => void;
   onHeadingInView?: (anchor: string) => void;
   scrollToAnchor?: string | null;
+  scrollToLine?: number | null;
   treeData?: TreeNodeItem[];
   indexedNotes?: NoteMeta[];
   savedScrollTop?: number;
@@ -218,6 +219,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   onForward,
   onHeadingInView,
   scrollToAnchor,
+  scrollToLine,
   treeData = [],
   indexedNotes = [],
   savedScrollTop,
@@ -316,6 +318,24 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       targetElem.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
   }, [scrollToAnchor]);
+
+  // Scroll to specific line when requested from search
+  useEffect(() => {
+    if (!scrollToLine || scrollToLine < 1) return;
+
+    if (editorViewRef.current) {
+      const view = editorViewRef.current;
+      const totalLines = view.state.doc.lines;
+      const targetLine = Math.min(Math.max(1, scrollToLine), totalLines);
+      const lineObj = view.state.doc.line(targetLine);
+
+      view.dispatch({
+        selection: EditorSelection.single(lineObj.from, lineObj.to),
+        effects: EditorView.scrollIntoView(lineObj.from, { y: 'center' }),
+      });
+      view.focus();
+    }
+  }, [scrollToLine, note.path]);
 
   // Track active heading in view as reader scrolls
   useEffect(() => {

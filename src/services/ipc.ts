@@ -1,8 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
   BacklinkGroup,
+  ContentHit,
+  ContentHitGroup,
+  ContentSearchOptions,
+  DoctorReport,
   Fingerprint,
   LinkItem,
+  NameHit,
   NoteContent,
   NoteMeta,
   RenameResult,
@@ -376,6 +381,128 @@ export const api = {
       headings: n.headings,
       tags: n.tags,
     }));
+  },
+
+  async searchNames(query: string, limit?: number): Promise<NameHit[]> {
+    if (isTauriEnvironment()) {
+      return await invoke<NameHit[]>("search_names", { query, limit });
+    }
+
+    const trimmed = query.trim().toLowerCase();
+    const notes = Object.values(FIXTURE_NOTES);
+    if (!trimmed) {
+      return notes.slice(0, limit || 30).map((n) => ({
+        path: n.path,
+        title: n.title,
+        score: 0,
+        match_indices_title: [],
+        match_indices_path: [],
+      }));
+    }
+
+    const results: NameHit[] = [];
+    notes.forEach((n) => {
+      const titleLower = n.title.toLowerCase();
+      const pathLower = n.path.toLowerCase();
+      if (titleLower.includes(trimmed)) {
+        const start = titleLower.indexOf(trimmed);
+        results.push({
+          path: n.path,
+          title: n.title,
+          score: 100 - start,
+          match_indices_title: Array.from({ length: trimmed.length }, (_, i) => start + i),
+          match_indices_path: [],
+        });
+      } else if (pathLower.includes(trimmed)) {
+        const start = pathLower.indexOf(trimmed);
+        results.push({
+          path: n.path,
+          title: n.title,
+          score: 50 - start,
+          match_indices_title: [],
+          match_indices_path: Array.from({ length: trimmed.length }, (_, i) => start + i),
+        });
+      }
+    });
+
+    results.sort((a, b) => b.score - a.score);
+    return results.slice(0, limit || 30);
+  },
+
+  async searchContent(query: string, options?: ContentSearchOptions): Promise<ContentHitGroup[]> {
+    if (isTauriEnvironment()) {
+      return await invoke<ContentHitGroup[]>("search_content", { query, options });
+    }
+
+    if (!query.trim()) return [];
+
+    const caseSensitive = options?.case_sensitive || false;
+    const wholeWord = options?.whole_word || false;
+    const isRegex = options?.is_regex || false;
+    const folderScope = options?.folder_scope;
+
+    let regex: RegExp;
+    try {
+      if (isRegex) {
+        const pat = wholeWord ? `\\b(?:${query})\\b` : query;
+        regex = new RegExp(pat, caseSensitive ? "g" : "gi");
+      } else {
+        const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const pat = wholeWord ? `\\b${escaped}\\b` : escaped;
+        regex = new RegExp(pat, caseSensitive ? "g" : "gi");
+      }
+    } catch (e: any) {
+      throw new Error(`Invalid regex: ${e?.message || String(e)}`);
+    }
+
+    const groups: ContentHitGroup[] = [];
+    Object.values(FIXTURE_NOTES).forEach((n) => {
+      if (folderScope && !n.path.startsWith(folderScope)) {
+        return;
+      }
+
+      const lines = n.content.split("\n");
+      const hits: ContentHit[] = [];
+
+      lines.forEach((line, lineIdx) => {
+        let match: RegExpExecArray | null;
+        regex.lastIndex = 0;
+        while ((match = regex.exec(line)) !== null) {
+          hits.push({
+            line: lineIdx + 1,
+            col: match.index + 1,
+            match_length: match[0].length,
+            line_text: line,
+          });
+          if (!regex.global) break;
+        }
+      });
+
+      if (hits.length > 0) {
+        groups.push({
+          path: n.path,
+          title: n.title,
+          matches: hits,
+        });
+      }
+    });
+
+    return groups;
+  },
+
+  async workspaceDoctor(): Promise<DoctorReport> {
+    if (isTauriEnvironment()) {
+      return await invoke<DoctorReport>("workspace_doctor");
+    }
+
+    return {
+      workspace: "projects",
+      note_count: Object.keys(FIXTURE_NOTES).length,
+      link_count: 12,
+      broken_links: [],
+      orphan_notes: [],
+      unreadable_files: [],
+    };
   },
 
   async openExternal(url: string): Promise<void> {

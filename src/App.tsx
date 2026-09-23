@@ -89,9 +89,10 @@ export const App: React.FC = () => {
   // Inline tree action state (create-note, create-folder, rename)
   const [inlineAction, setInlineAction] = useState<InlineActionState | null>(null);
 
-  // Outline heading state
+  // Outline heading & search target line state
   const [activeHeadingAnchor, setActiveHeadingAnchor] = useState<string>('');
   const [scrollToAnchor, setScrollToAnchor] = useState<string | null>(null);
+  const [scrollToLine, setScrollToLine] = useState<number | null>(null);
 
   // Toast notifications
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
@@ -463,7 +464,7 @@ export const App: React.FC = () => {
 
   // Note selection
   const handleSelectNote = useCallback(
-    async (targetPath: string) => {
+    async (targetPath: string, targetLine?: number) => {
       // Split anchor if present
       const cleanPath = targetPath.split('#')[0];
       const anchor = targetPath.includes('#') ? targetPath.split('#')[1] : null;
@@ -478,6 +479,10 @@ export const App: React.FC = () => {
         if (anchor) {
           setScrollToAnchor(anchor);
           setTimeout(() => setScrollToAnchor(null), 300);
+        }
+        if (targetLine !== undefined) {
+          setScrollToLine(targetLine);
+          setTimeout(() => setScrollToLine(null), 300);
         }
         return;
       }
@@ -509,6 +514,13 @@ export const App: React.FC = () => {
         setTimeout(() => {
           setScrollToAnchor(anchor);
           setTimeout(() => setScrollToAnchor(null), 300);
+        }, 100);
+      }
+
+      if (targetLine !== undefined) {
+        setTimeout(() => {
+          setScrollToLine(targetLine);
+          setTimeout(() => setScrollToLine(null), 300);
         }, 100);
       }
     },
@@ -1063,6 +1075,10 @@ export const App: React.FC = () => {
           setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))
         }
         theme={theme}
+        leftSidebarVisible={leftSidebarVisible}
+        onToggleLeftSidebar={() => setLeftSidebarVisible((prev) => !prev)}
+        rightSidebarVisible={rightSidebarVisible}
+        onToggleRightSidebar={() => setRightSidebarVisible((prev) => !prev)}
       />
 
       {/* Main body with sidebars & editor/reader */}
@@ -1097,6 +1113,7 @@ export const App: React.FC = () => {
               // Clear scrollToAnchor after scrolling
               setTimeout(() => setScrollToAnchor(null), 300);
             }}
+            onClose={() => setLeftSidebarVisible(false)}
           />
         )}
 
@@ -1126,6 +1143,7 @@ export const App: React.FC = () => {
           onForward={handleForward}
           onHeadingInView={(anchor) => setActiveHeadingAnchor(anchor)}
           scrollToAnchor={scrollToAnchor}
+          scrollToLine={scrollToLine}
           treeData={treeData}
           indexedNotes={indexedNotes}
           savedScrollTop={activeScrollTop}
@@ -1142,6 +1160,7 @@ export const App: React.FC = () => {
             onNavigate={handleSelectNote}
             onCreateNote={handleCreateBrokenNote}
             onOpenExternal={handleOpenExternal}
+            onClose={() => setRightSidebarVisible(false)}
           />
         )}
       </div>

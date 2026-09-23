@@ -6,6 +6,7 @@ export interface RightSidebarProps {
   onNavigate: (path: string) => void;
   onCreateNote?: (path: string) => void;
   onOpenExternal?: (url: string) => void;
+  onClose?: () => void;
 }
 
 export const RightSidebar: React.FC<RightSidebarProps> = ({
@@ -13,6 +14,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
   onNavigate,
   onCreateNote,
   onOpenExternal,
+  onClose,
 }) => {
   const totalBacklinks = note.backlinks.reduce(
     (acc, b) => acc + b.occurrences.length,
@@ -22,14 +24,25 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
   return (
     <aside className="w-[250px] shrink-0 flex flex-col bg-[var(--panel)] border-l border-[var(--border)] min-h-0 select-none">
       {/* Tabs */}
-      <div className="flex h-[31px] shrink-0 border-b border-[var(--border)]" role="tablist">
+      <div className="flex items-center h-[31px] shrink-0 border-b border-[var(--border)]" role="tablist">
         <button
           role="tab"
           aria-selected="true"
-          className="px-3 text-[11.5px] tracking-wide text-[var(--text)] font-medium shadow-[inset_0_-2px_0_var(--accent)]"
+          className="px-3 h-full text-[11.5px] tracking-wide text-[var(--text)] font-medium shadow-[inset_0_-2px_0_var(--accent)]"
         >
           Links
         </button>
+
+        {onClose && (
+          <button
+            onClick={onClose}
+            className="ml-auto mr-1.5 w-5 h-5 flex items-center justify-center rounded text-[var(--muted)] hover:bg-[var(--panel-2)] hover:text-[var(--text)] transition-colors text-xs font-semibold"
+            title="Collapse sidebar (⌘⌥B)"
+            aria-label="Collapse sidebar"
+          >
+            -
+          </button>
+        )}
       </div>
 
       <div className="flex-1 overflow-auto py-2 min-h-0">

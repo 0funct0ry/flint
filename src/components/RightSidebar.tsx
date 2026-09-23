@@ -4,9 +4,16 @@ import { NoteFixture } from '../types';
 export interface RightSidebarProps {
   note: NoteFixture;
   onNavigate: (path: string) => void;
+  onCreateNote?: (path: string) => void;
+  onOpenExternal?: (url: string) => void;
 }
 
-export const RightSidebar: React.FC<RightSidebarProps> = ({ note, onNavigate }) => {
+export const RightSidebar: React.FC<RightSidebarProps> = ({
+  note,
+  onNavigate,
+  onCreateNote,
+  onOpenExternal,
+}) => {
   const totalBacklinks = note.backlinks.reduce(
     (acc, b) => acc + b.occurrences.length,
     0
@@ -77,25 +84,52 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({ note, onNavigate }) 
           </div>
         ) : (
           note.outgoingLinks.map((link, idx) => {
-            const isUnresolved = !link.resolved;
+            const rawTarget = link.raw_target || link.rawTarget || '';
+            const isExternal =
+              rawTarget.startsWith('http://') ||
+              rawTarget.startsWith('https://') ||
+              rawTarget.startsWith('mailto:');
+            const isUnresolved = !isExternal && !link.resolved;
+
             return (
               <a
                 key={idx}
                 href="#"
                 onClick={(e) => {
                   e.preventDefault();
-                  if (link.resolved) {
+                  if (isExternal) {
+                    if (onOpenExternal) onOpenExternal(rawTarget);
+                  } else if (link.resolved) {
                     onNavigate(link.resolved);
+                  } else if (onCreateNote) {
+                    // Create broken note target
+                    const cleanPath = rawTarget
+                      .split('#')[0]
+                      .replace(/^\.\//, '');
+                    const withExt = cleanPath.endsWith('.md')
+                      ? cleanPath
+                      : `${cleanPath}.md`;
+                    const folder = note.path.split('/').slice(0, -1).join('/');
+                    const targetPath = folder ? `${folder}/${withExt}` : withExt;
+                    onCreateNote(targetPath);
                   }
                 }}
                 className={`flex items-center gap-1.5 px-3 py-1 text-[12.5px] hover:bg-[var(--panel-2)] transition-colors truncate ${
                   isUnresolved ? 'text-[var(--spark)]' : 'text-[var(--text-2)]'
                 }`}
-                title={isUnresolved ? 'Unresolved link — click to create note' : undefined}
+                title={
+                  isExternal
+                    ? `Open ${rawTarget} in browser`
+                    : isUnresolved
+                    ? 'Unresolved link — click to create note'
+                    : `Go to ${link.resolved}`
+                }
               >
-                <span className="text-[var(--faint)] text-xs">◦</span>
+                <span className="text-[var(--faint)] text-xs">
+                  {isExternal ? '↗' : '◦'}
+                </span>
                 <span className="truncate">
-                  {link.rawTarget.replace(/^\.\//, '')}
+                  {rawTarget.replace(/^\.\//, '')}
                   {isUnresolved && ' — create'}
                 </span>
               </a>

@@ -6,8 +6,9 @@ export interface HeadingItem {
 
 export interface LinkItem {
   source: string;
-  rawTarget: string;
-  resolved?: string;
+  raw_target?: string;
+  rawTarget?: string;
+  resolved?: string | null;
   line: number;
   col: number;
   context: string;

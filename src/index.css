@@ -150,14 +150,27 @@ button {
   color: var(--accent);
   text-decoration: none;
   border-bottom: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
-  transition: border-color 0.15s ease;
+  transition: border-color 0.15s ease, color 0.15s ease;
+  cursor: pointer;
 }
 .reader-content a:hover {
   border-bottom-color: var(--accent);
 }
+.reader-content a.flint-internal-link {
+  color: var(--accent);
+}
+.reader-content a.flint-broken-link,
 .reader-content a.broken {
   color: var(--spark);
-  border-bottom: 1px dotted var(--spark);
+  border-bottom: 1.5px dotted var(--spark);
+  cursor: pointer;
+}
+.reader-content a.flint-broken-link:hover,
+.reader-content a.broken:hover {
+  border-bottom-style: solid;
+}
+.reader-content a.flint-external-link {
+  color: var(--accent);
 }
 .reader-content ul {
   list-style-type: disc;
@@ -301,14 +314,26 @@ button {
   line-height: 1.72 !important;
   font-family: var(--mono) !important;
 }
+.cm-content {
+  caret-color: var(--text) !important;
+}
+[data-theme="dark"] .cm-content {
+  caret-color: #FFFFFF !important;
+}
 .cm-activeLine {
   background-color: var(--panel-2) !important;
 }
-.cm-cursor, .cm-dropCursor {
+.cm-cursor,
+.cm-dropCursor,
+.cm-cursor-primary,
+.cm-cursor-secondary {
   border-left-color: var(--text) !important;
   border-left-width: 2px !important;
 }
-[data-theme="dark"] .cm-cursor, [data-theme="dark"] .cm-dropCursor {
+[data-theme="dark"] .cm-cursor,
+[data-theme="dark"] .cm-dropCursor,
+[data-theme="dark"] .cm-cursor-primary,
+[data-theme="dark"] .cm-cursor-secondary {
   border-left-color: #FFFFFF !important;
   box-shadow: 0 0 3px rgba(255, 255, 255, 0.4);
 }

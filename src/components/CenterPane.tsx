@@ -6,8 +6,9 @@ import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { searchKeymap, openSearchPanel } from '@codemirror/search';
 import { bracketMatching } from '@codemirror/language';
+import { autocompletion, CompletionContext, CompletionResult } from '@codemirror/autocomplete';
 import { ViewMode } from './TitleBar';
-import { NoteFixture } from '../types';
+import { NoteFixture, TreeNodeItem } from '../types';
 import { ConflictBanner } from './ConflictBanner';
 
 export interface CenterPaneProps {
@@ -18,6 +19,8 @@ export interface CenterPaneProps {
   onSaveNow?: () => void;
   onBlurSave?: () => void;
   onNavigateRelative: (target: string) => void;
+  onCreateNote?: (target: string) => void;
+  onOpenExternal?: (url: string) => void;
   onCloseNote?: () => void;
   showConflictBanner: boolean;
   onKeepVersion: () => void;
@@ -27,6 +30,10 @@ export interface CenterPaneProps {
   onForward: () => void;
   onHeadingInView?: (anchor: string) => void;
   scrollToAnchor?: string | null;
+  treeData?: TreeNodeItem[];
+  savedScrollTop?: number;
+  savedCursorPos?: number;
+  onScrollOrCursorChange?: (scrollTop: number, cursorPos: number) => void;
 }
 
 /**
@@ -125,6 +132,72 @@ function handleTabKey(view: EditorView): boolean {
   return true;
 }
 
+/**
+ * Compute relative path from source folder to target note path
+ */
+function computeRelativeLinkPath(sourceNotePath: string, targetNotePath: string): string {
+  const sourceFolderParts = sourceNotePath.split('/').slice(0, -1);
+  const targetParts = targetNotePath.split('/');
+
+  let common = 0;
+  while (
+    common < sourceFolderParts.length &&
+    common < targetParts.length &&
+    sourceFolderParts[common] === targetParts[common]
+  ) {
+    common++;
+  }
+
+  const upCount = sourceFolderParts.length - common;
+  const relSegments = [];
+  for (let i = 0; i < upCount; i++) {
+    relSegments.push('..');
+  }
+  relSegments.push(...targetParts.slice(common));
+
+  const result = relSegments.join('/');
+  if (!result.startsWith('.') && !result.startsWith('/')) {
+    return `./${result}`;
+  }
+  return result;
+}
+
+/**
+ * Flatten tree nodes to get all note paths
+ */
+function getAllNotePaths(tree: TreeNodeItem[]): Array<{ path: string; title?: string; name: string }> {
+  const result: Array<{ path: string; title?: string; name: string }> = [];
+  function walk(nodes: TreeNodeItem[]) {
+    for (const node of nodes) {
+      if (node.is_folder && node.children) {
+        walk(node.children);
+      } else if (node.is_note || node.path.endsWith('.md') || node.path.endsWith('.markdown')) {
+        result.push({ path: node.path, title: node.title, name: node.name });
+      }
+    }
+  }
+  walk(tree);
+  return result;
+}
+
+/**
+ * Find link at position in text line
+ */
+function findLinkAtPos(lineText: string, col: number): { target: string; isExternal: boolean } | null {
+  const regex = /\[([^\]]*)\]\(([^)]+)\)/g;
+  let match;
+  while ((match = regex.exec(lineText)) !== null) {
+    const start = match.index;
+    const end = match.index + match[0].length;
+    if (col >= start && col <= end) {
+      const target = match[2];
+      const isExternal = target.startsWith('http://') || target.startsWith('https://') || target.startsWith('mailto:');
+      return { target, isExternal };
+    }
+  }
+  return null;
+}
+
 export const CenterPane: React.FC<CenterPaneProps> = ({
   note,
   viewMode,
@@ -133,6 +206,8 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   onSaveNow,
   onBlurSave,
   onNavigateRelative,
+  onCreateNote,
+  onOpenExternal,
   onCloseNote,
   showConflictBanner,
   onKeepVersion,
@@ -142,6 +217,10 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   onForward,
   onHeadingInView,
   scrollToAnchor,
+  treeData = [],
+  savedScrollTop,
+  savedCursorPos,
+  onScrollOrCursorChange,
 }) => {
   const editorContainerRef = useRef<HTMLDivElement>(null);
   const readerContainerRef = useRef<HTMLDivElement>(null);
@@ -156,6 +235,21 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
 
   const onBlurSaveRef = useRef(onBlurSave);
   onBlurSaveRef.current = onBlurSave;
+
+  const onNavigateRelativeRef = useRef(onNavigateRelative);
+  onNavigateRelativeRef.current = onNavigateRelative;
+
+  const onOpenExternalRef = useRef(onOpenExternal);
+  onOpenExternalRef.current = onOpenExternal;
+
+  const onCreateNoteRef = useRef(onCreateNote);
+  onCreateNoteRef.current = onCreateNote;
+
+  const treeDataRef = useRef(treeData);
+  treeDataRef.current = treeData;
+
+  const onScrollOrCursorChangeRef = useRef(onScrollOrCursorChange);
+  onScrollOrCursorChangeRef.current = onScrollOrCursorChange;
 
   // Track the note path currently loaded in the editor instance
   const loadedNotePathRef = useRef<string>('');
@@ -293,7 +387,34 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     };
   }, [viewMode, note.path]);
 
-  // Initialize CodeMirror 6 editor instance with full SPEC §8.2 extension suite
+  // Navigate to link target helper
+  const navigateToLink = (rawTarget: string) => {
+    const isExternal =
+      rawTarget.startsWith('http://') ||
+      rawTarget.startsWith('https://') ||
+      rawTarget.startsWith('mailto:');
+    if (isExternal) {
+      if (onOpenExternalRef.current) {
+        onOpenExternalRef.current(rawTarget);
+      }
+    } else {
+      const cleanPath = rawTarget.split('#')[0];
+      const anchor = rawTarget.includes('#') ? rawTarget.split('#')[1] : null;
+
+      if (!cleanPath && anchor) {
+        // Anchor in current note
+        const targetElem = readerContainerRef.current?.querySelector(`#${CSS.escape(anchor)}`);
+        if (targetElem) {
+          targetElem.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+        return;
+      }
+
+      onNavigateRelativeRef.current(rawTarget);
+    }
+  };
+
+  // Initialize CodeMirror 6 editor instance with autocompletion and link navigation
   useEffect(() => {
     if (!editorContainerRef.current) return;
     if (!note.path) {
@@ -304,6 +425,51 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       loadedNotePathRef.current = '';
       return;
     }
+
+    // Link autocomplete completion source
+    const linkCompletionSource = (context: CompletionContext): CompletionResult | null => {
+      const line = context.state.doc.lineAt(context.pos);
+      const lineBefore = line.text.slice(0, context.pos - line.from);
+
+      // Trigger on `[` or `](`
+      const openBracketMatch = /\[([^\]]*)$/.exec(lineBefore);
+      const openParenMatch = /\]\(([^)]*)$/.exec(lineBefore);
+
+      const notes = getAllNotePaths(treeDataRef.current);
+      if (openParenMatch) {
+        const typed = openParenMatch[1];
+        const from = context.pos - typed.length;
+        return {
+          from,
+          options: notes.map((n) => {
+            const rel = computeRelativeLinkPath(note.path, n.path);
+            return {
+              label: rel,
+              detail: n.title || n.name,
+              type: 'file',
+              apply: rel,
+            };
+          }),
+        };
+      } else if (openBracketMatch) {
+        const typed = openBracketMatch[1];
+        const from = context.pos - typed.length;
+        return {
+          from,
+          options: notes.map((n) => {
+            const rel = computeRelativeLinkPath(note.path, n.path);
+            const title = n.title || n.name.replace(/\.md$/, '');
+            return {
+              label: title,
+              detail: rel,
+              type: 'file',
+              apply: `${title}](${rel})`,
+            };
+          }),
+        };
+      }
+      return null;
+    };
 
     // If switching to a new note, create/re-create editor
     if (loadedNotePathRef.current !== note.path || !editorViewRef.current) {
@@ -345,6 +511,20 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
           key: 'Tab',
           run: handleTabKey,
         },
+        {
+          key: 'Mod-Enter',
+          run: (view: EditorView) => {
+            const pos = view.state.selection.main.head;
+            const line = view.state.doc.lineAt(pos);
+            const col = pos - line.from;
+            const link = findLinkAtPos(line.text, col);
+            if (link) {
+              navigateToLink(link.target);
+              return true;
+            }
+            return false;
+          },
+        },
       ];
 
       const startState = EditorState.create({
@@ -355,8 +535,30 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
           highlightActiveLine(),
           EditorView.lineWrapping,
           markdown(),
+          autocompletion({
+            override: [linkCompletionSource],
+            activateOnTyping: true,
+          }),
           Prec.high(keymap.of(formattingKeymap)),
           keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap]),
+          EditorView.domEventHandlers({
+            click: (event, view) => {
+              if (event.metaKey || event.ctrlKey) {
+                const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+                if (pos !== null) {
+                  const line = view.state.doc.lineAt(pos);
+                  const col = pos - line.from;
+                  const link = findLinkAtPos(line.text, col);
+                  if (link) {
+                    event.preventDefault();
+                    navigateToLink(link.target);
+                    return true;
+                  }
+                }
+              }
+              return false;
+            },
+          }),
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {
               onContentChangeRef.current(update.state.doc.toString());
@@ -366,6 +568,11 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
                 onBlurSaveRef.current();
               }
             }
+            if (onScrollOrCursorChangeRef.current) {
+              const scroller = update.view.scrollDOM;
+              const cursor = update.state.selection.main.head;
+              onScrollOrCursorChangeRef.current(scroller.scrollTop, cursor);
+            }
           }),
         ],
       });
@@ -374,6 +581,16 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
         state: startState,
         parent: editorContainerRef.current,
       });
+
+      // Restore saved cursor & scroll if provided
+      if (savedCursorPos !== undefined && savedCursorPos <= startState.doc.length) {
+        view.dispatch({
+          selection: { anchor: savedCursorPos },
+        });
+      }
+      if (savedScrollTop !== undefined) {
+        view.scrollDOM.scrollTop = savedScrollTop;
+      }
 
       editorViewRef.current = view;
       loadedNotePathRef.current = note.path;
@@ -406,14 +623,26 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       if (href) {
         if (href.startsWith('#/note/')) {
           e.preventDefault();
-          const notePath = href.replace('#/note/', '');
-          onNavigateRelative(notePath);
+          const targetPathWithAnchor = href.replace('#/note/', '');
+          onNavigateRelative(targetPathWithAnchor);
+        } else if (href.startsWith('#/create-note/')) {
+          e.preventDefault();
+          const targetPathWithAnchor = href.replace('#/create-note/', '');
+          const cleanPath = targetPathWithAnchor.split('#')[0];
+          if (onCreateNote) {
+            onCreateNote(cleanPath);
+          }
         } else if (href.startsWith('#')) {
           e.preventDefault();
           const anchor = href.slice(1);
           const targetElem = readerContainerRef.current?.querySelector(`#${CSS.escape(anchor)}`);
           if (targetElem) {
             targetElem.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
+        } else if (href.startsWith('http://') || href.startsWith('https://') || href.startsWith('mailto:')) {
+          e.preventDefault();
+          if (onOpenExternal) {
+            onOpenExternal(href);
           }
         }
       }

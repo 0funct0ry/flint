@@ -18,6 +18,12 @@ import { Fingerprint, NoteContent, NoteFixture, TreeNodeItem, WorkspaceInfo } fr
 import { api } from './services/ipc';
 import { renderMarkdownToHtml } from './services/markdown';
 
+interface HistoryEntry {
+  path: string;
+  scrollTop?: number;
+  cursorPos?: number;
+}
+
 export const App: React.FC = () => {
   const [theme, setTheme] = useState<'light' | 'dark'>('dark');
   const [viewMode, setViewMode] = useState<ViewMode>('split');
@@ -50,9 +56,11 @@ export const App: React.FC = () => {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteMode, setPaletteMode] = useState<'notes' | 'commands'>('notes');
 
-  // Navigation history
-  const [history, setHistory] = useState<string[]>([]);
+  // Navigation history with scroll and cursor restoration (SPEC §6.3, M6)
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
+  const [activeScrollTop, setActiveScrollTop] = useState<number | undefined>(undefined);
+  const [activeCursorPos, setActiveCursorPos] = useState<number | undefined>(undefined);
 
   // Inline tree action state (create-note, create-folder, rename)
   const [inlineAction, setInlineAction] = useState<InlineActionState | null>(null);
@@ -101,6 +109,10 @@ export const App: React.FC = () => {
     isDirty: false,
   });
 
+  // Current scroll & cursor tracking
+  const currentScrollTopRef = useRef<number>(0);
+  const currentCursorPosRef = useRef<number>(0);
+
   useEffect(() => {
     currentNoteRef.current = {
       path: currentNotePath,
@@ -145,6 +157,14 @@ export const App: React.FC = () => {
         renderedHtml = renderMarkdownToHtml(noteContent.content);
       }
 
+      // Fetch real outgoing links via IPC (M6)
+      let outgoingLinks: any[] = [];
+      try {
+        outgoingLinks = await api.linksOutgoing(path, noteContent.content);
+      } catch (err) {
+        console.warn(`Failed to extract links for ${path}:`, err);
+      }
+
       setNoteState((prev) => {
         const existing = prev[path] || FIXTURE_NOTES[path] || {
           path,
@@ -154,7 +174,7 @@ export const App: React.FC = () => {
           content: noteContent.content,
           renderedHtml,
           headings,
-          outgoingLinks: [],
+          outgoingLinks,
           backlinks: [],
           lastModifiedAgo: 'just now',
         };
@@ -168,6 +188,7 @@ export const App: React.FC = () => {
             headings,
             content: noteContent.content,
             renderedHtml,
+            outgoingLinks,
           },
         };
       });
@@ -275,33 +296,112 @@ export const App: React.FC = () => {
 
   // Note selection
   const handleSelectNote = useCallback(
-    async (path: string) => {
-      if (path === currentNotePath) return;
+    async (targetPath: string) => {
+      // Split anchor if present
+      const cleanPath = targetPath.split('#')[0];
+      const anchor = targetPath.includes('#') ? targetPath.split('#')[1] : null;
+
+      if (!cleanPath && anchor) {
+        setScrollToAnchor(anchor);
+        setTimeout(() => setScrollToAnchor(null), 300);
+        return;
+      }
+
+      if (cleanPath === currentNotePath) {
+        if (anchor) {
+          setScrollToAnchor(anchor);
+          setTimeout(() => setScrollToAnchor(null), 300);
+        }
+        return;
+      }
 
       // Save previous note if dirty before navigating
       if (isDirty) {
         await saveNote(false);
       }
 
-      setCurrentNotePath(path);
-      setHistory((prev) => [...prev.slice(0, historyIndex + 1), path]);
-      setHistoryIndex((prev) => prev + 1);
+      // Save current scroll/cursor to current history entry before moving
+      if (historyIndex >= 0 && historyIndex < history.length) {
+        history[historyIndex] = {
+          ...history[historyIndex],
+          scrollTop: currentScrollTopRef.current,
+          cursorPos: currentCursorPosRef.current,
+        };
+      }
 
-      await loadNote(path);
+      const newEntry: HistoryEntry = { path: cleanPath };
+      setHistory((prev) => [...prev.slice(0, historyIndex + 1), newEntry]);
+      setHistoryIndex((prev) => prev + 1);
+      setCurrentNotePath(cleanPath);
+      setActiveScrollTop(undefined);
+      setActiveCursorPos(undefined);
+
+      await loadNote(cleanPath);
+
+      if (anchor) {
+        setTimeout(() => {
+          setScrollToAnchor(anchor);
+          setTimeout(() => setScrollToAnchor(null), 300);
+        }, 100);
+      }
     },
-    [currentNotePath, historyIndex, isDirty, loadNote, saveNote]
+    [currentNotePath, history, historyIndex, isDirty, loadNote, saveNote]
   );
 
-  // History back / forward
+  // Create broken note target and navigate to it (SPEC §6.3, M6)
+  const handleCreateBrokenNote = useCallback(
+    async (rawPath: string) => {
+      try {
+        const cleanPath = rawPath.endsWith('.md') || rawPath.endsWith('.markdown')
+          ? rawPath
+          : `${rawPath}.md`;
+        const stem = cleanPath.split('/').pop()?.replace(/\.md$/, '') || 'Untitled';
+        const templateContent = `# ${stem}\n\n`;
+
+        await api.noteCreate(cleanPath, templateContent);
+        await refreshTree();
+        showToast(`Created note "${cleanPath}"`);
+        await handleSelectNote(cleanPath);
+      } catch (err: any) {
+        showToast(`Failed to create note: ${err?.message || String(err)}`);
+      }
+    },
+    [handleSelectNote, refreshTree, showToast]
+  );
+
+  // Open external URL in system browser (SPEC §6.3, M6)
+  const handleOpenExternal = useCallback(
+    async (url: string) => {
+      try {
+        await api.openExternal(url);
+      } catch (err: any) {
+        showToast(`Failed to open link: ${err?.message || String(err)}`);
+      }
+    },
+    [showToast]
+  );
+
+  // History back / forward with cursor and scroll restoration
   const handleBack = useCallback(async () => {
     if (historyIndex > 0) {
       if (isDirty) {
         await saveNote(false);
       }
-      const target = history[historyIndex - 1];
+      // Save current position
+      if (historyIndex < history.length) {
+        history[historyIndex] = {
+          ...history[historyIndex],
+          scrollTop: currentScrollTopRef.current,
+          cursorPos: currentCursorPosRef.current,
+        };
+      }
+
+      const targetEntry = history[historyIndex - 1];
       setHistoryIndex(historyIndex - 1);
-      setCurrentNotePath(target);
-      await loadNote(target);
+      setCurrentNotePath(targetEntry.path);
+      setActiveScrollTop(targetEntry.scrollTop);
+      setActiveCursorPos(targetEntry.cursorPos);
+      await loadNote(targetEntry.path);
     }
   }, [history, historyIndex, isDirty, loadNote, saveNote]);
 
@@ -310,10 +410,21 @@ export const App: React.FC = () => {
       if (isDirty) {
         await saveNote(false);
       }
-      const target = history[historyIndex + 1];
+      // Save current position
+      if (historyIndex >= 0 && historyIndex < history.length) {
+        history[historyIndex] = {
+          ...history[historyIndex],
+          scrollTop: currentScrollTopRef.current,
+          cursorPos: currentCursorPosRef.current,
+        };
+      }
+
+      const targetEntry = history[historyIndex + 1];
       setHistoryIndex(historyIndex + 1);
-      setCurrentNotePath(target);
-      await loadNote(target);
+      setCurrentNotePath(targetEntry.path);
+      setActiveScrollTop(targetEntry.scrollTop);
+      setActiveCursorPos(targetEntry.cursorPos);
+      await loadNote(targetEntry.path);
     }
   }, [history, historyIndex, isDirty, loadNote, saveNote]);
 
@@ -704,18 +815,41 @@ export const App: React.FC = () => {
     ? `${workspaceInfo.name}/${currentNotePath.replace(/^projects\//, '')}`
     : workspaceInfo.name;
 
-  // Content change handler with 400ms debounced autosave
+  // Content change handler with 400ms debounced autosave and live outgoing links extraction
   const handleContentChange = (newContent: string) => {
     setIsDirty(true);
     const renderedHtml = renderMarkdownToHtml(newContent);
-    setNoteState((prev) => ({
-      ...prev,
-      [currentNotePath]: {
-        ...prev[currentNotePath],
-        content: newContent,
-        renderedHtml,
-      },
-    }));
+    setNoteState((prev) => {
+      const current = prev[currentNotePath];
+      return {
+        ...prev,
+        [currentNotePath]: {
+          ...current,
+          content: newContent,
+          renderedHtml,
+        },
+      };
+    });
+
+    // Extract outgoing links live for the right sidebar
+    const targetPath = currentNotePath;
+    api.linksOutgoing(targetPath, newContent)
+      .then((outgoingLinks) => {
+        setNoteState((prev) => {
+          const current = prev[targetPath];
+          if (!current) return prev;
+          return {
+            ...prev,
+            [targetPath]: {
+              ...current,
+              outgoingLinks,
+            },
+          };
+        });
+      })
+      .catch((err) => {
+        console.warn(`Failed to update outgoing links for ${targetPath}:`, err);
+      });
 
     // Debounce autosave 400ms
     if (autosaveTimerRef.current) {
@@ -786,6 +920,8 @@ export const App: React.FC = () => {
           onSaveNow={() => saveNote(false)}
           onBlurSave={() => saveNote(false)}
           onNavigateRelative={handleSelectNote}
+          onCreateNote={handleCreateBrokenNote}
+          onOpenExternal={handleOpenExternal}
           onCloseNote={handleCloseNote}
           showConflictBanner={showConflictBanner}
           onKeepVersion={() => {
@@ -802,10 +938,22 @@ export const App: React.FC = () => {
           onForward={handleForward}
           onHeadingInView={(anchor) => setActiveHeadingAnchor(anchor)}
           scrollToAnchor={scrollToAnchor}
+          treeData={treeData}
+          savedScrollTop={activeScrollTop}
+          savedCursorPos={activeCursorPos}
+          onScrollOrCursorChange={(scrollTop, cursorPos) => {
+            currentScrollTopRef.current = scrollTop;
+            currentCursorPosRef.current = cursorPos;
+          }}
         />
 
         {rightSidebarVisible && (
-          <RightSidebar note={currentNote} onNavigate={handleSelectNote} />
+          <RightSidebar
+            note={currentNote}
+            onNavigate={handleSelectNote}
+            onCreateNote={handleCreateBrokenNote}
+            onOpenExternal={handleOpenExternal}
+          />
         )}
       </div>
 

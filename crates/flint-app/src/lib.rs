@@ -244,6 +244,58 @@ fn note_render(
     Ok(result)
 }
 
+/// Retrieve all outgoing links from a note (SPEC §11, M6).
+#[tauri::command]
+fn links_outgoing(
+    path: String,
+    content: Option<String>,
+    state: State<AppState>,
+) -> Result<Vec<flint_core::Link>, String> {
+    let root = get_workspace_root(&state)?;
+    let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+    flint_core::links_outgoing(&root, &safe_path, content.as_deref()).map_err(|e| e.to_string())
+}
+
+/// Open an external URL in the default system browser (SPEC §6.3, §11, M6).
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !trimmed.starts_with("http://")
+        && !trimmed.starts_with("https://")
+        && !trimmed.starts_with("mailto:")
+    {
+        return Err(
+            "Only http, https, and mailto URLs are supported for external open".to_string(),
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd")
+            .args(["/c", "start", "", trimmed])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        Command::new("xdg-open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     run_with_workspace(None);
@@ -267,7 +319,9 @@ pub fn run_with_workspace(initial_path: Option<PathBuf>) {
             folder_create,
             folder_delete,
             reveal_in_file_manager,
-            note_render
+            note_render,
+            links_outgoing,
+            open_external
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -388,6 +388,77 @@ pub fn render_note_markdown(
             Event::Code(text) if current_heading_level.is_some() => {
                 current_heading_text.push_str(&text);
             }
+            Event::Start(Tag::Link {
+                link_type: _,
+                dest_url,
+                title,
+                id: _,
+            }) => {
+                let raw_dest = dest_url.to_string();
+                let title_attr = if !title.is_empty() {
+                    format!(
+                        " title=\"{}\"",
+                        html_escape::encode_double_quoted_attribute(&title)
+                    )
+                } else {
+                    String::new()
+                };
+
+                if let (Some(root), Some(source_rel)) = (workspace_root, note_relative_path) {
+                    let resolution = crate::resolve_link_target(root, source_rel, &raw_dest);
+                    match resolution {
+                        crate::ResolvedTarget::Internal { path, anchor } => {
+                            let anchor_part = anchor.map(|a| format!("#{}", a)).unwrap_or_default();
+                            let href = format!("#/note/{}{}", path, anchor_part);
+                            let link_html = format!(
+                                "<a href=\"{}\" class=\"flint-internal-link\" data-target=\"{}\"{}>",
+                                html_escape::encode_double_quoted_attribute(&href),
+                                html_escape::encode_double_quoted_attribute(&path),
+                                title_attr
+                            );
+                            custom_events
+                                .push(Event::Html(CowStr::Boxed(link_html.into_boxed_str())));
+                        }
+                        crate::ResolvedTarget::Unresolved { raw_path, anchor } => {
+                            let anchor_part = anchor.map(|a| format!("#{}", a)).unwrap_or_default();
+                            let href = format!("#/create-note/{}{}", raw_path, anchor_part);
+                            let title_val = if !title.is_empty() {
+                                title.to_string()
+                            } else {
+                                format!("Broken link — click to create {}", raw_path)
+                            };
+                            let link_html = format!(
+                                "<a href=\"{}\" class=\"flint-broken-link\" data-target=\"{}\" title=\"{}\">",
+                                html_escape::encode_double_quoted_attribute(&href),
+                                html_escape::encode_double_quoted_attribute(&raw_path),
+                                html_escape::encode_double_quoted_attribute(&title_val)
+                            );
+                            custom_events
+                                .push(Event::Html(CowStr::Boxed(link_html.into_boxed_str())));
+                        }
+                        crate::ResolvedTarget::External(url) => {
+                            let link_html = format!(
+                                "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" class=\"flint-external-link\"{}>",
+                                html_escape::encode_double_quoted_attribute(&url),
+                                title_attr
+                            );
+                            custom_events
+                                .push(Event::Html(CowStr::Boxed(link_html.into_boxed_str())));
+                        }
+                    }
+                } else {
+                    // Fallback when no workspace root context is provided
+                    let link_html = format!(
+                        "<a href=\"{}\"{}>",
+                        html_escape::encode_double_quoted_attribute(&raw_dest),
+                        title_attr
+                    );
+                    custom_events.push(Event::Html(CowStr::Boxed(link_html.into_boxed_str())));
+                }
+            }
+            Event::End(TagEnd::Link) => {
+                custom_events.push(Event::Html(CowStr::Borrowed("</a>")));
+            }
             Event::Start(Tag::Image {
                 link_type: _,
                 dest_url,
@@ -487,6 +558,7 @@ pub fn render_note_markdown(
     a_attrs.insert("title");
     a_attrs.insert("class");
     a_attrs.insert("target");
+    a_attrs.insert("data-target");
     tag_attributes.insert("a", a_attrs);
 
     let mut img_attrs = HashSet::new();
@@ -520,6 +592,7 @@ pub fn render_note_markdown(
     generic_attrs.insert("title");
     generic_attrs.insert("data-lang");
     generic_attrs.insert("data-math");
+    generic_attrs.insert("data-target");
     tag_attributes.insert("div", generic_attrs.clone());
     tag_attributes.insert("span", generic_attrs.clone());
     tag_attributes.insert("h1", generic_attrs.clone());
@@ -541,7 +614,8 @@ pub fn render_note_markdown(
     ammonia_cleaner
         .tags(tags)
         .tag_attributes(tag_attributes)
-        .url_schemes(url_schemes);
+        .url_schemes(url_schemes)
+        .link_rel(Some("noopener noreferrer"));
 
     let sanitized_html = ammonia_cleaner.clean(&raw_rendered_html).to_string();
 

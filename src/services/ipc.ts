@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Fingerprint, NoteContent, NoteMeta, RenameResult, RenderResult, TreeNodeItem, WorkspaceInfo } from "../types";
+import { Fingerprint, LinkItem, NoteContent, NoteMeta, RenameResult, RenderResult, TreeNodeItem, WorkspaceInfo } from "../types";
 import { FIXTURE_NOTES } from "../fixtures/workspace";
 import { renderMarkdownToHtml } from "./markdown";
 
@@ -259,4 +259,55 @@ export const api = {
       headings,
     };
   },
+
+  async linksOutgoing(path: string, content?: string): Promise<LinkItem[]> {
+    if (isTauriEnvironment()) {
+      return await invoke<LinkItem[]>("links_outgoing", { path, content });
+    }
+
+    // Mock link extraction for browser environment
+    const noteContent = content !== undefined
+      ? content
+      : browserMockStorage[path]?.content || FIXTURE_NOTES[path]?.content || "";
+
+    const lines = noteContent.split('\n');
+    const links: LinkItem[] = [];
+
+    lines.forEach((line, lineIdx) => {
+      const regex = /\[([^\]]+)\]\(([^)]+)\)/g;
+      let match;
+      while ((match = regex.exec(line)) !== null) {
+        const rawTarget = match[2];
+        const isExternal = rawTarget.startsWith("http://") || rawTarget.startsWith("https://") || rawTarget.startsWith("mailto:");
+        let resolved: string | null = null;
+        if (!isExternal) {
+          const cleanTarget = rawTarget.split('#')[0].replace(/^\.\//, '');
+          const withExt = cleanTarget.endsWith('.md') ? cleanTarget : `${cleanTarget}.md`;
+          const folder = path.split('/').slice(0, -1).join('/');
+          const candidate = folder ? `${folder}/${withExt}` : withExt;
+          if (browserMockStorage[candidate] || FIXTURE_NOTES[candidate]) {
+            resolved = candidate;
+          }
+        }
+        links.push({
+          source: path,
+          raw_target: rawTarget,
+          resolved,
+          line: lineIdx + 1,
+          col: match.index + 1,
+          context: line.trim(),
+        });
+      }
+    });
+
+    return links;
+  },
+
+  async openExternal(url: string): Promise<void> {
+    if (isTauriEnvironment()) {
+      return await invoke<void>("open_external", { url });
+    }
+    window.open(url, "_blank", "noopener,noreferrer");
+  },
 };
+

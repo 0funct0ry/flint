@@ -1044,6 +1044,263 @@ pub fn build_workspace_tree(
     scan_dir(root, root, show_non_note_files)
 }
 
+/// Outcome of resolving a raw link target (SPEC §6.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResolvedTarget {
+    /// Internal note in workspace, with optional heading anchor (e.g. `settlement`).
+    Internal {
+        path: NotePath,
+        anchor: Option<String>,
+    },
+    /// External link (http, https, mailto, etc.)
+    External(String),
+    /// Unresolved / broken link inside the workspace, with raw target path.
+    Unresolved {
+        raw_path: String,
+        anchor: Option<String>,
+    },
+}
+
+/// Simple URL percent-decoding helper.
+pub fn url_decode(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let mut chars = input.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next();
+            let h2 = chars.next();
+            if let (Some(h1), Some(h2)) = (h1, h2) {
+                let s = [h1, h2];
+                if let Ok(hex_str) = std::str::from_utf8(&s) {
+                    if let Ok(byte) = u8::from_str_radix(hex_str, 16) {
+                        bytes.push(byte);
+                        continue;
+                    }
+                }
+                bytes.push(b'%');
+                bytes.push(h1);
+                bytes.push(h2);
+            } else {
+                bytes.push(b'%');
+                if let Some(h) = h1 {
+                    bytes.push(h);
+                }
+            }
+        } else if b == b'+' {
+            bytes.push(b' ');
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8_lossy(&bytes).to_string()
+}
+
+/// Resolve a link target according to SPEC §6.3:
+/// - URL decoding
+/// - Anchor stripping (`#heading`)
+/// - External link check (`http://`, `https://`, `mailto:`, etc.)
+/// - Relative against source note folder or workspace-absolute (`/path`)
+/// - Implicit `.md` extension fallback
+/// - Canonicalization and containment check inside root
+pub fn resolve_link_target(
+    workspace_root: &Path,
+    source_note_rel: &str,
+    raw_target: &str,
+) -> ResolvedTarget {
+    let trimmed = raw_target.trim();
+    if trimmed.is_empty() {
+        return ResolvedTarget::Unresolved {
+            raw_path: String::new(),
+            anchor: None,
+        };
+    }
+
+    // 1. External check
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("mailto:")
+        || trimmed.starts_with("ftp://")
+    {
+        return ResolvedTarget::External(trimmed.to_string());
+    }
+
+    // 2. URL decode and anchor split
+    let decoded = url_decode(trimmed);
+    let (path_part, anchor) = match decoded.split_once('#') {
+        Some((p, a)) => (p.trim(), Some(a.trim().to_string())),
+        None => (decoded.as_str(), None),
+    };
+
+    // If only an anchor is provided (e.g. `#heading`), it refers to the current note
+    if path_part.is_empty() {
+        if anchor.is_some() {
+            return ResolvedTarget::Internal {
+                path: source_note_rel.to_string(),
+                anchor,
+            };
+        }
+        return ResolvedTarget::Unresolved {
+            raw_path: String::new(),
+            anchor: None,
+        };
+    }
+
+    let source_dir_rel = Path::new(source_note_rel)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+
+    // Helper to evaluate candidate relative path string
+    let try_resolve_candidate = |candidate: &str| -> Option<NotePath> {
+        let is_abs = candidate.starts_with('/');
+        let norm_candidate = candidate.trim_start_matches('/');
+
+        let rel_path_buf = if is_abs || source_dir_rel.as_os_str().is_empty() {
+            PathBuf::from(norm_candidate)
+        } else {
+            source_dir_rel.join(norm_candidate)
+        };
+
+        let posix_rel = to_posix_path(&rel_path_buf);
+        if let Ok(safe_path) = SafePath::resolve(workspace_root, &posix_rel) {
+            let abs = safe_path.as_path();
+            if abs.exists() && abs.is_file() {
+                return Some(safe_path.to_posix_string());
+            }
+        }
+        None
+    };
+
+    // Try exact path part
+    if let Some(resolved) = try_resolve_candidate(path_part) {
+        return ResolvedTarget::Internal {
+            path: resolved,
+            anchor,
+        };
+    }
+
+    // Try appending .md if no extension
+    if !path_part.ends_with(".md") && !path_part.ends_with(".markdown") {
+        let with_md = format!("{}.md", path_part);
+        if let Some(resolved) = try_resolve_candidate(&with_md) {
+            return ResolvedTarget::Internal {
+                path: resolved,
+                anchor,
+            };
+        }
+    }
+
+    // Unresolved: compute what path it would have created
+    let is_abs = path_part.starts_with('/');
+    let norm_candidate = path_part.trim_start_matches('/');
+    let target_with_ext =
+        if !norm_candidate.ends_with(".md") && !norm_candidate.ends_with(".markdown") {
+            format!("{}.md", norm_candidate)
+        } else {
+            norm_candidate.to_string()
+        };
+
+    let target_rel_buf = if is_abs || source_dir_rel.as_os_str().is_empty() {
+        PathBuf::from(target_with_ext)
+    } else {
+        source_dir_rel.join(target_with_ext)
+    };
+
+    let raw_clean = to_posix_path(&target_rel_buf);
+
+    ResolvedTarget::Unresolved {
+        raw_path: raw_clean,
+        anchor,
+    }
+}
+
+/// Extract all links from Markdown note content with line and column positions.
+pub fn extract_links(workspace_root: &Path, source_note_rel: &str, content: &str) -> Vec<Link> {
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+
+    let mut links = Vec::new();
+    let (_fm_raw, body, _) = parse_front_matter(content);
+
+    // Track line offsets in the full content
+    let line_offsets: Vec<usize> = std::iter::once(0)
+        .chain(content.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+
+    let offset_to_line_col = |byte_idx: usize| -> (u32, u32) {
+        let line_idx = match line_offsets.binary_search(&byte_idx) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+        let line_start = line_offsets[line_idx];
+        let col = byte_idx.saturating_sub(line_start) + 1;
+        ((line_idx + 1) as u32, col as u32)
+    };
+
+    let content_lines: Vec<&str> = content.lines().collect();
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let parser = Parser::new_ext(body, options).into_offset_iter();
+
+    for (event, range) in parser {
+        if let Event::Start(Tag::Link { dest_url, .. }) = event {
+            let raw_dest = dest_url.to_string();
+            // Calculate absolute range in original content
+            let body_offset = content.len() - body.len();
+            let abs_start = body_offset + range.start;
+
+            let (line, col) = offset_to_line_col(abs_start);
+            let context_line = if (line as usize) <= content_lines.len() {
+                content_lines[(line - 1) as usize].trim().to_string()
+            } else {
+                String::new()
+            };
+
+            let resolution = resolve_link_target(workspace_root, source_note_rel, &raw_dest);
+            let resolved_path = match resolution {
+                ResolvedTarget::Internal { path, .. } => Some(path),
+                ResolvedTarget::External(_) => None,
+                ResolvedTarget::Unresolved { .. } => None,
+            };
+
+            links.push(Link {
+                source: source_note_rel.to_string(),
+                raw_target: raw_dest,
+                resolved: resolved_path,
+                line,
+                col,
+                context: context_line,
+            });
+        }
+    }
+
+    links
+}
+
+/// Retrieve all outgoing links for a given note (SPEC §11, M6).
+pub fn links_outgoing(
+    workspace_root: &Path,
+    source_note_safe: &SafePath,
+    override_content: Option<&str>,
+) -> Result<Vec<Link>, NoteError> {
+    let source_rel = source_note_safe.to_posix_string();
+    let content = match override_content {
+        Some(c) => c.to_string(),
+        None => {
+            let abs = source_note_safe.as_path();
+            if !abs.exists() {
+                return Err(NoteError::NotFound(source_rel));
+            }
+            fs::read_to_string(abs).map_err(|e| NoteError::Io(e.to_string()))?
+        }
+    };
+
+    Ok(extract_links(workspace_root, &source_rel, &content))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1390,6 +1647,95 @@ mod tests {
         let top_folder = SafePath::resolve(root, "delete-folder").unwrap();
         delete_folder(root, &top_folder, true).unwrap();
         assert!(!root.join("delete-folder").exists());
+    }
+
+    #[test]
+    fn test_resolve_link_target_and_extraction() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Create target notes
+        fs::create_dir_all(root.join("projects/payments")).unwrap();
+        fs::write(root.join("projects/payments/rails.md"), "# Rails").unwrap();
+        fs::write(root.join("overview.md"), "# Overview").unwrap();
+
+        let source = "projects/payments/settlement.md";
+
+        // 1. Relative link with implicit .md
+        let res1 = resolve_link_target(root, source, "./rails");
+        assert_eq!(
+            res1,
+            ResolvedTarget::Internal {
+                path: "projects/payments/rails.md".into(),
+                anchor: None,
+            }
+        );
+
+        // 2. Relative link with anchor and extension
+        let res2 = resolve_link_target(root, source, "rails.md#instant-settlement");
+        assert_eq!(
+            res2,
+            ResolvedTarget::Internal {
+                path: "projects/payments/rails.md".into(),
+                anchor: Some("instant-settlement".into()),
+            }
+        );
+
+        // 3. Workspace absolute link (leading slash)
+        let res3 = resolve_link_target(root, source, "/overview.md");
+        assert_eq!(
+            res3,
+            ResolvedTarget::Internal {
+                path: "overview.md".into(),
+                anchor: None,
+            }
+        );
+
+        // 4. URL encoded path
+        fs::write(root.join("projects/payments/special note.md"), "# Special").unwrap();
+        let res4 = resolve_link_target(root, source, "special%20note");
+        assert_eq!(
+            res4,
+            ResolvedTarget::Internal {
+                path: "projects/payments/special note.md".into(),
+                anchor: None,
+            }
+        );
+
+        // 5. External link
+        let res5 = resolve_link_target(root, source, "https://example.com/docs");
+        assert_eq!(
+            res5,
+            ResolvedTarget::External("https://example.com/docs".into())
+        );
+
+        // 6. Unresolved broken link
+        let res6 = resolve_link_target(root, source, "./nonexistent");
+        assert_eq!(
+            res6,
+            ResolvedTarget::Unresolved {
+                raw_path: "projects/payments/nonexistent.md".into(),
+                anchor: None,
+            }
+        );
+
+        // 7. Extract links test
+        let markdown = r#"---
+title: Test
+---
+Check out [Payment rails](./rails) and [Overview](/overview.md#intro).
+Also see [Broken link](./missing-note) and external [Google](https://google.com).
+"#;
+        let links = extract_links(root, source, markdown);
+        assert_eq!(links.len(), 4);
+        assert_eq!(links[0].raw_target, "./rails");
+        assert_eq!(links[0].resolved, Some("projects/payments/rails.md".into()));
+        assert_eq!(links[1].raw_target, "/overview.md#intro");
+        assert_eq!(links[1].resolved, Some("overview.md".into()));
+        assert_eq!(links[2].raw_target, "./missing-note");
+        assert_eq!(links[2].resolved, None);
+        assert_eq!(links[3].raw_target, "https://google.com");
+        assert_eq!(links[3].resolved, None);
     }
 }
 

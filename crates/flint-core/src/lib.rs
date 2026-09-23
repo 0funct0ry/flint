@@ -304,6 +304,8 @@ pub fn to_posix_path(path: &Path) -> String {
     path.components()
         .filter_map(|c| match c {
             Component::Normal(s) => s.to_str(),
+            Component::ParentDir => Some(".."),
+            Component::CurDir => Some("."),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -1205,7 +1207,12 @@ pub fn resolve_link_target(
         source_dir_rel.join(target_with_ext)
     };
 
-    let raw_clean = to_posix_path(&target_rel_buf);
+    let posix_candidate = to_posix_path(&target_rel_buf);
+    let raw_clean = if let Ok(safe) = SafePath::resolve(workspace_root, &posix_candidate) {
+        safe.to_posix_string()
+    } else {
+        posix_candidate
+    };
 
     ResolvedTarget::Unresolved {
         raw_path: raw_clean,
@@ -1299,6 +1306,260 @@ pub fn links_outgoing(
     };
 
     Ok(extract_links(workspace_root, &source_rel, &content))
+}
+
+/// Summary of link rewriting across the workspace.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RewriteSummary {
+    pub links_updated: usize,
+    pub notes_updated: usize,
+}
+
+/// Compute shortest POSIX relative path from the directory of `from_note_rel` to `to_target_rel`.
+pub fn relativize_path(from_note_rel: &str, to_target_rel: &str) -> String {
+    let from_dir = Path::new(from_note_rel)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let target_path = Path::new(to_target_rel);
+
+    // If both are in same directory
+    if from_dir == target_path.parent().unwrap_or_else(|| Path::new("")) {
+        let file_name = target_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(to_target_rel);
+        return format!("./{}", file_name);
+    }
+
+    let from_components: Vec<_> = from_dir.components().collect();
+    let target_components: Vec<_> = target_path.components().collect();
+
+    let mut common_len = 0;
+    while common_len < from_components.len()
+        && common_len < target_components.len()
+        && from_components[common_len] == target_components[common_len]
+    {
+        common_len += 1;
+    }
+
+    let up_count = from_components.len() - common_len;
+    let mut result_parts = Vec::new();
+    result_parts.extend(std::iter::repeat_n("..", up_count));
+
+    for comp in &target_components[common_len..] {
+        if let Component::Normal(s) = comp {
+            if let Some(s_str) = s.to_str() {
+                result_parts.push(s_str);
+            }
+        }
+    }
+
+    let joined = result_parts.join("/");
+    if up_count == 0 {
+        format!("./{}", joined)
+    } else {
+        joined
+    }
+}
+
+/// Parse and rewrite Markdown inline link destinations pointing to moved notes.
+///
+/// Rules:
+/// - Links inside fenced code blocks (\`\`\` or ~~~) and inline code (\`...\`) are strictly preserved.
+/// - Anchors (e.g. `#section`) and URL percent-encoding are preserved.
+/// - Returns `(new_content, rewritten_count)`.
+pub fn rewrite_markdown_links(
+    workspace_root: &Path,
+    source_note_rel: &str,
+    content: &str,
+    moved_notes_map: &HashMap<String, String>,
+) -> (String, usize) {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+    if moved_notes_map.is_empty() {
+        return (content.to_string(), 0);
+    }
+
+    let (_fm_raw, body, _) = parse_front_matter(content);
+    let body_offset = content.len() - body.len();
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let parser = Parser::new_ext(body, options).into_offset_iter();
+
+    let mut replacements = Vec::new();
+    let mut pending_link: Option<(String, usize)> = None; // (trimmed, start_pos)
+
+    for (event, range) in parser {
+        match event {
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                let raw_dest = dest_url.to_string();
+                let trimmed = raw_dest.trim().to_string();
+                pending_link = Some((trimmed, range.start));
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some((trimmed, start_pos)) = pending_link.take() {
+                    if trimmed.starts_with("http://")
+                        || trimmed.starts_with("https://")
+                        || trimmed.starts_with("mailto:")
+                        || trimmed.starts_with("ftp://")
+                    {
+                        continue;
+                    }
+
+                    let full_range = start_pos..range.end;
+                    if full_range.end > body.len() || full_range.start >= full_range.end {
+                        continue;
+                    }
+
+                    // Resolve target
+                    let resolution = resolve_link_target(workspace_root, source_note_rel, &trimmed);
+                    let resolved_note = match resolution {
+                        ResolvedTarget::Internal { path, .. } => path,
+                        ResolvedTarget::Unresolved { raw_path, .. } => raw_path,
+                        _ => continue,
+                    };
+
+                    // Check if resolved note is in moved map
+                    if let Some(new_target_path) = moved_notes_map.get(&resolved_note) {
+                        if new_target_path == &resolved_note
+                            && !moved_notes_map.contains_key(source_note_rel)
+                        {
+                            continue;
+                        }
+
+                        let has_percent_encoding = trimmed.contains('%');
+                        let (_, anchor_opt) = match trimmed.split_once('#') {
+                            Some((_, a)) => ((), Some(a)),
+                            None => ((), None),
+                        };
+
+                        let current_source = moved_notes_map
+                            .get(source_note_rel)
+                            .map(|s| s.as_str())
+                            .unwrap_or(source_note_rel);
+
+                        let mut new_rel = relativize_path(current_source, new_target_path);
+
+                        if has_percent_encoding {
+                            new_rel = new_rel.replace(' ', "%20");
+                        }
+
+                        let new_dest = if let Some(anchor) = anchor_opt {
+                            format!("{}#{}", new_rel, anchor)
+                        } else {
+                            new_rel
+                        };
+
+                        // In the full link range `[text](dest)`
+                        let link_slice = &body[full_range.clone()];
+                        if let Some(dest_pos_in_slice) = link_slice.rfind('(') {
+                            if let Some(close_paren) = link_slice[dest_pos_in_slice..].find(')') {
+                                let dest_start_in_slice = dest_pos_in_slice + 1;
+                                let dest_end_in_slice = dest_pos_in_slice + close_paren;
+                                let raw_slice_dest =
+                                    &link_slice[dest_start_in_slice..dest_end_in_slice];
+
+                                if raw_slice_dest.trim() == trimmed {
+                                    let abs_dest_start =
+                                        body_offset + full_range.start + dest_start_in_slice;
+                                    let abs_dest_end =
+                                        body_offset + full_range.start + dest_end_in_slice;
+
+                                    replacements.push((abs_dest_start, abs_dest_end, new_dest));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if replacements.is_empty() {
+        return (content.to_string(), 0);
+    }
+
+    // Sort replacements descending by start position to apply from back to front
+    replacements.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut updated = content.to_string();
+    let count = replacements.len();
+
+    for (start, end, replacement) in replacements {
+        if start <= end && end <= updated.len() {
+            updated.replace_range(start..end, &replacement);
+        }
+    }
+
+    (updated, count)
+}
+
+/// Rewrite all relative links resolving to moved notes across the entire workspace (SPEC §5.4).
+pub fn rewrite_workspace_links_for_rename(
+    root: &Path,
+    moved_notes_map: &HashMap<String, String>,
+) -> Result<RewriteSummary, NoteError> {
+    if moved_notes_map.is_empty() || !root.exists() {
+        return Ok(RewriteSummary::default());
+    }
+
+    let mut total_links = 0;
+    let mut total_notes = 0;
+
+    let walker = ignore::WalkBuilder::new(root)
+        .hidden(false)
+        .parents(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .build();
+
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if !path.is_file() || !is_note_path(path) {
+            continue;
+        }
+
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let mut is_ignored = false;
+        for comp in rel.components() {
+            if let Component::Normal(s) = comp {
+                let name = s.to_string_lossy();
+                if is_default_ignored(&name) {
+                    is_ignored = true;
+                    break;
+                }
+            }
+        }
+        if is_ignored {
+            continue;
+        }
+
+        let posix_rel = to_posix_path(rel);
+        if let Ok(safe_path) = SafePath::resolve(root, &posix_rel) {
+            if let Ok(content) = fs::read_to_string(safe_path.as_path()) {
+                let (new_content, rewritten_count) =
+                    rewrite_markdown_links(root, &posix_rel, &content, moved_notes_map);
+
+                if rewritten_count > 0 && new_content != content {
+                    write_note_atomic(root, &safe_path, &new_content, None)?;
+                    total_links += rewritten_count;
+                    total_notes += 1;
+                }
+            }
+        }
+    }
+
+    Ok(RewriteSummary {
+        links_updated: total_links,
+        notes_updated: total_notes,
+    })
 }
 
 impl Index {
@@ -2241,6 +2502,146 @@ Also see [Broken link](./missing-note) and external [Google](https://google.com)
             "Incremental update took too long: {:?}",
             update_duration
         );
+    }
+
+    #[test]
+    fn test_link_relativization() {
+        // Sibling
+        assert_eq!(
+            relativize_path(
+                "projects/payments/settlement.md",
+                "projects/payments/rails.md"
+            ),
+            "./rails.md"
+        );
+        // Child folder
+        assert_eq!(
+            relativize_path("projects/payments.md", "projects/sub/deep/note.md"),
+            "./sub/deep/note.md"
+        );
+        // Parent folder
+        assert_eq!(
+            relativize_path("projects/payments/settlement.md", "overview.md"),
+            "../../overview.md"
+        );
+        // Sibling folder
+        assert_eq!(
+            relativize_path("projects/payments/settlement.md", "projects/auth/login.md"),
+            "../auth/login.md"
+        );
+        // Root note to root note
+        assert_eq!(relativize_path("daily.md", "spec.md"), "./spec.md");
+    }
+
+    #[test]
+    fn test_rewrite_markdown_links_comprehensive() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Setup notes
+        fs::create_dir_all(root.join("projects/payments")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("projects/payments/rails.md"), "# Rails").unwrap();
+        fs::write(root.join("projects/payments/special note.md"), "# Special").unwrap();
+
+        let source_note = "projects/payments/settlement.md";
+        let markdown = r#"# Settlement
+
+Check out [Payment rails](./rails.md) and [Rails anchor](./rails.md#instant).
+Check [Special Note](./special%20note.md).
+Check [Workspace absolute](/projects/payments/rails.md).
+
+Here is a code block that should NOT be rewritten:
+```markdown
+[Payment rails in code fence](./rails.md)
+```
+
+And inline code `[Payment rails in inline code](./rails.md)` should not be touched.
+
+Also [Unrelated link](https://example.com) and [Other Note](../other.md).
+"#;
+
+        let mut moved_map = HashMap::new();
+        // Rename rails.md to docs/payment-rails.md
+        moved_map.insert(
+            "projects/payments/rails.md".to_string(),
+            "docs/payment-rails.md".to_string(),
+        );
+        // Rename special note.md to docs/special note.md
+        moved_map.insert(
+            "projects/payments/special note.md".to_string(),
+            "docs/special note.md".to_string(),
+        );
+
+        let (rewritten, count) = rewrite_markdown_links(root, source_note, markdown, &moved_map);
+
+        assert_eq!(count, 4); // 4 links rewritten outside code blocks
+
+        // Verify updated links
+        assert!(rewritten.contains("[Payment rails](../../docs/payment-rails.md)"));
+        assert!(rewritten.contains("[Rails anchor](../../docs/payment-rails.md#instant)"));
+        assert!(rewritten.contains("[Special Note](../../docs/special%20note.md)"));
+        assert!(rewritten.contains("[Workspace absolute](../../docs/payment-rails.md)"));
+
+        // Verify code blocks and inline code preserved
+        assert!(rewritten.contains("```markdown\n[Payment rails in code fence](./rails.md)\n```"));
+        assert!(rewritten.contains("`[Payment rails in inline code](./rails.md)`"));
+    }
+
+    #[test]
+    fn test_rewrite_workspace_links_on_rename() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Create folders & notes
+        fs::create_dir_all(root.join("projects/payments")).unwrap();
+        fs::create_dir_all(root.join("architecture")).unwrap();
+
+        let settlement_content = "# Settlement\n\nSee [Rails](./rails.md) for details.\n";
+        fs::write(
+            root.join("projects/payments/settlement.md"),
+            settlement_content,
+        )
+        .unwrap();
+
+        let arch_content =
+            "# Architecture\n\nSee [Settlement](/projects/payments/settlement.md#daily).\n";
+        fs::write(root.join("architecture/overview.md"), arch_content).unwrap();
+
+        let rails_content = "# Rails\n\nSee [Settlement](./settlement.md).\n";
+        fs::write(root.join("projects/payments/rails.md"), rails_content).unwrap();
+
+        fs::create_dir_all(root.join("projects/auth")).unwrap();
+        let auth_content = "# Auth\n\nSee [Settlement](../payments/settlement.md).\n";
+        fs::write(root.join("projects/auth/login.md"), auth_content).unwrap();
+
+        // Move settlement.md to core/settlement-engine.md
+        fs::create_dir_all(root.join("core")).unwrap();
+        let from_safe = SafePath::resolve(root, "projects/payments/settlement.md").unwrap();
+        let to_safe = SafePath::resolve(root, "core/settlement-engine.md").unwrap();
+        rename_path(root, &from_safe, &to_safe).unwrap();
+
+        let mut moved_map = HashMap::new();
+        moved_map.insert(
+            "projects/payments/settlement.md".to_string(),
+            "core/settlement-engine.md".to_string(),
+        );
+
+        let summary = rewrite_workspace_links_for_rename(root, &moved_map).unwrap();
+        assert_eq!(summary.links_updated, 3);
+        assert_eq!(summary.notes_updated, 3);
+
+        // Verify architecture/overview.md updated
+        let updated_arch = fs::read_to_string(root.join("architecture/overview.md")).unwrap();
+        assert!(updated_arch.contains("[Settlement](../core/settlement-engine.md#daily)"));
+
+        // Verify projects/payments/rails.md updated
+        let updated_rails = fs::read_to_string(root.join("projects/payments/rails.md")).unwrap();
+        assert!(updated_rails.contains("[Settlement](../../core/settlement-engine.md)"));
+
+        // Verify projects/auth/login.md updated
+        let updated_auth = fs::read_to_string(root.join("projects/auth/login.md")).unwrap();
+        assert!(updated_auth.contains("[Settlement](../../core/settlement-engine.md)"));
     }
 }
 

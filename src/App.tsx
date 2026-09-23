@@ -59,6 +59,7 @@ export const App: React.FC = () => {
     unresolved_count: 1,
   });
   const [indexingProgress, setIndexingProgress] = useState<IndexProgressEvent | null>(null);
+  const [isWatcherDegraded, setIsWatcherDegraded] = useState(false);
   const [indexedNotes, setIndexedNotes] = useState<NoteMeta[]>([]);
   const [unresolvedLinks, setUnresolvedLinks] = useState<LinkItem[]>([]);
   const [unresolvedModalOpen, setUnresolvedModalOpen] = useState(false);
@@ -321,9 +322,14 @@ export const App: React.FC = () => {
 
     loadWorkspace();
 
-    // Listen to Tauri index events if in desktop environment
+    // Listen to Tauri index and watcher events if in desktop environment
     let unlistenProgress: (() => void) | undefined;
     let unlistenReady: (() => void) | undefined;
+    let unlistenChanged: (() => void) | undefined;
+    let unlistenCreated: (() => void) | undefined;
+    let unlistenRemoved: (() => void) | undefined;
+    let unlistenRenamed: (() => void) | undefined;
+    let unlistenDegraded: (() => void) | undefined;
 
     if (isTauriEnvironment()) {
       listen<IndexProgressEvent>('index:progress', (event) => {
@@ -343,14 +349,89 @@ export const App: React.FC = () => {
       }).then((unsub) => {
         unlistenReady = unsub;
       });
+
+      listen<{ path: string }>('note:changed', async (event) => {
+        if (!mounted) return;
+        const changedPath = event.payload?.path;
+        refreshStats();
+
+        // If the changed note is the currently open note
+        if (changedPath && currentNoteRef.current.path === changedPath) {
+          if (!currentNoteRef.current.isDirty) {
+            // Unsaved edits absent: reload in-place preserving scroll and cursor (SPEC §5.3, M8)
+            const prevScroll = currentScrollTopRef.current;
+            const prevCursor = currentCursorPosRef.current;
+            await loadNote(changedPath);
+            setActiveScrollTop(prevScroll);
+            setActiveCursorPos(prevCursor);
+          } else {
+            // Note has unsaved edits: show conflict banner (SPEC §5.3)
+            setShowConflictBanner(true);
+            try {
+              const diskNote = await api.noteRead(changedPath);
+              setDiskVersionContent(diskNote.content);
+            } catch {
+              setDiskVersionContent('');
+            }
+          }
+        }
+      }).then((unsub) => {
+        unlistenChanged = unsub;
+      });
+
+      listen<{ path: string }>('note:created', () => {
+        if (!mounted) return;
+        refreshTree();
+        refreshStats();
+      }).then((unsub) => {
+        unlistenCreated = unsub;
+      });
+
+      listen<{ path: string }>('note:removed', (event) => {
+        if (!mounted) return;
+        const removedPath = event.payload?.path;
+        refreshTree();
+        refreshStats();
+        if (removedPath && currentNoteRef.current.path === removedPath) {
+          setCurrentNotePath('');
+        }
+      }).then((unsub) => {
+        unlistenRemoved = unsub;
+      });
+
+      listen<{ from: string; to: string }>('note:renamed', (event) => {
+        if (!mounted) return;
+        const { from, to } = event.payload || {};
+        refreshTree();
+        refreshStats();
+        if (from && currentNoteRef.current.path === from && to) {
+          setCurrentNotePath(to);
+          loadNote(to);
+        }
+      }).then((unsub) => {
+        unlistenRenamed = unsub;
+      });
+
+      listen<{ reason: string }>('watcher:degraded', () => {
+        if (mounted) {
+          setIsWatcherDegraded(true);
+        }
+      }).then((unsub) => {
+        unlistenDegraded = unsub;
+      });
     }
 
     return () => {
       mounted = false;
       if (unlistenProgress) unlistenProgress();
       if (unlistenReady) unlistenReady();
+      if (unlistenChanged) unlistenChanged();
+      if (unlistenCreated) unlistenCreated();
+      if (unlistenRemoved) unlistenRemoved();
+      if (unlistenRenamed) unlistenRenamed();
+      if (unlistenDegraded) unlistenDegraded();
     };
-  }, [refreshStats]);
+  }, [loadNote, refreshStats, refreshTree]);
 
   // Window blur / beforeunload save
   useEffect(() => {
@@ -586,8 +667,9 @@ export const App: React.FC = () => {
         const toPath = parentDir ? `${parentDir}/${finalName}` : finalName;
 
         if (fromPath !== toPath) {
-          await api.noteRename(fromPath, toPath);
+          const res = await api.noteRename(fromPath, toPath);
           await refreshTree();
+          await refreshStats();
 
           // If currently viewing the renamed note, update current path
           if (currentNotePath === fromPath) {
@@ -601,14 +683,18 @@ export const App: React.FC = () => {
             await loadNote(newCurrent);
           }
 
-          showToast(`Renamed to "${finalName}"`);
+          if (res?.links_updated && res.links_updated > 0) {
+            showToast(`Renamed. Updated ${res.links_updated} link${res.links_updated === 1 ? '' : 's'}`);
+          } else {
+            showToast(`Renamed to "${finalName}"`);
+          }
         }
         setInlineAction(null);
       }
     } catch (err: any) {
       showToast(`Error: ${err?.message || String(err)}`);
     }
-  }, [currentNotePath, handleSelectNote, inlineAction, loadNote, refreshTree, showToast]);
+  }, [currentNotePath, handleSelectNote, inlineAction, loadNote, refreshStats, refreshTree, showToast]);
 
   const handleDuplicateNote = useCallback(async (itemPath: string) => {
     try {
@@ -675,8 +761,9 @@ export const App: React.FC = () => {
     const toPath = toParentFolder ? `${toParentFolder}/${itemName}` : itemName;
 
     try {
-      await api.noteRename(fromPath, toPath);
+      const res = await api.noteRename(fromPath, toPath);
       await refreshTree();
+      await refreshStats();
 
       if (currentNotePath === fromPath) {
         setCurrentNotePath(toPath);
@@ -687,13 +774,19 @@ export const App: React.FC = () => {
 
       // Show toast with undo affordance
       const folderDisplayName = toParentFolder || 'workspace root';
+      const moveMsg =
+        res?.links_updated && res.links_updated > 0
+          ? `Moved "${itemName}" to ${folderDisplayName} (updated ${res.links_updated} link${res.links_updated === 1 ? '' : 's'})`
+          : `Moved "${itemName}" to ${folderDisplayName}`;
+
       showToast(
-        `Moved "${itemName}" to ${folderDisplayName}`,
+        moveMsg,
         'Undo',
         async () => {
           try {
             await api.noteRename(toPath, fromPath);
             await refreshTree();
+            await refreshStats();
             if (currentNotePath === toPath) {
               setCurrentNotePath(fromPath);
             }
@@ -707,7 +800,7 @@ export const App: React.FC = () => {
     } catch (err: any) {
       showToast(`Failed to move: ${err?.message || String(err)}`);
     }
-  }, [currentNotePath, refreshTree, showToast]);
+  }, [currentNotePath, refreshStats, refreshTree, showToast]);
 
   const handleRevealInFileManager = useCallback(async (itemPath: string) => {
     try {
@@ -1053,13 +1146,14 @@ export const App: React.FC = () => {
         )}
       </div>
 
-      {/* Status bar (SPEC §6.1, §6.2, §9.1, M7) */}
+      {/* Status bar (SPEC §6.1, §6.2, §9.1, M7, M8) */}
       <StatusBar
         workspaceName={workspaceInfo.name}
         noteCount={workspaceStats.note_count}
         linkCount={workspaceStats.link_count}
         unresolvedCount={workspaceStats.unresolved_count}
         indexingProgress={indexingProgress}
+        isWatcherDegraded={isWatcherDegraded}
         onClickUnresolved={() => setUnresolvedModalOpen(true)}
         cursorLine={1}
         cursorCol={1}

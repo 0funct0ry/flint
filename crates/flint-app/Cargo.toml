@@ -15,6 +15,8 @@ flint-core = { path = "../flint-core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+notify.workspace = true
+ignore.workspace = true
 tauri = { version = "2.3", features = [] }
 
 [build-dependencies]

@@ -102,3 +102,13 @@ export interface RenderResult {
   headings: HeadingItem[];
 }
 
+export interface WatcherDegradedPayload {
+  reason: string;
+}
+
+export interface NoteEventPayload {
+  path?: string;
+  from?: string;
+  to?: string;
+}
+

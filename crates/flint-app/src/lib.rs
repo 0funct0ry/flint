@@ -1,19 +1,34 @@
 use flint_core::{
     bootstrap_workspace, build_workspace_tree, create_folder, create_note, delete_folder,
-    delete_path, duplicate_note, read_note, rename_path, render_note_markdown,
-    resolve_workspace_root, write_note_atomic, BacklinkGroup, Fingerprint, Index, Link,
-    NoteContent, NoteMeta, RenderResult, SafePath, TreeNodeItem, WorkspaceInfo, WorkspaceStats,
+    delete_path, duplicate_note, is_default_ignored, is_note_path, read_note, rename_path,
+    render_note_markdown, resolve_workspace_root, rewrite_workspace_links_for_rename,
+    to_posix_path, write_note_atomic, BacklinkGroup, Fingerprint, Index, Link, NoteContent,
+    NoteMeta, RenderResult, SafePath, TreeNodeItem, WorkspaceInfo, WorkspaceStats,
 };
+use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
+
+/// Suppressed write item to avoid double-processing Flint's own writes (SPEC §10.4).
+#[derive(Debug, Clone)]
+pub struct SuppressedWrite {
+    pub content_hash: Option<String>,
+    pub timestamp: Instant,
+}
 
 pub struct AppState {
     pub active_workspace: Mutex<Option<PathBuf>>,
     pub index: Arc<RwLock<Index>>,
+    pub suppressed_writes: Arc<Mutex<HashMap<String, SuppressedWrite>>>,
+    pub watcher_stop: Arc<AtomicBool>,
 }
 
 impl Default for AppState {
@@ -21,8 +36,47 @@ impl Default for AppState {
         Self {
             active_workspace: Mutex::new(None),
             index: Arc::new(RwLock::new(Index::new())),
+            suppressed_writes: Arc::new(Mutex::new(HashMap::new())),
+            watcher_stop: Arc::new(AtomicBool::new(false)),
         }
     }
+}
+
+/// Record a path being written by Flint to suppress subsequent watcher event.
+fn record_suppressed_write(
+    suppressed_map: &Arc<Mutex<HashMap<String, SuppressedWrite>>>,
+    posix_path: &str,
+    content_hash: Option<String>,
+) {
+    if let Ok(mut lock) = suppressed_map.lock() {
+        // Clean up expired entries (> 2 seconds old)
+        let now = Instant::now();
+        lock.retain(|_, v| now.duration_since(v.timestamp) < Duration::from_secs(2));
+
+        lock.insert(
+            posix_path.to_string(),
+            SuppressedWrite {
+                content_hash,
+                timestamp: now,
+            },
+        );
+    }
+}
+
+/// Check if a path change was initiated by Flint itself.
+fn is_suppressed_write(
+    suppressed_map: &Arc<Mutex<HashMap<String, SuppressedWrite>>>,
+    posix_path: &str,
+) -> bool {
+    if let Ok(mut lock) = suppressed_map.lock() {
+        let now = Instant::now();
+        lock.retain(|_, v| now.duration_since(v.timestamp) < Duration::from_secs(2));
+
+        if lock.remove(posix_path).is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Helper to obtain the active workspace root or fallback to current dir.
@@ -54,7 +108,259 @@ pub struct RenameResult {
     pub links_updated: usize,
 }
 
-/// Open and initialize a workspace directory with background indexing (SPEC §6.2, §11).
+/// Event payload emitted when a note is changed, created, or removed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteEventPayload {
+    pub path: String,
+}
+
+/// Event payload emitted when a note or folder is renamed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoteRenamedPayload {
+    pub from: String,
+    pub to: String,
+}
+
+/// Event payload emitted when filesystem watcher status changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatcherDegradedPayload {
+    pub degraded: bool,
+    pub reason: Option<String>,
+}
+
+/// Check if a workspace path should be ignored by the watcher.
+fn is_path_ignored(root: &Path, abs_path: &Path) -> bool {
+    let file_name = abs_path
+        .file_name()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
+    if file_name.ends_with(".flint-tmp") || file_name.ends_with('~') {
+        return true;
+    }
+
+    let rel = match abs_path.strip_prefix(root) {
+        Ok(r) => r,
+        Err(_) => return true,
+    };
+
+    for comp in rel.components() {
+        if let Component::Normal(s) = comp {
+            let name = s.to_string_lossy();
+            if is_default_ignored(&name) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Spawn the debounced filesystem watcher thread with event coalescing (SPEC §10.4).
+fn spawn_filesystem_watcher(
+    root: PathBuf,
+    app_handle: AppHandle,
+    index_arc: Arc<RwLock<Index>>,
+    suppressed_writes: Arc<Mutex<HashMap<String, SuppressedWrite>>>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    std::thread::spawn(move || {
+        let (tx, rx): (
+            Sender<notify::Result<notify::Event>>,
+            Receiver<notify::Result<notify::Event>>,
+        ) = channel();
+
+        // Create watcher with notify
+        let watcher_res = RecommendedWatcher::new(
+            move |res| {
+                let _ = tx.send(res);
+            },
+            Config::default(),
+        );
+
+        let mut watcher = match watcher_res {
+            Ok(mut w) => {
+                if let Err(e) = w.watch(&root, RecursiveMode::Recursive) {
+                    let _ = app_handle.emit(
+                        "watcher:degraded",
+                        WatcherDegradedPayload {
+                            degraded: true,
+                            reason: Some(format!("Watch error: {}", e)),
+                        },
+                    );
+                    None
+                } else {
+                    Some(w)
+                }
+            }
+            Err(e) => {
+                let _ = app_handle.emit(
+                    "watcher:degraded",
+                    WatcherDegradedPayload {
+                        degraded: true,
+                        reason: Some(format!("Watcher init error: {}", e)),
+                    },
+                );
+                None
+            }
+        };
+
+        if watcher.is_none() {
+            // Polling fallback loop: 5 seconds interval per SPEC §10.4
+            let mut last_scan_map: HashMap<String, u64> = HashMap::new();
+
+            // Initial scan
+            if let Ok(tree) = build_workspace_tree(&root, true) {
+                fn populate_map(items: &[TreeNodeItem], map: &mut HashMap<String, u64>) {
+                    for item in items {
+                        map.insert(item.path.clone(), 0);
+                        if let Some(ref children) = item.children {
+                            populate_map(children, map);
+                        }
+                    }
+                }
+                populate_map(&tree, &mut last_scan_map);
+            }
+
+            while !stop_flag.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_secs(5));
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                // Rescan and detect changes
+                if let Ok(new_index) = Index::build_from_workspace(&root, |_, _| {}) {
+                    let stats = new_index.get_stats();
+                    if let Ok(mut lock) = index_arc.write() {
+                        *lock = new_index;
+                    }
+                    let _ = app_handle.emit("index:ready", stats);
+                }
+            }
+            return;
+        }
+
+        // Debounce map: posix_path -> (EventKind, Vec<PathBuf>, Instant)
+        let mut debounce_events: HashMap<String, (EventKind, Vec<PathBuf>, Instant)> =
+            HashMap::new();
+
+        while !stop_flag.load(Ordering::Relaxed) {
+            // Check for incoming notify events with 50ms timeout
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Ok(event)) => {
+                    let kind = event.kind;
+                    for path in event.paths {
+                        if is_path_ignored(&root, &path) {
+                            continue;
+                        }
+                        let rel = path.strip_prefix(&root).unwrap_or(&path);
+                        let posix = to_posix_path(rel);
+                        if posix.is_empty() {
+                            continue;
+                        }
+
+                        debounce_events.insert(posix, (kind, vec![path], Instant::now()));
+                    }
+                }
+                Ok(Err(err)) => {
+                    eprintln!("Notify watcher error: {:?}", err);
+                    let _ = app_handle.emit(
+                        "watcher:degraded",
+                        WatcherDegradedPayload {
+                            degraded: true,
+                            reason: Some(format!("{:?}", err)),
+                        },
+                    );
+                }
+                Err(_) => {
+                    // Timeout - process ready debounced events (>= 150ms old)
+                }
+            }
+
+            if debounce_events.is_empty() {
+                continue;
+            }
+
+            let now = Instant::now();
+            let debounce_threshold = Duration::from_millis(150);
+
+            let mut ready_keys = Vec::new();
+            for (posix, (_, _, timestamp)) in debounce_events.iter() {
+                if now.duration_since(*timestamp) >= debounce_threshold {
+                    ready_keys.push(posix.clone());
+                }
+            }
+
+            for posix in ready_keys {
+                if let Some((_kind, paths, _)) = debounce_events.remove(&posix) {
+                    // Check if self-written by Flint
+                    if is_suppressed_write(&suppressed_writes, &posix) {
+                        continue;
+                    }
+
+                    let abs_path = paths.first().cloned().unwrap_or_else(|| root.join(&posix));
+                    let is_note = is_note_path(&abs_path);
+
+                    if abs_path.exists() {
+                        if abs_path.is_file() && is_note {
+                            if let Ok(safe_path) = SafePath::resolve(&root, &posix) {
+                                if let Ok(content) = std::fs::read_to_string(safe_path.as_path()) {
+                                    let was_existing = if let Ok(mut lock) = index_arc.write() {
+                                        let exists = lock.notes.contains_key(&posix);
+                                        lock.insert_or_update_note(&root, &safe_path, &content);
+                                        exists
+                                    } else {
+                                        false
+                                    };
+
+                                    if was_existing {
+                                        let _ = app_handle.emit(
+                                            "note:changed",
+                                            NoteEventPayload {
+                                                path: posix.clone(),
+                                            },
+                                        );
+                                    } else {
+                                        let _ = app_handle.emit(
+                                            "note:created",
+                                            NoteEventPayload {
+                                                path: posix.clone(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // File or folder removed on disk
+                        if let Ok(mut lock) = index_arc.write() {
+                            lock.remove_note(Some(&root), &posix);
+                        }
+
+                        let _ = app_handle.emit(
+                            "note:removed",
+                            NoteEventPayload {
+                                path: posix.clone(),
+                            },
+                        );
+                    }
+
+                    // Emit updated stats
+                    if let Ok(lock) = index_arc.read() {
+                        let stats = lock.get_stats();
+                        let _ = app_handle.emit("index:ready", stats);
+                    }
+                }
+            }
+        }
+
+        // Clean up watcher
+        if let Some(mut w) = watcher.take() {
+            let _ = w.unwatch(&root);
+        }
+    });
+}
+
+/// Open and initialize a workspace directory with background indexing and watcher (SPEC §6.2, §10.4, §11).
 #[tauri::command]
 fn workspace_open(
     path: Option<String>,
@@ -85,6 +391,9 @@ fn workspace_open(
         is_empty,
     };
 
+    // Stop existing watcher if any
+    state.watcher_stop.store(true, Ordering::Relaxed);
+
     if let Ok(mut lock) = state.active_workspace.lock() {
         *lock = Some(root.clone());
     }
@@ -109,6 +418,16 @@ fn workspace_open(
             let _ = app_handle_clone.emit("index:ready", stats);
         }
     });
+
+    // Start new filesystem watcher per SPEC §10.4
+    let new_stop = Arc::new(AtomicBool::new(false));
+    spawn_filesystem_watcher(
+        root,
+        app_handle,
+        Arc::clone(&state.index),
+        Arc::clone(&state.suppressed_writes),
+        Arc::clone(&new_stop),
+    );
 
     Ok(info)
 }
@@ -142,6 +461,11 @@ fn note_write(
 ) -> Result<Fingerprint, String> {
     let root = get_workspace_root(&state)?;
     let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+    let posix = safe_path.to_posix_string();
+
+    // Record self-write suppression
+    record_suppressed_write(&state.suppressed_writes, &posix, None);
+
     let fp = write_note_atomic(&root, &safe_path, &content, fingerprint.as_ref())
         .map_err(|e| e.to_string())?;
 
@@ -162,6 +486,10 @@ fn note_create(
 ) -> Result<NoteMeta, String> {
     let root = get_workspace_root(&state)?;
     let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+    let posix = safe_path.to_posix_string();
+
+    record_suppressed_write(&state.suppressed_writes, &posix, None);
+
     let meta = create_note(&root, &safe_path, template.as_deref()).map_err(|e| e.to_string())?;
 
     // Incremental index update per SPEC §6.2
@@ -173,34 +501,83 @@ fn note_create(
     Ok(meta)
 }
 
-/// Rename/move a note or folder (SPEC §11, M4).
+/// Rename/move a note or folder and optionally rewrite all relative markdown links (SPEC §5.4, §11, M8).
 #[tauri::command]
 fn note_rename(
     from: String,
     to: String,
-    _rewrite_links: Option<bool>,
+    rewrite_links: Option<bool>,
     state: State<AppState>,
 ) -> Result<RenameResult, String> {
     let root = get_workspace_root(&state)?;
     let from_safe = SafePath::resolve(&root, &from).map_err(|e| e.to_string())?;
     let to_safe = SafePath::resolve(&root, &to).map_err(|e| e.to_string())?;
 
-    rename_path(&root, &from_safe, &to_safe).map_err(|e| e.to_string())?;
+    let from_posix = from_safe.to_posix_string();
+    let to_posix = to_safe.to_posix_string();
 
-    // Update index on rename
-    if let Ok(mut lock) = state.index.write() {
-        lock.remove_note(Some(&root), &from_safe.to_posix_string());
-        if to_safe.as_path().is_file() {
-            if let Ok(content) = std::fs::read_to_string(to_safe.as_path()) {
-                lock.insert_or_update_note(&root, &to_safe, &content);
+    record_suppressed_write(&state.suppressed_writes, &from_posix, None);
+    record_suppressed_write(&state.suppressed_writes, &to_posix, None);
+
+    // Build map of moved notes for link rewriting
+    let mut moved_notes_map = HashMap::new();
+    let from_abs = from_safe.as_path();
+
+    if from_abs.is_file() {
+        moved_notes_map.insert(from_posix.clone(), to_posix.clone());
+    } else if from_abs.is_dir() {
+        // Collect all child notes within the renamed folder
+        let walker = ignore::WalkBuilder::new(from_abs)
+            .hidden(false)
+            .parents(true)
+            .git_ignore(true)
+            .build();
+        for entry in walker.flatten() {
+            let path = entry.path();
+            if path.is_file() && is_note_path(path) {
+                if let Ok(rel) = path.strip_prefix(&root) {
+                    let old_posix = to_posix_path(rel);
+                    let sub = old_posix.strip_prefix(&from_posix).unwrap_or("");
+                    let new_posix = format!("{}{}", to_posix, sub);
+                    moved_notes_map.insert(old_posix, new_posix);
+                }
             }
         }
     }
 
-    // Link rewriting is deferred to M8 per PROMPTS.md
+    rename_path(&root, &from_safe, &to_safe).map_err(|e| e.to_string())?;
+
+    // Check if rewriteLinksOnRename is enabled (default: true per SPEC §5.4, §12)
+    let do_rewrite = rewrite_links.unwrap_or(true);
+    let mut links_updated = 0;
+
+    if do_rewrite && !moved_notes_map.is_empty() {
+        for target in moved_notes_map.values() {
+            record_suppressed_write(&state.suppressed_writes, target, None);
+        }
+
+        if let Ok(summary) = rewrite_workspace_links_for_rename(&root, &moved_notes_map) {
+            links_updated = summary.links_updated;
+        }
+    }
+
+    // Update index on rename
+    if let Ok(mut lock) = state.index.write() {
+        for (old_p, new_p) in &moved_notes_map {
+            lock.remove_note(Some(&root), old_p);
+            if let Ok(safe) = SafePath::resolve(&root, new_p) {
+                if safe.as_path().is_file() {
+                    if let Ok(content) = std::fs::read_to_string(safe.as_path()) {
+                        lock.insert_or_update_note(&root, &safe, &content);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(RenameResult {
         moved: true,
-        links_updated: 0,
+        links_updated,
     })
 }
 
@@ -421,6 +798,8 @@ pub fn run_with_workspace(initial_path: Option<PathBuf>) {
     let state = AppState {
         active_workspace: Mutex::new(initial_path),
         index: Arc::new(RwLock::new(Index::new())),
+        suppressed_writes: Arc::new(Mutex::new(HashMap::new())),
+        watcher_stop: Arc::new(AtomicBool::new(false)),
     };
     tauri::Builder::default()
         .manage(state)

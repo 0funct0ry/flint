@@ -11,7 +11,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
 trash.workspace = true
-ignore = "0.4"
+ignore.workspace = true
 pulldown-cmark.workspace = true
 ammonia.workspace = true
 syntect.workspace = true

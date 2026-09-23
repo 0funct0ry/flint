@@ -40,6 +40,20 @@ describe('StatusBar & UnresolvedLinksModal (M7)', () => {
     expect(screen.getByText('Indexing 450 / 1000')).toBeInTheDocument();
   });
 
+  it('renders degraded watcher indicator when watcher is degraded', () => {
+    render(
+      <StatusBar
+        workspaceName="test-vault"
+        noteCount={10}
+        linkCount={5}
+        unresolvedCount={0}
+        isWatcherDegraded={true}
+      />
+    );
+
+    expect(screen.getByText(/⚠️ polling \(degraded\)/)).toBeInTheDocument();
+  });
+
   it('renders UnresolvedLinksModal and allows navigation / note creation', () => {
     const onClose = vi.fn();
     const onNavigateToSource = vi.fn();

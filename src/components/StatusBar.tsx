@@ -8,6 +8,7 @@ export interface StatusBarProps {
   cursorLine?: number;
   cursorCol?: number;
   indexingProgress?: { indexed: number; total: number } | null;
+  isWatcherDegraded?: boolean;
   onClickUnresolved?: () => void;
 }
 
@@ -19,6 +20,7 @@ export const StatusBar: React.FC<StatusBarProps> = ({
   cursorLine = 1,
   cursorCol = 1,
   indexingProgress = null,
+  isWatcherDegraded = false,
   onClickUnresolved,
 }) => {
   return (
@@ -54,9 +56,18 @@ export const StatusBar: React.FC<StatusBarProps> = ({
         <span>Markdown</span>
         <span>UTF-8</span>
         <span>LF</span>
-        <span className="text-[var(--faint)]" title="Watching the filesystem">
-          watching
-        </span>
+        {isWatcherDegraded ? (
+          <span
+            className="text-[var(--spark)] flex items-center gap-1"
+            title="Native filesystem watcher unavailable. Falling back to 5s polling."
+          >
+            ⚠️ polling (degraded)
+          </span>
+        ) : (
+          <span className="text-[var(--faint)]" title="Watching the filesystem">
+            watching
+          </span>
+        )}
       </div>
     </footer>
   );

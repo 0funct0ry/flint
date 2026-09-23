@@ -219,6 +219,13 @@ button {
   overflow-x: auto;
   line-height: 1.6;
 }
+.reader-content pre code {
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
+  color: inherit !important;
+}
 .reader-content pre.syntect-code {
   background: var(--panel);
   border: 1px solid var(--border);

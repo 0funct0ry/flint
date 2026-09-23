@@ -422,7 +422,7 @@ fn run() -> Result<u8, (u8, String)> {
                 } else {
                     println!("Opening workspace at: {}", ws_root.display());
                 }
-                flint_app_lib::run_with_workspace(Some(ws_root));
+                flint_app_lib::run_with_context(tauri::generate_context!(), Some(ws_root));
             }
             Ok(exit_codes::SUCCESS)
         }

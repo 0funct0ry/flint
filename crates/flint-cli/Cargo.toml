@@ -16,6 +16,10 @@ flint-app = { path = "../flint-app" }
 serde.workspace = true
 serde_json.workspace = true
 clap = { version = "4.5", features = ["derive", "env", "cargo"] }
+tauri = { version = "2.3", features = [] }
+
+[build-dependencies]
+tauri-build = { version = "2.0", features = [] }
 
 [dev-dependencies]
 tempfile = "3.17"

@@ -15,10 +15,10 @@ flint/
 ├── Cargo.toml                  # Workspace definition
 ├── crates/
 │   ├── flint-core/             # Pure domain logic: index, link parsing, search, path guard
-│   ├── flint-cli/              # clap CLI, produces the `flint` binary
-│   └── flint-app/              # Tauri host: commands, events, watcher wiring
+│   ├── flint-cli/              # clap CLI + Tauri host, produces the single `flint` binary
+│   └── flint-app/              # lib-only: Tauri commands, events, watcher wiring
 ├── src/                        # React 18 + TypeScript + Tailwind + CodeMirror 6 frontend
-├── src-tauri/ -> crates/flint-app
+├── src-tauri/ -> crates/flint-cli
 └── internal-docs/              # Specification & milestone build prompts
 ```
 

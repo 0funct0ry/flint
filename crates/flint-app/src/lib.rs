@@ -822,19 +822,17 @@ fn open_external(url: String) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {
-    run_with_workspace(None);
-}
-
-pub fn run_with_workspace(initial_path: Option<PathBuf>) {
+pub fn build_app(
+    builder: tauri::Builder<tauri::Wry>,
+    initial_path: Option<PathBuf>,
+) -> tauri::Builder<tauri::Wry> {
     let state = AppState {
         active_workspace: Mutex::new(initial_path),
         index: Arc::new(RwLock::new(Index::new())),
         suppressed_writes: Arc::new(Mutex::new(HashMap::new())),
         watcher_stop: Arc::new(AtomicBool::new(false)),
     };
-    tauri::Builder::default()
+    builder
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             workspace_open,
@@ -859,6 +857,10 @@ pub fn run_with_workspace(initial_path: Option<PathBuf>) {
             links_outgoing,
             open_external
         ])
-        .run(tauri::generate_context!())
+}
+
+pub fn run_with_context(context: tauri::Context<tauri::Wry>, initial_path: Option<PathBuf>) {
+    build_app(tauri::Builder::default(), initial_path)
+        .run(context)
         .expect("error while running tauri application");
 }

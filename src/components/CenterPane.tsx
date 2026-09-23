@@ -635,7 +635,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
         });
       }
     }
-  }, [note.path, note.content, isDirty]);
+  }, [note.path, note.content, isDirty, savedCursorPos, savedScrollTop]);
 
   // Clean up on unmount
   useEffect(() => {

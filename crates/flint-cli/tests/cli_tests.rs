@@ -91,4 +91,14 @@ fn test_cli_search_and_list_and_doctor() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"broken_links\""));
+
+    // Test flint <PATH> --no-open --json resolves explicit subdir
+    let mut cmd_open_path = Command::cargo_bin("flint").unwrap();
+    cmd_open_path
+        .arg(root.join("notes/payments"))
+        .arg("--no-open")
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("notes/payments"));
 }

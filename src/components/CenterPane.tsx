@@ -229,7 +229,6 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   const editorContainerRef = useRef<HTMLDivElement>(null);
   const readerContainerRef = useRef<HTMLDivElement>(null);
   const editorViewRef = useRef<EditorView | null>(null);
-  const isScrollingSyncRef = useRef(false);
 
   const onContentChangeRef = useRef(onContentChange);
   onContentChangeRef.current = onContentChange;
@@ -363,44 +362,92 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     return () => reader.removeEventListener('scroll', handleScroll);
   }, [onHeadingInView, note.renderedHtml]);
 
-  // Synchronized scrolling in split view
+  // Synchronized scrolling in split view with source-line mapping (SPEC §8.1)
   useEffect(() => {
     if (viewMode !== 'split') return;
 
-    const editorScroller = editorContainerRef.current?.querySelector('.cm-scroller');
+    const editorScroller = editorContainerRef.current?.querySelector('.cm-scroller') as HTMLElement | null;
     const reader = readerContainerRef.current;
     if (!editorScroller || !reader) return;
 
+    // Track which pane is the active scroll source to prevent echo loops.
+    // 'idle' = no sync in progress, 'editor' = editor initiated, 'reader' = reader initiated
+    let scrollSource: 'idle' | 'editor' | 'reader' = 'idle';
+    let scrollResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const resetScrollSource = () => {
+      scrollSource = 'idle';
+      scrollResetTimer = null;
+    };
+
+    const scheduleReset = () => {
+      if (scrollResetTimer) clearTimeout(scrollResetTimer);
+      // Hold the guard long enough for the synced pane's scroll event to fire and be suppressed
+      scrollResetTimer = setTimeout(resetScrollSource, 80);
+    };
+
     const handleEditorScroll = () => {
-      if (isScrollingSyncRef.current) return;
-      isScrollingSyncRef.current = true;
+      if (scrollSource === 'reader') return;
+      scrollSource = 'editor';
 
-      const editorScrollTop = editorScroller.scrollTop;
-      const editorScrollHeight = editorScroller.scrollHeight - editorScroller.clientHeight;
-      const progress = editorScrollHeight > 0 ? editorScrollTop / editorScrollHeight : 0;
+      const editorView = editorViewRef.current;
+      if (editorView) {
+        const scrollTop = editorScroller.scrollTop;
+        const scrollHeight = editorScroller.scrollHeight;
+        const clientHeight = editorScroller.clientHeight;
+        const maxScroll = scrollHeight - clientHeight;
 
-      const readerScrollHeight = reader.scrollHeight - reader.clientHeight;
-      reader.scrollTop = progress * readerScrollHeight;
+        // Edge clamp: top
+        if (scrollTop <= 2) {
+          reader.scrollTop = 0;
+        }
+        // Edge clamp: bottom
+        else if (scrollTop >= maxScroll - 2) {
+          reader.scrollTop = reader.scrollHeight - reader.clientHeight;
+        }
+        // Line-based proportional mapping
+        else {
+          const topBlock = editorView.lineBlockAtHeight(scrollTop);
+          const topLineNumber = editorView.state.doc.lineAt(topBlock.from).number;
+          const totalLines = editorView.state.doc.lines;
+          const progress = totalLines > 1 ? (topLineNumber - 1) / (totalLines - 1) : 0;
+          const readerMaxScroll = reader.scrollHeight - reader.clientHeight;
+          reader.scrollTop = progress * readerMaxScroll;
+        }
+      }
 
-      requestAnimationFrame(() => {
-        isScrollingSyncRef.current = false;
-      });
+      scheduleReset();
     };
 
     const handleReaderScroll = () => {
-      if (isScrollingSyncRef.current) return;
-      isScrollingSyncRef.current = true;
+      if (scrollSource === 'editor') return;
+      scrollSource = 'reader';
 
-      const readerScrollTop = reader.scrollTop;
-      const readerScrollHeight = reader.scrollHeight - reader.clientHeight;
-      const progress = readerScrollHeight > 0 ? readerScrollTop / readerScrollHeight : 0;
+      const editorView = editorViewRef.current;
+      if (editorView) {
+        const scrollTop = reader.scrollTop;
+        const maxScroll = reader.scrollHeight - reader.clientHeight;
 
-      const editorScrollHeight = editorScroller.scrollHeight - editorScroller.clientHeight;
-      editorScroller.scrollTop = progress * editorScrollHeight;
+        // Edge clamp: top
+        if (scrollTop <= 2) {
+          editorScroller.scrollTop = 0;
+        }
+        // Edge clamp: bottom
+        else if (scrollTop >= maxScroll - 2) {
+          editorScroller.scrollTop = editorScroller.scrollHeight - editorScroller.clientHeight;
+        }
+        // Reverse line-based proportional mapping
+        else {
+          const readerProgress = maxScroll > 0 ? scrollTop / maxScroll : 0;
+          const totalLines = editorView.state.doc.lines;
+          const targetLineNum = Math.max(1, Math.min(Math.round(readerProgress * (totalLines - 1)) + 1, totalLines));
+          const line = editorView.state.doc.line(targetLineNum);
+          const lineBlock = editorView.lineBlockAt(line.from);
+          editorScroller.scrollTop = lineBlock.top;
+        }
+      }
 
-      requestAnimationFrame(() => {
-        isScrollingSyncRef.current = false;
-      });
+      scheduleReset();
     };
 
     editorScroller.addEventListener('scroll', handleEditorScroll, { passive: true });
@@ -409,8 +456,9 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     return () => {
       editorScroller.removeEventListener('scroll', handleEditorScroll);
       reader.removeEventListener('scroll', handleReaderScroll);
+      if (scrollResetTimer) clearTimeout(scrollResetTimer);
     };
-  }, [viewMode, note.path]);
+  }, [viewMode, note.path, note.headings]);
 
   // Navigate to link target helper
   const navigateToLink = (rawTarget: string) => {

@@ -147,6 +147,16 @@ export const App: React.FC = () => {
     };
   }, [currentNotePath, noteState, noteFingerprints, isDirty]);
 
+  // Clean up autosave timer on unmount
+  useEffect(() => {
+    return () => {
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
+    };
+  }, []);
+
   // Refresh workspace tree helper
   const refreshTree = useCallback(async () => {
     try {
@@ -465,6 +475,12 @@ export const App: React.FC = () => {
   // Note selection
   const handleSelectNote = useCallback(
     async (targetPath: string, targetLine?: number) => {
+      // Clear pending autosave timer on navigation
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
+
       // Split anchor if present
       const cleanPath = targetPath.split('#')[0];
       const anchor = targetPath.includes('#') ? targetPath.split('#')[1] : null;
@@ -572,6 +588,10 @@ export const App: React.FC = () => {
   // History back / forward with cursor and scroll restoration
   const handleBack = useCallback(async () => {
     if (historyIndex > 0) {
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
       if (isDirty) {
         await saveNote(false);
       }
@@ -595,6 +615,10 @@ export const App: React.FC = () => {
 
   const handleForward = useCallback(async () => {
     if (historyIndex < history.length - 1) {
+      if (autosaveTimerRef.current) {
+        clearTimeout(autosaveTimerRef.current);
+        autosaveTimerRef.current = null;
+      }
       if (isDirty) {
         await saveNote(false);
       }
@@ -828,6 +852,10 @@ export const App: React.FC = () => {
   }, [showToast]);
 
   const handleCloseNote = useCallback(async () => {
+    if (autosaveTimerRef.current) {
+      clearTimeout(autosaveTimerRef.current);
+      autosaveTimerRef.current = null;
+    }
     if (isDirty) {
       await saveNote(false);
     }
@@ -1091,7 +1119,7 @@ export const App: React.FC = () => {
             currentNotePath={currentNotePath}
             onSelectNote={handleSelectNote}
             headings={currentNote.headings}
-            isEmpty={workspaceInfo.is_empty}
+            isEmpty={treeData.length === 0}
             error={treeError}
             selectedFolderPath={selectedFolderPath}
             onSelectFolder={setSelectedFolderPath}

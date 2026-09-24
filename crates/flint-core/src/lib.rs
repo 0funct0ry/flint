@@ -495,7 +495,7 @@ pub fn extract_headings(content: &str) -> Vec<HeadingItem> {
 }
 
 /// Fast simple 64-bit hash (FNV-1a) formatted as hex string.
-fn hash_bytes(bytes: &[u8]) -> String {
+pub fn hash_bytes(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in bytes {
         hash ^= *byte as u64;
@@ -1368,6 +1368,8 @@ pub fn links_outgoing(
 pub struct RewriteSummary {
     pub links_updated: usize,
     pub notes_updated: usize,
+    #[serde(default)]
+    pub rewritten_notes: Vec<(String, String)>,
 }
 
 /// Compute shortest POSIX relative path from the directory of `from_note_rel` to `to_target_rel`.
@@ -1566,6 +1568,7 @@ pub fn rewrite_workspace_links_for_rename(
 
     let mut total_links = 0;
     let mut total_notes = 0;
+    let mut rewritten_notes = Vec::new();
 
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
@@ -1604,6 +1607,7 @@ pub fn rewrite_workspace_links_for_rename(
 
                 if rewritten_count > 0 && new_content != content {
                     write_note_atomic(root, &safe_path, &new_content, None)?;
+                    rewritten_notes.push((posix_rel.clone(), new_content));
                     total_links += rewritten_count;
                     total_notes += 1;
                 }
@@ -1614,6 +1618,7 @@ pub fn rewrite_workspace_links_for_rename(
     Ok(RewriteSummary {
         links_updated: total_links,
         notes_updated: total_notes,
+        rewritten_notes,
     })
 }
 

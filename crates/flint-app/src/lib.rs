@@ -67,13 +67,21 @@ fn record_suppressed_write(
 fn is_suppressed_write(
     suppressed_map: &Arc<Mutex<HashMap<String, SuppressedWrite>>>,
     posix_path: &str,
+    actual_hash: Option<&str>,
 ) -> bool {
     if let Ok(mut lock) = suppressed_map.lock() {
         let now = Instant::now();
         lock.retain(|_, v| now.duration_since(v.timestamp) < Duration::from_secs(2));
 
-        if lock.remove(posix_path).is_some() {
-            return true;
+        if let Some(entry) = lock.get(posix_path) {
+            let matches = match (&entry.content_hash, actual_hash) {
+                (Some(expected), Some(actual)) => expected == actual,
+                _ => true,
+            };
+            if matches {
+                lock.remove(posix_path);
+                return true;
+            }
         }
     }
     false
@@ -292,46 +300,54 @@ fn spawn_filesystem_watcher(
 
             for posix in ready_keys {
                 if let Some((_kind, paths, _)) = debounce_events.remove(&posix) {
-                    // Check if self-written by Flint
-                    if is_suppressed_write(&suppressed_writes, &posix) {
-                        continue;
-                    }
-
                     let abs_path = paths.first().cloned().unwrap_or_else(|| root.join(&posix));
                     let is_note = is_note_path(&abs_path);
 
                     if abs_path.exists() {
                         if abs_path.is_file() && is_note {
                             if let Ok(safe_path) = SafePath::resolve(&root, &posix) {
-                                if let Ok(content) = std::fs::read_to_string(safe_path.as_path()) {
-                                    let was_existing = if let Ok(mut lock) = index_arc.write() {
-                                        let exists = lock.notes.contains_key(&posix);
-                                        lock.insert_or_update_note(&root, &safe_path, &content);
-                                        exists
-                                    } else {
-                                        false
-                                    };
+                                if let Ok(bytes) = std::fs::read(safe_path.as_path()) {
+                                    let hash = flint_core::hash_bytes(&bytes);
 
-                                    if was_existing {
-                                        let _ = app_handle.emit(
-                                            "note:changed",
-                                            NoteEventPayload {
-                                                path: posix.clone(),
-                                            },
-                                        );
-                                    } else {
-                                        let _ = app_handle.emit(
-                                            "note:created",
-                                            NoteEventPayload {
-                                                path: posix.clone(),
-                                            },
-                                        );
+                                    // Check if self-written by Flint with matching content hash
+                                    if is_suppressed_write(&suppressed_writes, &posix, Some(&hash)) {
+                                        continue;
+                                    }
+
+                                    if let Ok(content) = String::from_utf8(bytes) {
+                                        let was_existing = if let Ok(mut lock) = index_arc.write() {
+                                            let exists = lock.notes.contains_key(&posix);
+                                            lock.insert_or_update_note(&root, &safe_path, &content);
+                                            exists
+                                        } else {
+                                            false
+                                        };
+
+                                        if was_existing {
+                                            let _ = app_handle.emit(
+                                                "note:changed",
+                                                NoteEventPayload {
+                                                    path: posix.clone(),
+                                                },
+                                            );
+                                        } else {
+                                            let _ = app_handle.emit(
+                                                "note:created",
+                                                NoteEventPayload {
+                                                    path: posix.clone(),
+                                                },
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
                     } else {
                         // File or folder removed on disk
+                        if is_suppressed_write(&suppressed_writes, &posix, None) {
+                            continue;
+                        }
+
                         if let Ok(mut lock) = index_arc.write() {
                             lock.remove_note(Some(&root), &posix);
                         }
@@ -370,8 +386,22 @@ fn workspace_open(
     let current_dir = env::current_dir().map_err(|e| e.to_string())?;
     let path_buf = path.map(PathBuf::from);
 
-    let root = resolve_workspace_root(path_buf.as_deref(), None, None, &current_dir)
-        .map_err(|e| e.to_string())?;
+    let root = match path_buf {
+        Some(explicit) => {
+            resolve_workspace_root(Some(&explicit), None, None, &current_dir).map_err(|e| e.to_string())?
+        }
+        None => {
+            let active_opt = state
+                .active_workspace
+                .lock()
+                .map_err(|e| format!("Lock error: {}", e))?
+                .clone();
+            match active_opt {
+                Some(active) => active,
+                None => resolve_workspace_root(None, None, None, &current_dir).map_err(|e| e.to_string())?,
+            }
+        }
+    };
 
     // Bootstrap .flint/config.json idempotently
     bootstrap_workspace(&root).map_err(|e| e.to_string())?;
@@ -463,11 +493,11 @@ fn note_write(
     let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
     let posix = safe_path.to_posix_string();
 
-    // Record self-write suppression
-    record_suppressed_write(&state.suppressed_writes, &posix, None);
-
     let fp = write_note_atomic(&root, &safe_path, &content, fingerprint.as_ref())
         .map_err(|e| e.to_string())?;
+
+    // Record self-write suppression with actual written content hash
+    record_suppressed_write(&state.suppressed_writes, &posix, Some(fp.content_hash.clone()));
 
     // Incremental index update per SPEC §6.2
     if let Ok(mut lock) = state.index.write() {
@@ -488,13 +518,14 @@ fn note_create(
     let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
     let posix = safe_path.to_posix_string();
 
-    record_suppressed_write(&state.suppressed_writes, &posix, None);
-
     let meta = create_note(&root, &safe_path, template.as_deref()).map_err(|e| e.to_string())?;
+
+    let content = template.as_deref().unwrap_or("");
+    let hash = flint_core::hash_bytes(content.as_bytes());
+    record_suppressed_write(&state.suppressed_writes, &posix, Some(hash));
 
     // Incremental index update per SPEC §6.2
     if let Ok(mut lock) = state.index.write() {
-        let content = template.as_deref().unwrap_or("");
         lock.insert_or_update_note(&root, &safe_path, content);
     }
 
@@ -515,9 +546,6 @@ fn note_rename(
 
     let from_posix = from_safe.to_posix_string();
     let to_posix = to_safe.to_posix_string();
-
-    record_suppressed_write(&state.suppressed_writes, &from_posix, None);
-    record_suppressed_write(&state.suppressed_writes, &to_posix, None);
 
     // Build map of moved notes for link rewriting
     let mut moved_notes_map = HashMap::new();
@@ -547,17 +575,33 @@ fn note_rename(
 
     rename_path(&root, &from_safe, &to_safe).map_err(|e| e.to_string())?;
 
+    // Record suppression for moved items
+    record_suppressed_write(&state.suppressed_writes, &from_posix, None);
+    if to_safe.as_path().is_file() {
+        if let Ok(bytes) = std::fs::read(to_safe.as_path()) {
+            record_suppressed_write(
+                &state.suppressed_writes,
+                &to_posix,
+                Some(flint_core::hash_bytes(&bytes)),
+            );
+        } else {
+            record_suppressed_write(&state.suppressed_writes, &to_posix, None);
+        }
+    } else {
+        record_suppressed_write(&state.suppressed_writes, &to_posix, None);
+    }
+
     // Check if rewriteLinksOnRename is enabled (default: true per SPEC §5.4, §12)
     let do_rewrite = rewrite_links.unwrap_or(true);
     let mut links_updated = 0;
 
     if do_rewrite && !moved_notes_map.is_empty() {
-        for target in moved_notes_map.values() {
-            record_suppressed_write(&state.suppressed_writes, target, None);
-        }
-
         if let Ok(summary) = rewrite_workspace_links_for_rename(&root, &moved_notes_map) {
             links_updated = summary.links_updated;
+            for (rewritten_path, new_content) in summary.rewritten_notes {
+                let hash = flint_core::hash_bytes(new_content.as_bytes());
+                record_suppressed_write(&state.suppressed_writes, &rewritten_path, Some(hash));
+            }
         }
     }
 
@@ -590,6 +634,8 @@ fn note_duplicate(path: String, state: State<AppState>) -> Result<NoteMeta, Stri
 
     if let Ok(safe_dup) = SafePath::resolve(&root, &meta.path) {
         if let Ok(content) = std::fs::read_to_string(safe_dup.as_path()) {
+            let hash = flint_core::hash_bytes(content.as_bytes());
+            record_suppressed_write(&state.suppressed_writes, &meta.path, Some(hash));
             if let Ok(mut lock) = state.index.write() {
                 lock.insert_or_update_note(&root, &safe_dup, &content);
             }
@@ -863,4 +909,36 @@ pub fn run_with_context(context: tauri::Context<tauri::Wry>, initial_path: Optio
     build_app(tauri::Builder::default(), initial_path)
         .run(context)
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_suppression_with_content_hash() {
+        let suppressed = Arc::new(Mutex::new(HashMap::new()));
+        let path = "test/note.md";
+        let hash = "hash123";
+
+        record_suppressed_write(&suppressed, path, Some(hash.to_string()));
+
+        // External write with different hash should NOT be suppressed
+        assert!(!is_suppressed_write(&suppressed, path, Some("external_hash")));
+
+        // Write with matching hash should be suppressed
+        assert!(is_suppressed_write(&suppressed, path, Some("hash123")));
+
+        // After suppression consumed, subsequent write is not suppressed
+        assert!(!is_suppressed_write(&suppressed, path, Some("hash123")));
+    }
+
+    #[test]
+    fn test_failed_write_does_not_suppress_follow_up() {
+        let suppressed = Arc::new(Mutex::new(HashMap::new()));
+        let path = "test/note.md";
+
+        // If write fails before recording, suppressed map is empty
+        assert!(!is_suppressed_write(&suppressed, path, Some("any_hash")));
+    }
 }

@@ -329,6 +329,14 @@ pub fn render_note_markdown(
     let mut current_heading_level = None;
     let mut current_heading_text = String::new();
 
+    // Image state: collect alt text between Start(Image) and End(Image)
+    let mut in_image = false;
+    let mut image_alt_text = String::new();
+    let mut image_resolved_url = String::new();
+    let mut image_exists = false;
+    let mut image_title = String::new();
+    let mut image_dest_url = String::new();
+
     for event in parser {
         match event {
             Event::Start(Tag::CodeBlock(kind)) => {
@@ -346,6 +354,15 @@ pub fn render_note_markdown(
             }
             Event::Text(text) if in_code_block => {
                 code_block_buf.push_str(&text);
+            }
+            Event::Text(text) if in_image => {
+                image_alt_text.push_str(&text);
+            }
+            Event::Code(text) if in_image => {
+                image_alt_text.push_str(&text);
+            }
+            Event::SoftBreak if in_image => {
+                image_alt_text.push(' ');
             }
             Event::Start(Tag::Heading { level, .. }) => {
                 current_heading_level = Some(level);
@@ -467,33 +484,39 @@ pub fn render_note_markdown(
             }) => {
                 let (resolved_url, exists) =
                     resolve_image_src(&dest_url, note_folder_abs.as_deref(), workspace_root);
-
-                if exists {
-                    let title_attr = if !title.is_empty() {
+                in_image = true;
+                image_alt_text.clear();
+                image_resolved_url = resolved_url;
+                image_exists = exists;
+                image_title = title.to_string();
+                image_dest_url = dest_url.to_string();
+            }
+            Event::End(TagEnd::Image) => {
+                in_image = false;
+                if image_exists {
+                    let title_attr = if !image_title.is_empty() {
                         format!(
                             " title=\"{}\"",
-                            html_escape::encode_double_quoted_attribute(&title)
+                            html_escape::encode_double_quoted_attribute(&image_title)
                         )
                     } else {
                         String::new()
                     };
                     let img_html = format!(
-                        "<img src=\"{}\" alt=\"\"{} loading=\"lazy\" />",
-                        html_escape::encode_double_quoted_attribute(&resolved_url),
+                        "<img src=\"{}\" alt=\"{}\"{} loading=\"lazy\" />",
+                        html_escape::encode_double_quoted_attribute(&image_resolved_url),
+                        html_escape::encode_double_quoted_attribute(&image_alt_text),
                         title_attr
                     );
                     custom_events.push(Event::Html(CowStr::Boxed(img_html.into_boxed_str())));
                 } else {
                     let missing_html = format!(
                         "<span class=\"flint-missing-image\" title=\"Image not found: {}\"><span class=\"flint-missing-image-icon\">🖼</span> Missing image: <code>{}</code></span>",
-                        html_escape::encode_double_quoted_attribute(&dest_url),
-                        html_escape::encode_text(&dest_url)
+                        html_escape::encode_double_quoted_attribute(&image_dest_url),
+                        html_escape::encode_text(&image_dest_url)
                     );
                     custom_events.push(Event::Html(CowStr::Boxed(missing_html.into_boxed_str())));
                 }
-            }
-            Event::End(TagEnd::Image) => {
-                // Handled in Start
             }
             Event::Start(Tag::Table(_)) => {
                 custom_events.push(Event::Html(CowStr::Borrowed(
@@ -504,7 +527,7 @@ pub fn render_note_markdown(
                 custom_events.push(Event::Html(CowStr::Borrowed("</table></div>")));
             }
             other => {
-                if current_heading_level.is_none() {
+                if current_heading_level.is_none() && !in_image {
                     custom_events.push(other);
                 }
             }
@@ -774,5 +797,23 @@ $$
         assert!(res
             .html
             .contains("Missing image: <code>./assets/nonexistent.png</code>"));
+    }
+
+    #[test]
+    fn test_render_specific_badge() {
+        let md = r#"[![Build](https://img.shields.io/badge/build-passing-brightgreen)](https://example.com/ci)"#;
+        let res = render_note_markdown(md, "dark", None, None);
+        eprintln!("DEBUG_RENDERED_HTML: {}", res.html);
+        assert!(res.html.contains("<img"));
+        assert!(res.html.contains("img.shields.io"));
+    }
+
+    #[test]
+    fn test_render_horizontal_rule() {
+        let md = "Above\n\n---\n\nBelow";
+        let res = render_note_markdown(md, "dark", None, None);
+        assert!(res.html.contains("<hr"));
+        assert!(res.html.contains("<p>Above</p>"));
+        assert!(res.html.contains("<p>Below</p>"));
     }
 }

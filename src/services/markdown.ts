@@ -99,46 +99,6 @@ export function renderMarkdownToHtml(markdown: string): string {
     }
   }
 
-  function escapeHtml(str: string): string {
-    return str
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#039;');
-  }
-
-  function formatInline(text: string): string {
-    // 1. Inline code: `code`
-    let formatted = text.replace(/`([^`]+)`/g, (_, code) => `<code>${escapeHtml(code)}</code>`);
-
-    // 2. Bold & Italic: ***text***
-    formatted = formatted.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>');
-
-    // 3. Bold: **text** or __text__
-    formatted = formatted.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    formatted = formatted.replace(/__([^_]+)__/g, '<strong>$1</strong>');
-
-    // 4. Italic: *text* or _text_
-    formatted = formatted.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-    formatted = formatted.replace(/_([^_]+)_/g, '<em>$1</em>');
-
-    // 5. Strikethrough: ~~text~~
-    formatted = formatted.replace(/~~([^~]+)~~/g, '<del>$1</del>');
-
-    // 6. Links: [text](target)
-    formatted = formatted.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => {
-      if (href.startsWith('http://') || href.startsWith('https://') || href.startsWith('mailto:')) {
-        return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
-      }
-      // Internal note link
-      const cleanHref = href.replace(/^\.\//, '');
-      return `<a href="#/note/${escapeHtml(cleanHref)}">${label}</a>`;
-    });
-
-    return formatted;
-  }
-
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
     const trimmed = rawLine.trim();
@@ -196,10 +156,7 @@ export function renderMarkdownToHtml(markdown: string): string {
       flushTable();
       const level = headingMatch[1].length;
       const hText = headingMatch[2].trim();
-      const anchor = hText
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/(^-|-$)/g, '');
+      const anchor = slugify(hText);
       htmlOutput.push(`<h${level} id="${anchor}">${formatInline(hText)}</h${level}>`);
       continue;
     }
@@ -296,6 +253,15 @@ export function renderMarkdownToHtml(markdown: string): string {
       continue;
     }
 
+    // Horizontal Rule: --- or *** or ___ (at least 3 characters, optional whitespace)
+    if (/^(?:[-*_]\s*){3,}$/.test(trimmed)) {
+      flushParagraph();
+      flushList();
+      flushTable();
+      htmlOutput.push('<hr />');
+      continue;
+    }
+
     // Normal paragraph text
     flushList();
     flushTable();
@@ -325,4 +291,93 @@ export function renderMarkdownToHtml(markdown: string): string {
   }
 
   return finalHtml;
+}
+
+export function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+export function slugify(text: string): string {
+  return text
+    .toLowerCase()
+    .split('')
+    .map((ch) => (/[a-z0-9]/.test(ch) ? ch : '-'))
+    .join('')
+    .split('-')
+    .filter((s) => s.length > 0)
+    .join('-');
+}
+
+function formatInline(text: string): string {
+  // First escape raw HTML to prevent XSS holes
+  const escaped = escapeHtml(text);
+
+  // 1. Inline code: `code`
+  let formatted = escaped.replace(/`([^`]+)`/g, (_, code) => `<code>${code}</code>`);
+
+  // 2. Bold & Italic: ***text***
+  formatted = formatted.replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>');
+
+  // 3. Bold: **text** or __text__
+  formatted = formatted.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  formatted = formatted.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+
+  // 4. Italic: *text* or _text_
+  formatted = formatted.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  formatted = formatted.replace(/_([^_]+)_/g, '<em>$1</em>');
+
+  // 5. Strikethrough: ~~text~~
+  formatted = formatted.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+
+  // 6. Linked images: [![alt](img-src)](link-href)
+  formatted = formatted.replace(
+    /\[!\[([^\]]*)\]\(([^)]+)\)\]\(([^)]+)\)/g,
+    (_, alt, imgSrc, linkHref) => {
+      const rawImgSrc = unescapeEntities(imgSrc);
+      const rawLinkHref = unescapeEntities(linkHref);
+      if (rawLinkHref.startsWith('http://') || rawLinkHref.startsWith('https://') || rawLinkHref.startsWith('mailto:')) {
+        return `<a href="${escapeHtml(rawLinkHref)}" target="_blank" rel="noopener noreferrer"><img src="${escapeHtml(rawImgSrc)}" alt="${escapeHtml(alt)}" style="max-width:100%;height:auto;" /></a>`;
+      }
+      const cleanHref = rawLinkHref.replace(/^\.\//, '');
+      return `<a href="#/note/${escapeHtml(cleanHref)}"><img src="${escapeHtml(rawImgSrc)}" alt="${escapeHtml(alt)}" style="max-width:100%;height:auto;" /></a>`;
+    }
+  );
+
+  // 7. Plain images: ![alt](src)
+  formatted = formatted.replace(
+    /!\[([^\]]*)\]\(([^)]+)\)/g,
+    (_, alt, src) => {
+      const rawSrc = unescapeEntities(src);
+      return `<img src="${escapeHtml(rawSrc)}" alt="${escapeHtml(alt)}" style="max-width:100%;height:auto;" />`;
+    }
+  );
+
+  // 8. Links: [text](target) - handle unescaped link markdown inside escaped string
+  formatted = formatted.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label, href) => {
+    const rawHref = unescapeEntities(href);
+
+    if (rawHref.startsWith('http://') || rawHref.startsWith('https://') || rawHref.startsWith('mailto:')) {
+      return `<a href="${escapeHtml(rawHref)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    }
+    // Internal note link
+    const cleanHref = rawHref.replace(/^\.\//, '');
+    return `<a href="#/note/${escapeHtml(cleanHref)}">${label}</a>`;
+  });
+
+  return formatted;
+}
+
+/** Reverse escapeHtml entities back to raw characters for href/src attributes */
+function unescapeEntities(str: string): string {
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'");
 }

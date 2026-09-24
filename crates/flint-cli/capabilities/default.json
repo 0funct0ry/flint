@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default capability granting the main window access to core APIs, including event listen/emit used for live workspace updates (note:created, note:changed, note:removed, note:renamed, index:progress, index:ready, watcher:degraded, conflict:detected).",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default"
+  ]
+}

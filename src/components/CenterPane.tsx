@@ -489,7 +489,6 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
 
   // Initialize CodeMirror 6 editor instance with autocompletion and link navigation
   useEffect(() => {
-    if (!editorContainerRef.current) return;
     if (!note.path) {
       if (editorViewRef.current) {
         editorViewRef.current.destroy();
@@ -498,6 +497,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       loadedNotePathRef.current = '';
       return;
     }
+    if (!editorContainerRef.current) return;
 
     // Link autocomplete completion source (SPEC §6.3, M7)
     const linkCompletionSource = (context: CompletionContext): CompletionResult | null => {
@@ -551,8 +551,11 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       return null;
     };
 
-    // If switching to a new note, create/re-create editor
-    if (loadedNotePathRef.current !== note.path || !editorViewRef.current) {
+    // If switching to a new note or container changed, create/re-create editor
+    const isAttached =
+      editorViewRef.current &&
+      editorContainerRef.current.contains(editorViewRef.current.dom);
+    if (loadedNotePathRef.current !== note.path || !editorViewRef.current || !isAttached) {
       if (editorViewRef.current) {
         editorViewRef.current.destroy();
       }

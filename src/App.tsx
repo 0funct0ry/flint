@@ -288,6 +288,25 @@ export const App: React.FC = () => {
               return { ...prev, [currentNotePath]: { ...cur, backlinks: bls } };
             });
           });
+
+          // Refresh note metadata (tags, title, headings) from backend
+          api.noteRead(currentNotePath).then((readNote) => {
+            setNoteState((prev) => {
+              const cur = prev[currentNotePath];
+              if (!cur) return prev;
+              return {
+                ...prev,
+                [currentNotePath]: {
+                  ...cur,
+                  tags: readNote.meta.tags,
+                  title: readNote.meta.title,
+                  headings: readNote.meta.headings,
+                },
+              };
+            });
+          }).catch((err) => {
+            console.warn(`Failed to refresh metadata after save for ${currentNotePath}:`, err);
+          });
         }
       } catch (err: any) {
         const errMsg = err?.message || String(err);

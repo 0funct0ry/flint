@@ -136,6 +136,19 @@ pub struct WatcherDegradedPayload {
     pub reason: Option<String>,
 }
 
+/// Helper to safely strip root prefix handling canonicalization differences (e.g. /private on macOS).
+fn get_relative_to_root(root: &Path, path: &Path) -> Option<PathBuf> {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return Some(rel.to_path_buf());
+    }
+    if let (Ok(c_root), Ok(c_path)) = (std::fs::canonicalize(root), std::fs::canonicalize(path)) {
+        if let Ok(rel) = c_path.strip_prefix(&c_root) {
+            return Some(rel.to_path_buf());
+        }
+    }
+    None
+}
+
 /// Check if a workspace path should be ignored by the watcher.
 fn is_path_ignored(root: &Path, abs_path: &Path) -> bool {
     let file_name = abs_path
@@ -146,9 +159,9 @@ fn is_path_ignored(root: &Path, abs_path: &Path) -> bool {
         return true;
     }
 
-    let rel = match abs_path.strip_prefix(root) {
-        Ok(r) => r,
-        Err(_) => return true,
+    let rel = match get_relative_to_root(root, abs_path) {
+        Some(r) => r,
+        None => return true,
     };
 
     for comp in rel.components() {
@@ -260,7 +273,11 @@ fn spawn_filesystem_watcher(
                         if is_path_ignored(&root, &path) {
                             continue;
                         }
-                        let rel = path.strip_prefix(&root).unwrap_or(&path);
+                        let rel_opt = get_relative_to_root(&root, &path);
+                        let rel = match rel_opt.as_ref() {
+                            Some(r) => r.as_path(),
+                            None => path.strip_prefix(&root).unwrap_or(&path),
+                        };
                         let posix = to_posix_path(rel);
                         if posix.is_empty() {
                             continue;
@@ -422,7 +439,7 @@ fn workspace_open(
         is_empty,
     };
 
-    // Stop existing watcher if any
+    // Stop existing watcher if any, then start a new one
     state.watcher_stop.store(true, Ordering::Relaxed);
 
     if let Ok(mut lock) = state.active_workspace.lock() {
@@ -451,13 +468,13 @@ fn workspace_open(
     });
 
     // Start new filesystem watcher per SPEC §10.4
-    let new_stop = Arc::new(AtomicBool::new(false));
+    state.watcher_stop.store(false, Ordering::Relaxed);
     spawn_filesystem_watcher(
         root,
         app_handle,
         Arc::clone(&state.index),
         Arc::clone(&state.suppressed_writes),
-        Arc::clone(&new_stop),
+        Arc::clone(&state.watcher_stop),
     );
 
     Ok(info)

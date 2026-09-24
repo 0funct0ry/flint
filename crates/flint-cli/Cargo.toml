@@ -18,6 +18,9 @@ serde_json.workspace = true
 clap = { version = "4.5", features = ["derive", "env", "cargo"] }
 tauri = { version = "2.3", features = [] }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [build-dependencies]
 tauri-build = { version = "2.0", features = [] }
 

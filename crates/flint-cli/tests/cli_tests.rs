@@ -101,4 +101,69 @@ fn test_cli_search_and_list_and_doctor() {
         .assert()
         .success()
         .stdout(predicate::str::contains("notes/payments"));
+
+    // Test flint with non-existent path synchronously fails with exit code 3
+    let mut cmd_bad_path = Command::cargo_bin("flint").unwrap();
+    cmd_bad_path
+        .arg(root.join("non_existent_vault_dir"))
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("Workspace not found"));
+
+    // Test detached launch: flint <PATH> returns code 0 quickly (< 2s) and prints launch message
+    let start = std::time::Instant::now();
+    let mut cmd_launch = Command::cargo_bin("flint").unwrap();
+    let assert_res = cmd_launch
+        .arg(root)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Opening workspace at:"));
+    let duration = start.elapsed();
+    assert!(
+        duration < std::time::Duration::from_secs(2),
+        "Detached GUI launch took too long: {:?}",
+        duration
+    );
+    drop(assert_res);
+
+    // On Unix, verify that the child process exists, has its own process group / session (no controlling terminal pgid),
+    // and then kill it so tests don't leave background processes behind.
+    #[cfg(unix)]
+    {
+        // Give OS a moment to register child process
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let canonical_root = root.canonicalize().unwrap();
+        let root_str = canonical_root.display().to_string();
+        let output = std::process::Command::new("pgrep")
+            .arg("-f")
+            .arg("--")
+            .arg(&format!("flint.*{}", root_str))
+            .output();
+
+        let mut found = false;
+        if let Ok(out) = output {
+            let pids_str = String::from_utf8_lossy(&out.stdout);
+            for pid_str in pids_str.lines() {
+                if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                    found = true;
+                    // Check process is alive and inspect its pgid / sid
+                    unsafe {
+                        let pgid = libc::getpgid(pid);
+                        assert!(pgid > 0, "Child process group should be valid");
+                        let sid = libc::getsid(pid);
+                        assert_eq!(pgid, sid, "Child should have setsid called (pgid == sid)");
+
+                        // Assert it is detached from our test runner's process group
+                        let my_pgid = libc::getpgrp();
+                        assert_ne!(pgid, my_pgid, "Child should not be in test process group");
+
+                        // Clean up child process
+                        libc::kill(pid, libc::SIGTERM);
+                    }
+                }
+            }
+        }
+        assert!(found, "Detached child process was not found by pgrep");
+    }
 }

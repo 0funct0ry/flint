@@ -4,8 +4,8 @@ use flint_core::{
 };
 use std::env;
 use std::fs;
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Stdio};
 
 /// Exit codes per SPEC §4.2:
 /// 0 success
@@ -50,6 +50,14 @@ pub struct Cli {
     /// Log level filter (error, warn, info, debug, trace)
     #[arg(long, default_value = "info", global = true)]
     pub log: String,
+
+    /// Run GUI in the foreground (blocking the terminal)
+    #[arg(long, global = true)]
+    pub foreground: bool,
+
+    /// Internal plumbing: run GUI child process directly
+    #[arg(long, hide = true, global = true)]
+    pub gui_child: bool,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -387,7 +395,15 @@ fn run() -> Result<u8, (u8, String)> {
             Ok(exit_codes::SUCCESS)
         }
         None => {
-            // Default: open GUI or resolve workspace
+            // If running as internal GUI child process, skip path re-resolution and run directly
+            if cli.gui_child {
+                let ws_root = cli.path.unwrap_or(current_dir);
+                let _ = bootstrap_workspace(&ws_root);
+                launch_gui(ws_root);
+                return Ok(exit_codes::SUCCESS);
+            }
+
+            // Default: resolve workspace synchronously
             let ws_root = resolve_workspace_root(
                 cli.path.as_deref(),
                 cli.workspace.as_deref(),
@@ -410,7 +426,7 @@ fn run() -> Result<u8, (u8, String)> {
                 } else {
                     println!("Workspace ready at: {}", ws_root.display());
                 }
-            } else {
+            } else if cli.foreground {
                 if cli.json {
                     println!(
                         "{}",
@@ -422,11 +438,79 @@ fn run() -> Result<u8, (u8, String)> {
                 } else {
                     println!("Opening workspace at: {}", ws_root.display());
                 }
-                flint_app_lib::run_with_context(tauri::generate_context!(), Some(ws_root));
+                launch_gui(ws_root);
+            } else {
+                spawn_detached_gui(&ws_root, &cli.log)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "status": "launching_gui",
+                            "detached": true,
+                            "workspace": ws_root.display().to_string()
+                        })
+                    );
+                } else {
+                    println!("Opening workspace at: {}", ws_root.display());
+                }
             }
             Ok(exit_codes::SUCCESS)
         }
     }
+}
+
+fn launch_gui(ws_root: PathBuf) {
+    flint_app_lib::run_with_context(tauri::generate_context!(), Some(ws_root));
+}
+
+fn spawn_detached_gui(ws_root: &Path, log_level: &str) -> Result<(), (u8, String)> {
+    let current_exe = env::current_exe().map_err(|e| {
+        (
+            exit_codes::GENERIC_FAILURE,
+            format!("Failed to determine current executable path: {}", e),
+        )
+    })?;
+
+    let mut cmd = Command::new(current_exe);
+    cmd.arg(ws_root)
+        .arg("--gui-child")
+        .arg("--log")
+        .arg(log_level)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // Detach from controlling terminal and create new session / process group
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_PROCESS_GROUP = 0x00000200, DETACHED_PROCESS = 0x00000008
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+
+    cmd.spawn().map_err(|e| {
+        (
+            exit_codes::GENERIC_FAILURE,
+            format!("Failed to spawn detached GUI child process: {}", e),
+        )
+    })?;
+
+    Ok(())
 }
 
 fn map_ws_error(err: WorkspaceError) -> (u8, String) {

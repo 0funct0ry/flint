@@ -310,7 +310,8 @@ fn spawn_filesystem_watcher(
                                     let hash = flint_core::hash_bytes(&bytes);
 
                                     // Check if self-written by Flint with matching content hash
-                                    if is_suppressed_write(&suppressed_writes, &posix, Some(&hash)) {
+                                    if is_suppressed_write(&suppressed_writes, &posix, Some(&hash))
+                                    {
                                         continue;
                                     }
 
@@ -387,9 +388,8 @@ fn workspace_open(
     let path_buf = path.map(PathBuf::from);
 
     let root = match path_buf {
-        Some(explicit) => {
-            resolve_workspace_root(Some(&explicit), None, None, &current_dir).map_err(|e| e.to_string())?
-        }
+        Some(explicit) => resolve_workspace_root(Some(&explicit), None, None, &current_dir)
+            .map_err(|e| e.to_string())?,
         None => {
             let active_opt = state
                 .active_workspace
@@ -398,7 +398,8 @@ fn workspace_open(
                 .clone();
             match active_opt {
                 Some(active) => active,
-                None => resolve_workspace_root(None, None, None, &current_dir).map_err(|e| e.to_string())?,
+                None => resolve_workspace_root(None, None, None, &current_dir)
+                    .map_err(|e| e.to_string())?,
             }
         }
     };
@@ -497,7 +498,11 @@ fn note_write(
         .map_err(|e| e.to_string())?;
 
     // Record self-write suppression with actual written content hash
-    record_suppressed_write(&state.suppressed_writes, &posix, Some(fp.content_hash.clone()));
+    record_suppressed_write(
+        &state.suppressed_writes,
+        &posix,
+        Some(fp.content_hash.clone()),
+    );
 
     // Incremental index update per SPEC §6.2
     if let Ok(mut lock) = state.index.write() {
@@ -924,7 +929,11 @@ mod tests {
         record_suppressed_write(&suppressed, path, Some(hash.to_string()));
 
         // External write with different hash should NOT be suppressed
-        assert!(!is_suppressed_write(&suppressed, path, Some("external_hash")));
+        assert!(!is_suppressed_write(
+            &suppressed,
+            path,
+            Some("external_hash")
+        ));
 
         // Write with matching hash should be suppressed
         assert!(is_suppressed_write(&suppressed, path, Some("hash123")));

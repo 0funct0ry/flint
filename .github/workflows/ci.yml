@@ -21,6 +21,19 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
       - name: Rust tests
         run: cargo test --workspace
+      - name: Install Node for Tauri build
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 11.0.4
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Approve build scripts
+        run: pnpm approve-builds --all
+      - name: Build Flint.app bundle (M10.04)
+        run: cargo tauri build --bundles app
 
   frontend:
     name: Frontend Checks

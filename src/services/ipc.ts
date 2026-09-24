@@ -516,11 +516,27 @@ export const api = {
     };
   },
 
+  async chooseFolder(): Promise<string | null> {
+    if (isTauriEnvironment()) {
+      // Returns Option<String> serialised as null or the path string
+      return await invoke<string | null>("choose_folder");
+    }
+    // In browser dev mode, return a mock path
+    return "/Users/dev/notes";
+  },
+
   async openExternal(url: string): Promise<void> {
     if (isTauriEnvironment()) {
       return await invoke<void>("open_external", { url });
     }
     window.open(url, "_blank", "noopener,noreferrer");
+  },
+
+  async recentWorkspaces(): Promise<string[]> {
+    if (isTauriEnvironment()) {
+      return await invoke<string[]>("recent_workspaces");
+    }
+    return [];
   },
 };
 

@@ -19,6 +19,7 @@ flint/
 │   └── flint-app/              # lib-only: Tauri commands, events, watcher wiring
 ├── src/                        # React 18 + TypeScript + Tailwind + CodeMirror 6 frontend
 ├── src-tauri/ -> crates/flint-cli
+├── bin/flint                   # macOS PATH shim — routes `flint` through LaunchServices
 └── internal-docs/              # Specification & milestone build prompts
 ```
 
@@ -44,7 +45,7 @@ flint/
    pnpm dev
    ```
 
-3. **Run Tauri application:**
+3. **Run Tauri application (dev mode):**
    ```bash
    cargo tauri dev
    ```
@@ -53,6 +54,32 @@ flint/
    ```bash
    cargo run -p flint-cli -- --help
    ```
+
+---
+
+## Building the App Bundle (macOS)
+
+To produce a fully launchable `Flint.app` (required for Finder double-click, Dock icon, and menu-bar registration — M10.04):
+
+```bash
+cargo tauri build --bundles app
+```
+
+The bundle is written to `target/release/bundle/macos/Flint.app`.
+
+> **Note:** `cargo run -p flint-cli` and `cargo tauri dev` produce a raw binary only.
+> The `.app` bundle is required for proper macOS GUI activation via LaunchServices.
+
+### macOS PATH Shim (`bin/flint`)
+
+The file [`bin/flint`](./bin/flint) is a thin shell script that must be installed to `PATH` (e.g. `/usr/local/bin/flint`).  It routes terminal invocations through `open -a Flint.app --args "$@"` so the GUI process is always registered with LaunchServices:
+
+```bash
+# Install (after building Flint.app and copying to /Applications):
+sudo install -m 0755 bin/flint /usr/local/bin/flint
+```
+
+The shim searches `/Applications/Flint.app`, `~/Applications/Flint.app`, and a recorded install path before falling back to the dev binary with a warning.
 
 ---
 
@@ -72,3 +99,4 @@ flint/
   pnpm typecheck
   pnpm build
   ```
+

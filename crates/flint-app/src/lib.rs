@@ -1,9 +1,10 @@
 use flint_core::{
     bootstrap_workspace, build_workspace_tree, create_folder, create_note, delete_folder,
-    delete_path, duplicate_note, is_default_ignored, is_note_path, read_note, rename_path,
-    render_note_markdown, resolve_workspace_root, rewrite_workspace_links_for_rename,
-    to_posix_path, write_note_atomic, BacklinkGroup, Fingerprint, Index, Link, NoteContent,
-    NoteMeta, RenderResult, SafePath, TreeNodeItem, WorkspaceInfo, WorkspaceStats,
+    delete_path, duplicate_note, get_last_workspace, get_recent_workspaces, is_default_ignored,
+    is_note_path, read_note, rename_path, render_note_markdown, resolve_workspace_root,
+    rewrite_workspace_links_for_rename, save_last_workspace, to_posix_path, write_note_atomic,
+    BacklinkGroup, Fingerprint, Index, Link, NoteContent, NoteMeta, RenderResult, SafePath,
+    TreeNodeItem, WorkspaceInfo, WorkspaceStats,
 };
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -415,14 +416,24 @@ fn workspace_open(
                 .clone();
             match active_opt {
                 Some(active) => active,
-                None => resolve_workspace_root(None, None, None, &current_dir)
-                    .map_err(|e| e.to_string())?,
+                None => {
+                    // Try lastWorkspace from global config (SPEC §3.1, M10.04)
+                    if let Some(last_ws) = get_last_workspace() {
+                        last_ws
+                    } else {
+                        // No remembered workspace and no path signal -> return error so onboarding state is shown
+                        return Err("No workspace open".to_string());
+                    }
+                }
             }
         }
     };
 
     // Bootstrap .flint/config.json idempotently
     bootstrap_workspace(&root).map_err(|e| e.to_string())?;
+
+    // Persist as lastWorkspace in global config (SPEC §3.1, M10.04)
+    let _ = save_last_workspace(&root);
 
     let name = root
         .file_name()
@@ -478,6 +489,42 @@ fn workspace_open(
     );
 
     Ok(info)
+}
+
+/// Native folder picker dialog (SPEC §9.4, M10.04), via Tauri's own dialog plugin
+/// rather than shelling out to platform-specific scripts.
+///
+/// `blocking_pick_folder` blocks the calling thread until the dialog closes, while the
+/// dialog itself needs the main thread free to pump its own event loop. Tauri's sync
+/// command dispatch can land on that same thread, which deadlocks (app hangs, no dialog
+/// ever shown). Running it inside `spawn_blocking` moves the wait onto a dedicated
+/// worker thread so the main thread stays free.
+#[tauri::command]
+async fn choose_folder(app_handle: AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let folder = app_handle
+            .dialog()
+            .file()
+            .set_title("Select a Flint workspace folder")
+            .blocking_pick_folder();
+
+        folder.map(|f| f.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// List recently opened workspaces (most-recent-first), for the onboarding screen (M10.04).
+/// Entries whose directory no longer exists on disk are already filtered out by
+/// `get_recent_workspaces`.
+#[tauri::command]
+fn recent_workspaces() -> Vec<String> {
+    get_recent_workspaces()
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .collect()
 }
 
 /// Retrieve the live workspace file tree.
@@ -901,6 +948,7 @@ pub fn build_app(
         watcher_stop: Arc::new(AtomicBool::new(false)),
     };
     builder
+        .plugin(tauri_plugin_dialog::init())
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             workspace_open,
@@ -923,7 +971,9 @@ pub fn build_app(
             reveal_in_file_manager,
             note_render,
             links_outgoing,
-            open_external
+            open_external,
+            choose_folder,
+            recent_workspaces
         ])
 }
 

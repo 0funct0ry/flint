@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use flint_core::{
-    bootstrap_workspace, build_workspace_tree, resolve_workspace_root, WorkspaceError,
+    bootstrap_workspace, build_workspace_tree, get_last_workspace, resolve_workspace_root,
+    WorkspaceError,
 };
 use std::env;
 use std::fs;
@@ -395,63 +396,100 @@ fn run() -> Result<u8, (u8, String)> {
             Ok(exit_codes::SUCCESS)
         }
         None => {
-            // If running as internal GUI child process, skip path re-resolution and run directly
+            // If running as internal GUI child process, skip path re-resolution and run directly.
+            // No path forwarded (`cli.path` is None) means the parent found no workspace signal
+            // at all — that must stay None here too, so the GUI shows onboarding (M10.04),
+            // never a silent guess at `current_dir`.
             if cli.gui_child {
-                let ws_root = cli.path.unwrap_or(current_dir);
-                let _ = bootstrap_workspace(&ws_root);
-                launch_gui(ws_root);
+                if let Some(ws_root) = &cli.path {
+                    let _ = bootstrap_workspace(ws_root);
+                }
+                launch_gui(cli.path);
                 return Ok(exit_codes::SUCCESS);
             }
 
-            // Default: resolve workspace synchronously
-            let ws_root = resolve_workspace_root(
-                cli.path.as_deref(),
-                cli.workspace.as_deref(),
-                env_var.as_deref(),
-                &current_dir,
-            )
-            .map_err(map_ws_error)?;
+            // Determine whether any explicit path signal was provided
+            let has_path_signal =
+                cli.path.is_some() || cli.workspace.is_some() || env_var.is_some();
 
-            let _ = bootstrap_workspace(&ws_root);
+            // Resolve workspace root (or None for onboarding state)
+            let ws_root_opt: Option<PathBuf> = if has_path_signal {
+                // Explicit signal: resolve strictly (fail fast on bad path)
+                let resolved = resolve_workspace_root(
+                    cli.path.as_deref(),
+                    cli.workspace.as_deref(),
+                    env_var.as_deref(),
+                    &current_dir,
+                )
+                .map_err(map_ws_error)?;
+                Some(resolved)
+            } else {
+                // No path signal: try lastWorkspace from global config (M10.04)
+                get_last_workspace().filter(|p| p.is_dir())
+                // If None, GUI will show onboarding empty state
+            };
+
+            if let Some(ref ws_root) = ws_root_opt {
+                let _ = bootstrap_workspace(ws_root);
+            }
 
             if cli.no_open {
-                if cli.json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "status": "ready",
-                            "workspace": ws_root.display().to_string()
-                        })
-                    );
-                } else {
-                    println!("Workspace ready at: {}", ws_root.display());
+                match &ws_root_opt {
+                    Some(ws_root) => {
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::json!({
+                                    "status": "ready",
+                                    "workspace": ws_root.display().to_string()
+                                })
+                            );
+                        } else {
+                            println!("Workspace ready at: {}", ws_root.display());
+                        }
+                    }
+                    None => {
+                        if cli.json {
+                            println!("{}", serde_json::json!({ "status": "no_workspace" }));
+                        } else {
+                            println!("No workspace open. Use 'flint <path>' to open one.");
+                        }
+                    }
                 }
             } else if cli.foreground {
+                let ws_display = ws_root_opt
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(onboarding)".to_string());
                 if cli.json {
                     println!(
                         "{}",
                         serde_json::json!({
                             "status": "launching_gui",
-                            "workspace": ws_root.display().to_string()
+                            "workspace": ws_display
                         })
                     );
                 } else {
-                    println!("Opening workspace at: {}", ws_root.display());
+                    println!("Opening workspace at: {}", ws_display);
                 }
-                launch_gui(ws_root);
+                launch_gui(ws_root_opt);
             } else {
-                spawn_detached_gui(&ws_root, &cli.log)?;
+                let ws_display = ws_root_opt
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(onboarding)".to_string());
+                spawn_detached_gui(ws_root_opt.as_deref(), &cli.log)?;
                 if cli.json {
                     println!(
                         "{}",
                         serde_json::json!({
                             "status": "launching_gui",
                             "detached": true,
-                            "workspace": ws_root.display().to_string()
+                            "workspace": ws_display
                         })
                     );
                 } else {
-                    println!("Opening workspace at: {}", ws_root.display());
+                    println!("Opening workspace at: {}", ws_display);
                 }
             }
             Ok(exit_codes::SUCCESS)
@@ -459,58 +497,140 @@ fn run() -> Result<u8, (u8, String)> {
     }
 }
 
-fn launch_gui(ws_root: PathBuf) {
-    flint_app_lib::run_with_context(tauri::generate_context!(), Some(ws_root));
+fn launch_gui(ws_root: Option<PathBuf>) {
+    flint_app_lib::run_with_context(tauri::generate_context!(), ws_root);
 }
 
-fn spawn_detached_gui(ws_root: &Path, log_level: &str) -> Result<(), (u8, String)> {
-    let current_exe = env::current_exe().map_err(|e| {
-        (
-            exit_codes::GENERIC_FAILURE,
-            format!("Failed to determine current executable path: {}", e),
-        )
-    })?;
-
-    let mut cmd = Command::new(current_exe);
-    cmd.arg(ws_root)
-        .arg("--gui-child")
-        .arg("--log")
-        .arg(log_level)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                // Detach from controlling terminal and create new session / process group
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+/// Attempt to find Flint.app in common macOS locations.
+/// Returns the path to the .app bundle if found.
+#[cfg(target_os = "macos")]
+fn find_flint_app() -> Option<PathBuf> {
+    // Check next to the current executable first (e.g. inside an already-built bundle)
+    if let Ok(exe) = env::current_exe() {
+        // Inside Flint.app the exe lives at Flint.app/Contents/MacOS/flint
+        // Go up three levels to reach the .app
+        if let Some(bundle) = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            if bundle.extension().map(|e| e == "app").unwrap_or(false) && bundle.is_dir() {
+                return Some(bundle.to_path_buf());
+            }
         }
     }
 
-    #[cfg(windows)]
+    // Common install locations
+    let mut candidates = vec![PathBuf::from("/Applications/Flint.app")];
+    if let Ok(home) = env::var("HOME") {
+        candidates.push(PathBuf::from(home).join("Applications/Flint.app"));
+    }
+    for candidate in &candidates {
+        if candidate.is_dir() {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
+fn spawn_detached_gui(ws_root: Option<&Path>, log_level: &str) -> Result<(), (u8, String)> {
+    // ── macOS: always prefer LaunchServices via `open -a` ──────────────────────
+    // A raw setsid()/exec detach never registers the process with LaunchServices,
+    // which is exactly the hung/unfocused-window bug this milestone fixes, so it is
+    // used on macOS only as a last-resort fallback (with a loud warning) when no
+    // built Flint.app can be found — e.g. a dev checkout that hasn't run
+    // `cargo tauri build` yet. A real install always has the bundle and always
+    // takes the `open -a` path.
+    #[cfg(target_os = "macos")]
     {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NEW_PROCESS_GROUP = 0x00000200, DETACHED_PROCESS = 0x00000008
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        if let Some(app_bundle) = find_flint_app() {
+            let mut open_cmd = Command::new("open");
+            open_cmd
+                .arg("-a")
+                .arg(&app_bundle)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // Forward extra args after the "--args" separator. `--gui-child` is required:
+            // without it the relaunched process re-enters this same CLI dispatch, sees
+            // `gui_child == false`, and calls `spawn_detached_gui` on itself again — an
+            // infinite `open -a` self-relaunch loop (bouncing Dock icon, no window, no
+            // eventual exit) rather than actually starting the GUI.
+            open_cmd.arg("--args");
+            if let Some(path) = ws_root {
+                open_cmd.arg(path);
+            }
+            open_cmd.arg("--gui-child").arg("--log").arg(log_level);
+
+            open_cmd.spawn().map_err(|e| {
+                (
+                    exit_codes::GENERIC_FAILURE,
+                    format!("Failed to open Flint.app via LaunchServices: {}", e),
+                )
+            })?;
+            return Ok(());
+        }
+
+        eprintln!(
+            "Warning: Flint.app not found in /Applications or ~/Applications. Falling back to \
+             a raw detached process, which will not register with LaunchServices (no Dock icon, \
+             may not focus). Build it with `cargo tauri build --bundles app` and install it for \
+             a proper launch."
+        );
     }
 
-    cmd.spawn().map_err(|e| {
-        (
-            exit_codes::GENERIC_FAILURE,
-            format!("Failed to spawn detached GUI child process: {}", e),
-        )
-    })?;
+    // ── Linux / Windows / macOS dev fallback: raw detach ───────────────────────
+    {
+        let current_exe = env::current_exe().map_err(|e| {
+            (
+                exit_codes::GENERIC_FAILURE,
+                format!("Failed to determine current executable path: {}", e),
+            )
+        })?;
 
-    Ok(())
+        let mut cmd = Command::new(current_exe);
+        if let Some(path) = ws_root {
+            cmd.arg(path);
+        }
+        cmd.arg("--gui-child")
+            .arg("--log")
+            .arg(log_level)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    // Detach from controlling terminal and create new session / process group
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NEW_PROCESS_GROUP = 0x00000200, DETACHED_PROCESS = 0x00000008
+            const DETACHED_PROCESS: u32 = 0x00000008;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+            cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+        }
+
+        cmd.spawn().map_err(|e| {
+            (
+                exit_codes::GENERIC_FAILURE,
+                format!("Failed to spawn detached GUI child process: {}", e),
+            )
+        })?;
+
+        Ok(())
+    }
 }
 
 fn map_ws_error(err: WorkspaceError) -> (u8, String) {

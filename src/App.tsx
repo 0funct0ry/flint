@@ -49,6 +49,7 @@ export const App: React.FC = () => {
     path: FIXTURE_ROOT_PATH,
     is_empty: false,
   });
+  const [noWorkspace, setNoWorkspace] = useState(false);
   const [treeData, setTreeData] = useState<TreeNodeItem[]>([]);
   const [treeError, setTreeError] = useState<string | null>(null);
 
@@ -336,6 +337,7 @@ export const App: React.FC = () => {
         const info = await api.workspaceOpen();
         if (mounted) {
           setWorkspaceInfo(info);
+          setNoWorkspace(false);
         }
         const tree = await api.workspaceTree(false);
         if (mounted) {
@@ -344,8 +346,14 @@ export const App: React.FC = () => {
         }
         await refreshStats();
       } catch (err: any) {
+        const errMsg = err?.message || String(err);
         if (mounted) {
-          setTreeError(err?.message || String(err));
+          // 'No workspace open' means first launch or last workspace gone — show onboarding
+          if (errMsg.includes('No workspace open') || errMsg.includes('no_workspace')) {
+            setNoWorkspace(true);
+          } else {
+            setTreeError(errMsg);
+          }
         }
       }
     }
@@ -481,6 +489,44 @@ export const App: React.FC = () => {
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
+
+  // Open a given path as the active workspace (M10.04 onboarding)
+  const openWorkspacePath = useCallback(
+    async (path: string) => {
+      try {
+        const info = await api.workspaceOpen(path);
+        setWorkspaceInfo(info);
+        setNoWorkspace(false);
+        const tree = await api.workspaceTree(false);
+        setTreeData(tree);
+        setTreeError(null);
+        await refreshStats();
+      } catch (err: any) {
+        console.error('Failed to open workspace:', err);
+      }
+    },
+    [refreshStats]
+  );
+
+  // Open a folder via native picker and load it as workspace (M10.04 onboarding)
+  const handleOpenFolder = useCallback(async () => {
+    const chosen = await api.chooseFolder();
+    if (!chosen) return;
+    await openWorkspacePath(chosen);
+  }, [openWorkspacePath]);
+
+  // Recently opened workspaces, shown on the onboarding screen (M10.04)
+  const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([]);
+  useEffect(() => {
+    if (!noWorkspace) return;
+    let mounted = true;
+    api.recentWorkspaces().then((list) => {
+      if (mounted) setRecentWorkspaces(list);
+    });
+    return () => {
+      mounted = false;
+    };
+  }, [noWorkspace]);
 
   // Mode cycle helper (⌘E)
   const cycleViewMode = useCallback(() => {
@@ -1024,12 +1070,15 @@ export const App: React.FC = () => {
       } else if (mod && e.key.toLowerCase() === 's') {
         e.preventDefault();
         saveNote(false);
+      } else if (mod && e.key.toLowerCase() === 'o') {
+        e.preventDefault();
+        handleOpenFolder();
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [cycleViewMode, handleBack, handleCloseNote, handleForward, handleStartCreateFolder, handleStartCreateNote, saveNote]);
+  }, [cycleViewMode, handleBack, handleCloseNote, handleForward, handleOpenFolder, handleStartCreateFolder, handleStartCreateNote, saveNote]);
 
   const currentNote = currentNotePath
     ? noteState[currentNotePath] ||
@@ -1108,6 +1157,108 @@ export const App: React.FC = () => {
   };
 
   return (
+    <>
+      {/* Onboarding / empty-state screen (M10.04): shown when no workspace is remembered */}
+      {noWorkspace && (
+        <div
+          className="flex flex-col h-screen w-screen bg-[var(--canvas)] text-[var(--text)] items-center justify-center font-ui"
+          style={{ gap: '2rem' }}
+        >
+          {/* Logo / wordmark */}
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '0.75rem' }}>
+            <div
+              style={{
+                width: '64px',
+                height: '64px',
+                borderRadius: '16px',
+                background: 'var(--panel-2)',
+                border: '1px solid var(--border)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+              }}
+            >
+              <img
+                src="/flint-icon.png"
+                alt=""
+                aria-hidden="true"
+                width={48}
+                height={48}
+                style={{ borderRadius: '10px' }}
+              />
+            </div>
+            <span style={{ fontSize: '2rem', fontWeight: 700, letterSpacing: '-0.02em', color: 'var(--text)' }}>Flint</span>
+          </div>
+
+          {/* Welcome message */}
+          <div style={{ textAlign: 'center', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+            <h1 style={{ fontSize: '1.5rem', fontWeight: 600, margin: 0, color: 'var(--text)' }}>
+              Welcome to Flint
+            </h1>
+            <p style={{ fontSize: '1rem', color: 'var(--text-2)', margin: 0, maxWidth: '28rem' }}>
+              Open a folder on disk to start editing your notes.
+              <br />
+              Your notes stay as plain Markdown files — no lock-in.
+            </p>
+          </div>
+
+          {/* Create / open workspace buttons */}
+          <div className="flex items-center gap-2">
+            <button
+              id="onboarding-create-workspace"
+              onClick={handleOpenFolder}
+              className="px-3.5 py-1.5 text-[12.5px] font-medium bg-[var(--accent)] text-white hover:opacity-85 rounded-[5px] transition-opacity shadow-sm flex items-center gap-1.5"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M12 5v14M5 12h14"/>
+              </svg>
+              Create Workspace
+            </button>
+            <button
+              id="onboarding-open-folder"
+              onClick={handleOpenFolder}
+              className="px-3.5 py-1.5 text-[12.5px] font-medium border border-[var(--border)] bg-[var(--panel)] text-[var(--text)] hover:bg-[var(--panel-2)] rounded-[5px] transition-colors flex items-center gap-1.5"
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+              </svg>
+              Open Workspace
+              <kbd style={{ fontSize: '0.7rem', opacity: 0.7, fontFamily: 'inherit', marginLeft: '0.125rem' }}>⌘O</kbd>
+            </button>
+          </div>
+
+          {/* Recently opened workspaces */}
+          {recentWorkspaces.length > 0 && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.375rem', width: '22rem' }}>
+              <span className="text-[11px] font-medium text-[var(--text-2)] uppercase tracking-wide text-center">
+                Recent workspaces
+              </span>
+              <div className="flex flex-col gap-1">
+                {recentWorkspaces.map((path) => {
+                  const name = path.split('/').filter(Boolean).pop() || path;
+                  return (
+                    <button
+                      key={path}
+                      onClick={() => openWorkspacePath(path)}
+                      title={path}
+                      className="flex items-center gap-2 px-2.5 py-1.5 text-[12.5px] text-left border border-[var(--border)] bg-[var(--panel)] text-[var(--text)] hover:bg-[var(--panel-2)] rounded-[5px] transition-colors truncate"
+                    >
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className="shrink-0 text-[var(--text-2)]">
+                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                      </svg>
+                      <span className="truncate font-medium">{name}</span>
+                      <span className="truncate text-[var(--text-2)] text-[11px]">{path}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Main app shell — hidden until a workspace is open */}
+      {!noWorkspace && (
     <div className="flex flex-col h-screen w-screen bg-[var(--canvas)] text-[var(--text)] overflow-hidden font-ui">
       {/* Title bar */}
       <TitleBar
@@ -1270,6 +1421,8 @@ export const App: React.FC = () => {
       {/* Toast Notification Container with Undo */}
       <Toast toasts={toasts} onDismiss={dismissToast} />
     </div>
+      )}
+    </>
   );
 };
 

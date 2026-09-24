@@ -954,6 +954,126 @@ pub fn resolve_workspace_root(
     Ok(canonical)
 }
 
+/// Retrieve the path to the global Flint config file (SPEC §3.1, M10.04).
+/// Returns `$XDG_CONFIG_HOME/flint/config.json` if set, else `~/.config/flint/config.json`.
+pub fn get_global_config_path() -> Option<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        if !xdg.trim().is_empty() {
+            return Some(PathBuf::from(xdg).join("flint").join("config.json"));
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            return Some(
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("flint")
+                    .join("config.json"),
+            );
+        }
+    }
+    None
+}
+
+/// Load the global configuration JSON, if present.
+pub fn load_global_config() -> Option<serde_json::Value> {
+    let path = get_global_config_path()?;
+    if !path.exists() {
+        return None;
+    }
+    let data = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Read the remembered `lastWorkspace` path from global configuration, if it exists and is a directory.
+pub fn get_last_workspace() -> Option<PathBuf> {
+    let config = load_global_config()?;
+    let last_ws_str = config.get("lastWorkspace")?.as_str()?;
+    let path = PathBuf::from(last_ws_str);
+    if path.is_dir() {
+        path.canonicalize().ok()
+    } else {
+        None
+    }
+}
+
+/// Maximum number of entries kept in the `recentWorkspaces` list.
+const MAX_RECENT_WORKSPACES: usize = 8;
+
+/// Persist the `lastWorkspace` canonical path to the global configuration file, and push
+/// it to the front of `recentWorkspaces` (deduplicated, most-recent-first, capped).
+pub fn save_last_workspace(ws_root: &Path) -> Result<(), std::io::Error> {
+    let config_path = match get_global_config_path() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut config_val = if config_path.exists() {
+        fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let canonical = ws_root
+        .canonicalize()
+        .unwrap_or_else(|_| ws_root.to_path_buf());
+    let canonical_str = canonical.display().to_string();
+
+    if let Some(obj) = config_val.as_object_mut() {
+        obj.insert(
+            "lastWorkspace".to_string(),
+            serde_json::Value::String(canonical_str.clone()),
+        );
+
+        let mut recent: Vec<String> = obj
+            .get("recentWorkspaces")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        recent.retain(|p| p != &canonical_str);
+        recent.insert(0, canonical_str);
+        recent.truncate(MAX_RECENT_WORKSPACES);
+
+        obj.insert(
+            "recentWorkspaces".to_string(),
+            serde_json::Value::Array(recent.into_iter().map(serde_json::Value::String).collect()),
+        );
+    }
+
+    let formatted = serde_json::to_string_pretty(&config_val)?;
+    fs::write(&config_path, formatted)?;
+    Ok(())
+}
+
+/// Read the remembered `recentWorkspaces` list from global configuration, most-recent-first.
+/// Entries that no longer exist as directories on disk are filtered out.
+pub fn get_recent_workspaces() -> Vec<PathBuf> {
+    let Some(config) = load_global_config() else {
+        return Vec::new();
+    };
+    let Some(entries) = config.get("recentWorkspaces").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
 /// Ensure `<workspace>/.flint/config.json` exists idempotently (SPEC §3.1, §12).
 pub fn bootstrap_workspace(root: &Path) -> Result<PathBuf, std::io::Error> {
     let flint_dir = root.join(".flint");

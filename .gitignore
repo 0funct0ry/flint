@@ -43,3 +43,5 @@ internal-docs/
 .idea/
 SAMPLE.md
 .flint/
+.claude/
+bin/

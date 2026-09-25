@@ -104,6 +104,39 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
     }
   }, [inlineAction]);
 
+  // Auto-expand parent folders for current active note (M10.06)
+  useEffect(() => {
+    if (!currentNotePath) return;
+    const parts = currentNotePath.split('/');
+    if (parts.length > 1) {
+      const parentPaths: string[] = [];
+      let acc = '';
+      for (let i = 0; i < parts.length - 1; i++) {
+        acc = acc ? `${acc}/${parts[i]}` : parts[i];
+        parentPaths.push(acc);
+      }
+      setExpandedFolders((prev) => {
+        const next = new Set(prev);
+        let changed = false;
+        for (const p of parentPaths) {
+          if (!next.has(p)) {
+            next.add(p);
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }
+
+    // Scroll selected treeitem into view if present
+    setTimeout(() => {
+      const selectedEl = document.querySelector('[role="treeitem"][aria-selected="true"]');
+      if (selectedEl) {
+        selectedEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }
+    }, 50);
+  }, [currentNotePath]);
+
   // Search panel state
   const [searchQuery, setSearchQuery] = useState('');
   const [caseSensitive, setCaseSensitive] = useState(false);

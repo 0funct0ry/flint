@@ -338,6 +338,9 @@ export const App: React.FC = () => {
         if (mounted) {
           setWorkspaceInfo(info);
           setNoWorkspace(false);
+          if (info.start_collapsed) {
+            setLeftSidebarVisible(false);
+          }
         }
         const tree = await api.workspaceTree(false);
         if (mounted) {
@@ -345,6 +348,9 @@ export const App: React.FC = () => {
           setTreeError(null);
         }
         await refreshStats();
+        if (mounted && info.initial_note) {
+          handleSelectNote(info.initial_note);
+        }
       } catch (err: any) {
         const errMsg = err?.message || String(err);
         if (mounted) {
@@ -469,6 +475,9 @@ export const App: React.FC = () => {
       if (unlistenRenamed) unlistenRenamed();
       if (unlistenDegraded) unlistenDegraded();
     };
+    // Mount-only: must run exactly once regardless of later identity changes to its callbacks,
+    // including handleSelectNote (used only for M10.06's initial_note focus on first load).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadNote, refreshStats, refreshTree]);
 
   // Window blur / beforeunload save
@@ -489,31 +498,6 @@ export const App: React.FC = () => {
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
-
-  // Open a given path as the active workspace (M10.04 onboarding)
-  const openWorkspacePath = useCallback(
-    async (path: string) => {
-      try {
-        const info = await api.workspaceOpen(path);
-        setWorkspaceInfo(info);
-        setNoWorkspace(false);
-        const tree = await api.workspaceTree(false);
-        setTreeData(tree);
-        setTreeError(null);
-        await refreshStats();
-      } catch (err: any) {
-        console.error('Failed to open workspace:', err);
-      }
-    },
-    [refreshStats]
-  );
-
-  // Open a folder via native picker and load it as workspace (M10.04 onboarding)
-  const handleOpenFolder = useCallback(async () => {
-    const chosen = await api.chooseFolder();
-    if (!chosen) return;
-    await openWorkspacePath(chosen);
-  }, [openWorkspacePath]);
 
   // Recently opened workspaces, shown on the onboarding screen (M10.04)
   const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([]);
@@ -607,6 +591,37 @@ export const App: React.FC = () => {
     },
     [currentNotePath, history, historyIndex, isDirty, loadNote, saveNote]
   );
+
+  // Open a given path as the active workspace (M10.04 onboarding)
+  const openWorkspacePath = useCallback(
+    async (path: string) => {
+      try {
+        const info = await api.workspaceOpen(path);
+        setWorkspaceInfo(info);
+        setNoWorkspace(false);
+        if (info.start_collapsed) {
+          setLeftSidebarVisible(false);
+        }
+        const tree = await api.workspaceTree(false);
+        setTreeData(tree);
+        setTreeError(null);
+        await refreshStats();
+        if (info.initial_note) {
+          handleSelectNote(info.initial_note);
+        }
+      } catch (err: any) {
+        console.error('Failed to open workspace:', err);
+      }
+    },
+    [handleSelectNote, refreshStats]
+  );
+
+  // Open a folder via native picker and load it as workspace (M10.04 onboarding)
+  const handleOpenFolder = useCallback(async () => {
+    const chosen = await api.chooseFolder();
+    if (!chosen) return;
+    await openWorkspacePath(chosen);
+  }, [openWorkspacePath]);
 
   // Create broken note target and navigate to it (SPEC §6.3, M6, M7)
   const handleCreateBrokenNote = useCallback(

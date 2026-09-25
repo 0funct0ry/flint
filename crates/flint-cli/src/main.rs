@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use flint_core::{
     bootstrap_workspace, build_workspace_tree, get_last_workspace, resolve_workspace_root,
-    WorkspaceError,
+    resolve_workspace_target, ResolvedWorkspaceTarget, WorkspaceError,
 };
 use std::env;
 use std::fs;
@@ -59,6 +59,10 @@ pub struct Cli {
     /// Internal plumbing: run GUI child process directly
     #[arg(long, hide = true, global = true)]
     pub gui_child: bool,
+
+    /// Internal plumbing: workspace-relative path of the note to focus in file-open mode
+    #[arg(long, hide = true, global = true)]
+    pub initial_note: Option<String>,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -401,10 +405,16 @@ fn run() -> Result<u8, (u8, String)> {
             // at all — that must stay None here too, so the GUI shows onboarding (M10.04),
             // never a silent guess at `current_dir`.
             if cli.gui_child {
+                // `cli.path` here is always the already-resolved workspace *directory* forwarded
+                // by the parent (never the raw file argv) — see the `spawn_detached_gui`/
+                // `launch_gui` call sites below, which pass `ws_root_opt`, not `cli.path`, on to
+                // the relaunch. `cli.initial_note` carries the file-open-mode note path across
+                // that re-exec boundary, since resolving it a second time here would require
+                // re-deriving it from a raw path we deliberately no longer forward.
                 if let Some(ws_root) = &cli.path {
                     let _ = bootstrap_workspace(ws_root);
                 }
-                launch_gui(cli.path);
+                launch_gui(cli.path, cli.initial_note);
                 return Ok(exit_codes::SUCCESS);
             }
 
@@ -412,17 +422,28 @@ fn run() -> Result<u8, (u8, String)> {
             let has_path_signal =
                 cli.path.is_some() || cli.workspace.is_some() || env_var.is_some();
 
-            // Resolve workspace root (or None for onboarding state)
+            // Resolve workspace root (or None for onboarding state), plus the initial note to
+            // focus when the PATH argument was a Markdown file rather than a directory (M10.06).
+            let mut initial_note_opt: Option<String> = None;
             let ws_root_opt: Option<PathBuf> = if has_path_signal {
                 // Explicit signal: resolve strictly (fail fast on bad path)
-                let resolved = resolve_workspace_root(
+                let resolved = resolve_workspace_target(
                     cli.path.as_deref(),
                     cli.workspace.as_deref(),
                     env_var.as_deref(),
                     &current_dir,
                 )
                 .map_err(map_ws_error)?;
-                Some(resolved)
+                match resolved {
+                    ResolvedWorkspaceTarget::Directory(dir) => Some(dir),
+                    ResolvedWorkspaceTarget::File {
+                        ws_root,
+                        initial_note,
+                    } => {
+                        initial_note_opt = Some(initial_note);
+                        Some(ws_root)
+                    }
+                }
             } else {
                 // No path signal: try lastWorkspace from global config (M10.04)
                 get_last_workspace().filter(|p| p.is_dir())
@@ -472,13 +493,17 @@ fn run() -> Result<u8, (u8, String)> {
                 } else {
                     println!("Opening workspace at: {}", ws_display);
                 }
-                launch_gui(ws_root_opt);
+                launch_gui(ws_root_opt, initial_note_opt);
             } else {
                 let ws_display = ws_root_opt
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "(onboarding)".to_string());
-                spawn_detached_gui(ws_root_opt.as_deref(), &cli.log)?;
+                spawn_detached_gui(
+                    ws_root_opt.as_deref(),
+                    initial_note_opt.as_deref(),
+                    &cli.log,
+                )?;
                 if cli.json {
                     println!(
                         "{}",
@@ -497,8 +522,8 @@ fn run() -> Result<u8, (u8, String)> {
     }
 }
 
-fn launch_gui(ws_root: Option<PathBuf>) {
-    flint_app_lib::run_with_context(tauri::generate_context!(), ws_root);
+fn launch_gui(ws_root: Option<PathBuf>, initial_note: Option<String>) {
+    flint_app_lib::run_with_context(tauri::generate_context!(), ws_root, initial_note);
 }
 
 /// Attempt to find Flint.app in common macOS locations.
@@ -533,7 +558,11 @@ fn find_flint_app() -> Option<PathBuf> {
     None
 }
 
-fn spawn_detached_gui(ws_root: Option<&Path>, log_level: &str) -> Result<(), (u8, String)> {
+fn spawn_detached_gui(
+    ws_root: Option<&Path>,
+    initial_note: Option<&str>,
+    log_level: &str,
+) -> Result<(), (u8, String)> {
     // ── macOS: always prefer LaunchServices via `open -a` ──────────────────────
     // A raw setsid()/exec detach never registers the process with LaunchServices,
     // which is exactly the hung/unfocused-window bug this milestone fixes, so it is
@@ -561,6 +590,9 @@ fn spawn_detached_gui(ws_root: Option<&Path>, log_level: &str) -> Result<(), (u8
                 open_cmd.arg(path);
             }
             open_cmd.arg("--gui-child").arg("--log").arg(log_level);
+            if let Some(note) = initial_note {
+                open_cmd.arg("--initial-note").arg(note);
+            }
 
             open_cmd.spawn().map_err(|e| {
                 (
@@ -592,10 +624,11 @@ fn spawn_detached_gui(ws_root: Option<&Path>, log_level: &str) -> Result<(), (u8
         if let Some(path) = ws_root {
             cmd.arg(path);
         }
-        cmd.arg("--gui-child")
-            .arg("--log")
-            .arg(log_level)
-            .stdin(Stdio::null())
+        cmd.arg("--gui-child").arg("--log").arg(log_level);
+        if let Some(note) = initial_note {
+            cmd.arg("--initial-note").arg(note);
+        }
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
@@ -643,6 +676,10 @@ fn map_ws_error(err: WorkspaceError) -> (u8, String) {
             exit_codes::WORKSPACE_NOT_FOUND,
             format!("Workspace is not a directory: {}", p.display()),
         ),
+        WorkspaceError::NotAMarkdownFile(p) => (
+            exit_codes::BAD_USAGE,
+            format!("Not a Markdown file: {}", p.display()),
+        ),
         WorkspaceError::PermissionDenied(s) => (
             exit_codes::PERMISSION_DENIED,
             format!("Permission denied: {}", s),
@@ -683,10 +720,17 @@ mod tests {
         let res_missing = resolve_workspace_root(Some(&missing), None, None, root);
         assert!(matches!(res_missing, Err(WorkspaceError::NotFound(_))));
 
-        // 3. File as dir returns NotADirectory
+        // 3. Markdown file argument resolves parent directory as workspace root
         let a_file = root.join("note.md");
         fs::write(&a_file, "# Test").unwrap();
         let res_file = resolve_workspace_root(Some(&a_file), None, None, root);
-        assert!(matches!(res_file, Err(WorkspaceError::NotADirectory(_))));
+        assert!(res_file.is_ok());
+        assert_eq!(res_file.unwrap(), root.canonicalize().unwrap());
+
+        // 4. Non-markdown file returns NotAMarkdownFile error
+        let txt_file = root.join("data.txt");
+        fs::write(&txt_file, "text").unwrap();
+        let res_txt = resolve_workspace_root(Some(&txt_file), None, None, root);
+        assert!(matches!(res_txt, Err(WorkspaceError::NotAMarkdownFile(_))));
     }
 }

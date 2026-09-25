@@ -138,7 +138,7 @@ fn test_cli_search_and_list_and_doctor() {
         let output = std::process::Command::new("pgrep")
             .arg("-f")
             .arg("--")
-            .arg(&format!("flint.*{}", root_str))
+            .arg(format!("flint.*{}", root_str))
             .output();
 
         let mut found = false;

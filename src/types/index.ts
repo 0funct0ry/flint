@@ -82,6 +82,8 @@ export interface WorkspaceInfo {
   name: string;
   path: string;
   is_empty: boolean;
+  initial_note?: string;
+  start_collapsed?: boolean;
 }
 
 export interface TreeNodeItem {

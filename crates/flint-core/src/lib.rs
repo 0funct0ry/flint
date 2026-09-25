@@ -129,6 +129,10 @@ pub struct WorkspaceInfo {
     pub name: String,
     pub path: String,
     pub is_empty: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_collapsed: Option<bool>,
 }
 
 /// A node in the file tree returned across IPC.
@@ -925,21 +929,37 @@ pub enum WorkspaceError {
     NotFound(PathBuf),
     #[error("Workspace path is a file, not a directory: {0}")]
     NotADirectory(PathBuf),
+    #[error("Not a Markdown file: {0}")]
+    NotAMarkdownFile(PathBuf),
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
     #[error("I/O error: {0}")]
     Io(String),
 }
 
-/// Resolve workspace path according to SPEC §4.1:
+/// Resolved workspace target result (SPEC §4.1, M10.06).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedWorkspaceTarget {
+    Directory(PathBuf),
+    File {
+        ws_root: PathBuf,
+        initial_note: String,
+    },
+}
+
+/// Resolve workspace path target according to SPEC §4.1 & M10.06:
 /// 1. Explicit PATH argument, else `--workspace`, else `$FLINT_WORKSPACE`, else current directory.
-/// 2. Canonicalize. Follow symlinks at the root only; reject a root that is not a directory.
-pub fn resolve_workspace_root(
+/// 2. Canonicalize. Follow symlinks at the root only.
+/// 3. If target is a directory, return `ResolvedWorkspaceTarget::Directory(canonical_dir)`.
+/// 4. If target is a file and a valid Markdown note (`.md`/`.markdown`), return `ResolvedWorkspaceTarget::File`
+///    with `ws_root` set to its parent directory and `initial_note` set to its relative POSIX path.
+/// 5. If target is a non-Markdown file, return `Err(WorkspaceError::NotAMarkdownFile(path))`.
+pub fn resolve_workspace_target(
     explicit: Option<&Path>,
     workspace_flag: Option<&Path>,
     env_var: Option<&str>,
     current_dir: &Path,
-) -> Result<PathBuf, WorkspaceError> {
+) -> Result<ResolvedWorkspaceTarget, WorkspaceError> {
     let target = if let Some(p) = explicit {
         p.to_path_buf()
     } else if let Some(p) = workspace_flag {
@@ -968,11 +988,40 @@ pub fn resolve_workspace_root(
         .canonicalize()
         .map_err(|e| WorkspaceError::Io(e.to_string()))?;
 
-    if !canonical.is_dir() {
-        return Err(WorkspaceError::NotADirectory(canonical));
+    if canonical.is_dir() {
+        Ok(ResolvedWorkspaceTarget::Directory(canonical))
+    } else if is_note_path(&canonical) {
+        let parent = canonical
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| current_dir.to_path_buf());
+        let relative_name = canonical
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        Ok(ResolvedWorkspaceTarget::File {
+            ws_root: parent,
+            initial_note: relative_name,
+        })
+    } else {
+        Err(WorkspaceError::NotAMarkdownFile(canonical))
     }
+}
 
-    Ok(canonical)
+/// Resolve workspace path according to SPEC §4.1:
+/// 1. Explicit PATH argument, else `--workspace`, else `$FLINT_WORKSPACE`, else current directory.
+/// 2. Canonicalize. Follow symlinks at the root only; reject a root that is not a directory.
+pub fn resolve_workspace_root(
+    explicit: Option<&Path>,
+    workspace_flag: Option<&Path>,
+    env_var: Option<&str>,
+    current_dir: &Path,
+) -> Result<PathBuf, WorkspaceError> {
+    match resolve_workspace_target(explicit, workspace_flag, env_var, current_dir)? {
+        ResolvedWorkspaceTarget::Directory(dir) => Ok(dir),
+        ResolvedWorkspaceTarget::File { ws_root, .. } => Ok(ws_root),
+    }
 }
 
 /// Retrieve the path to the global Flint config file (SPEC §3.1, M10.04).
@@ -3315,6 +3364,66 @@ Also [Unrelated link](https://example.com) and [Other Note](../other.md).
         };
         let res_invalid = search_content(root, "[unclosed-regex", &opts_invalid);
         assert!(res_invalid.is_err());
+    }
+
+    #[test]
+    fn test_resolve_workspace_target_file_mode() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        let md_file = root.join("test_note.md");
+        fs::write(&md_file, "# Test Note").unwrap();
+
+        let markdown_file = root.join("doc.markdown");
+        fs::write(&markdown_file, "# Doc").unwrap();
+
+        let non_md_file = root.join("data.txt");
+        fs::write(&non_md_file, "plain text").unwrap();
+
+        let missing_file = root.join("missing.md");
+
+        // 1. Ordinary .md file resolves to parent dir & relative initial note
+        let res_md = resolve_workspace_target(Some(&md_file), None, None, root).unwrap();
+        assert_eq!(
+            res_md,
+            ResolvedWorkspaceTarget::File {
+                ws_root: root.canonicalize().unwrap(),
+                initial_note: "test_note.md".to_string(),
+            }
+        );
+
+        // 2. .markdown file resolves as valid target
+        let res_markdown =
+            resolve_workspace_target(Some(&markdown_file), None, None, root).unwrap();
+        assert_eq!(
+            res_markdown,
+            ResolvedWorkspaceTarget::File {
+                ws_root: root.canonicalize().unwrap(),
+                initial_note: "doc.markdown".to_string(),
+            }
+        );
+
+        // 3. Relative path resolves against current_dir
+        let rel_path = Path::new("test_note.md");
+        let res_rel = resolve_workspace_target(Some(rel_path), None, None, root).unwrap();
+        assert_eq!(
+            res_rel,
+            ResolvedWorkspaceTarget::File {
+                ws_root: root.canonicalize().unwrap(),
+                initial_note: "test_note.md".to_string(),
+            }
+        );
+
+        // 4. Non-markdown file returns NotAMarkdownFile error
+        let res_non_md = resolve_workspace_target(Some(&non_md_file), None, None, root);
+        assert!(matches!(
+            res_non_md,
+            Err(WorkspaceError::NotAMarkdownFile(_))
+        ));
+
+        // 5. Missing file returns NotFound error
+        let res_missing = resolve_workspace_target(Some(&missing_file), None, None, root);
+        assert!(matches!(res_missing, Err(WorkspaceError::NotFound(_))));
     }
 
     #[test]

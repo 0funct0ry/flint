@@ -2,9 +2,10 @@ use flint_core::{
     bootstrap_workspace, build_workspace_tree, create_folder, create_note, delete_folder,
     delete_path, duplicate_note, get_last_workspace, get_recent_workspaces, is_default_ignored,
     is_note_path, read_note, rename_path, render_note_markdown, resolve_workspace_root,
-    rewrite_workspace_links_for_rename, save_last_workspace, to_posix_path, write_note_atomic,
-    BacklinkGroup, Fingerprint, Index, Link, NoteContent, NoteMeta, RenderResult, SafePath,
-    TreeNodeItem, WorkspaceInfo, WorkspaceStats,
+    resolve_workspace_target, rewrite_workspace_links_for_rename, save_last_workspace,
+    to_posix_path, write_note_atomic, BacklinkGroup, Fingerprint, Index, Link, NoteContent,
+    NoteMeta, RenderResult, ResolvedWorkspaceTarget, SafePath, TreeNodeItem, WorkspaceInfo,
+    WorkspaceStats,
 };
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,10 @@ pub struct SuppressedWrite {
 
 pub struct AppState {
     pub active_workspace: Mutex<Option<PathBuf>>,
+    /// The note to focus on the very first `workspace_open` call when Flint was launched in
+    /// file-open mode (M10.06). Consumed (taken) on first use so it never reapplies to a later
+    /// workspace switch.
+    pub pending_initial_note: Mutex<Option<String>>,
     pub index: Arc<RwLock<Index>>,
     pub suppressed_writes: Arc<Mutex<HashMap<String, SuppressedWrite>>>,
     pub watcher_stop: Arc<AtomicBool>,
@@ -36,6 +41,7 @@ impl Default for AppState {
     fn default() -> Self {
         Self {
             active_workspace: Mutex::new(None),
+            pending_initial_note: Mutex::new(None),
             index: Arc::new(RwLock::new(Index::new())),
             suppressed_writes: Arc::new(Mutex::new(HashMap::new())),
             watcher_stop: Arc::new(AtomicBool::new(false)),
@@ -405,9 +411,23 @@ fn workspace_open(
     let current_dir = env::current_dir().map_err(|e| e.to_string())?;
     let path_buf = path.map(PathBuf::from);
 
+    let mut initial_note_opt = None;
+    let mut is_file_open_mode = false;
+
     let root = match path_buf {
-        Some(explicit) => resolve_workspace_root(Some(&explicit), None, None, &current_dir)
-            .map_err(|e| e.to_string())?,
+        Some(explicit) => match resolve_workspace_target(Some(&explicit), None, None, &current_dir)
+            .map_err(|e| e.to_string())?
+        {
+            ResolvedWorkspaceTarget::Directory(dir) => dir,
+            ResolvedWorkspaceTarget::File {
+                ws_root,
+                initial_note,
+            } => {
+                initial_note_opt = Some(initial_note);
+                is_file_open_mode = true;
+                ws_root
+            }
+        },
         None => {
             let active_opt = state
                 .active_workspace
@@ -415,6 +435,10 @@ fn workspace_open(
                 .map_err(|e| format!("Lock error: {}", e))?
                 .clone();
             match active_opt {
+                // `active_workspace` is always an already-resolved, canonical workspace
+                // *directory* by this point — it is seeded from `run_with_context`'s resolved
+                // `ws_root` (never a raw file path) and every prior successful call to this
+                // command overwrites it with `root` below, which is itself always a directory.
                 Some(active) => active,
                 None => {
                     // Try lastWorkspace from global config (SPEC §3.1, M10.04)
@@ -429,11 +453,24 @@ fn workspace_open(
         }
     };
 
+    // Consume the pending file-open-mode note (if any) on this, the first `workspace_open` call
+    // after launch — it must not reapply to a later manual workspace switch.
+    if !is_file_open_mode {
+        if let Ok(mut lock) = state.pending_initial_note.lock() {
+            if let Some(note) = lock.take() {
+                initial_note_opt = Some(note);
+                is_file_open_mode = true;
+            }
+        }
+    }
+
     // Bootstrap .flint/config.json idempotently
     bootstrap_workspace(&root).map_err(|e| e.to_string())?;
 
-    // Persist as lastWorkspace in global config (SPEC §3.1, M10.04)
-    let _ = save_last_workspace(&root);
+    // Persist as lastWorkspace in global config unless launching in file-open mode (SPEC M10.06 rule 3)
+    if !is_file_open_mode {
+        let _ = save_last_workspace(&root);
+    }
 
     let name = root
         .file_name()
@@ -448,6 +485,8 @@ fn workspace_open(
         name,
         path: root.display().to_string(),
         is_empty,
+        initial_note: initial_note_opt,
+        start_collapsed: if is_file_open_mode { Some(true) } else { None },
     };
 
     // Stop existing watcher if any, then start a new one
@@ -940,9 +979,11 @@ fn open_external(url: String) -> Result<(), String> {
 pub fn build_app(
     builder: tauri::Builder<tauri::Wry>,
     initial_path: Option<PathBuf>,
+    initial_note: Option<String>,
 ) -> tauri::Builder<tauri::Wry> {
     let state = AppState {
         active_workspace: Mutex::new(initial_path),
+        pending_initial_note: Mutex::new(initial_note),
         index: Arc::new(RwLock::new(Index::new())),
         suppressed_writes: Arc::new(Mutex::new(HashMap::new())),
         watcher_stop: Arc::new(AtomicBool::new(false)),
@@ -978,8 +1019,12 @@ pub fn build_app(
         ])
 }
 
-pub fn run_with_context(context: tauri::Context<tauri::Wry>, initial_path: Option<PathBuf>) {
-    build_app(tauri::Builder::default(), initial_path)
+pub fn run_with_context(
+    context: tauri::Context<tauri::Wry>,
+    initial_path: Option<PathBuf>,
+    initial_note: Option<String>,
+) {
+    build_app(tauri::Builder::default(), initial_path, initial_note)
         .run(context)
         .expect("error while running tauri application");
 }

@@ -267,6 +267,34 @@ button {
   margin: 0 0 13px;
   font-style: italic;
 }
+/* Callouts (Obsidian-style `> [!type]`, M10.05) */
+.reader-content .callout {
+  border-left: 3px solid var(--muted);
+  background: var(--panel-2);
+  padding: 8px 13px;
+  margin: 0 0 13px;
+  border-radius: 4px;
+  font-style: normal;
+  color: var(--text-2);
+}
+.reader-content .callout p:last-child {
+  margin-bottom: 0;
+}
+.reader-content .callout-note {
+  border-left-color: var(--accent);
+}
+.reader-content .callout-tip {
+  border-left-color: var(--str);
+}
+.reader-content .callout-info {
+  border-left-color: var(--lnk);
+}
+.reader-content .callout-warning {
+  border-left-color: var(--spark);
+}
+.reader-content .callout-danger {
+  border-left-color: #e06c75;
+}
 .reader-content hr {
   border: none;
   border-top: 1px solid var(--border);
@@ -351,6 +379,10 @@ button {
 }
 .cm-cursorLayer {
   animation: cm-blink 1.2s ease-in-out infinite;
+}
+.cm-flint-comment {
+  color: var(--cmt);
+  border-bottom: 1px dashed var(--cmt);
 }
 @keyframes cm-blink {
   0%, 100% { opacity: 1; }

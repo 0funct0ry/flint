@@ -2,6 +2,7 @@
 //!
 //! This crate has zero Tauri or GUI dependencies and can be tested in complete isolation.
 
+pub mod md_extensions;
 pub mod render;
 pub use render::{render_note_markdown, RenderResult};
 
@@ -2358,9 +2359,10 @@ pub fn search_content(
             let posix = safe_path.to_posix_string();
             let content = fs::read_to_string(abs_path).ok()?;
             let title = resolve_note_title(&content, safe_path.as_relative_path());
+            let searchable_content = crate::md_extensions::strip_comments(&content);
 
             let mut hits = Vec::new();
-            for (line_idx, line) in content.lines().enumerate() {
+            for (line_idx, line) in searchable_content.lines().enumerate() {
                 for mat in regex.find_iter(line) {
                     hits.push(ContentHit {
                         line: (line_idx + 1) as u32,
@@ -3293,6 +3295,30 @@ Also [Unrelated link](https://example.com) and [Other Note](../other.md).
         };
         let res_invalid = search_content(root, "[unclosed-regex", &opts_invalid);
         assert!(res_invalid.is_err());
+    }
+
+    #[test]
+    fn test_search_content_excludes_comment_text() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(
+            root.join("note.md"),
+            "# Note\nVisible text.\n%%secret%%\nFenced example:\n```\n%%secret%%\n```\n",
+        )
+        .unwrap();
+
+        let opts = ContentSearchOptions::default();
+
+        // Comment text is excluded from search results.
+        let res = search_content(root, "secret", &opts).unwrap();
+        assert_eq!(res.len(), 1);
+        // Only the fenced (non-comment) occurrence should match.
+        assert_eq!(res[0].matches.len(), 1);
+
+        // Non-comment text still matches.
+        let res_visible = search_content(root, "Visible", &opts).unwrap();
+        assert_eq!(res_visible.len(), 1);
     }
 
     #[test]

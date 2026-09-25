@@ -1,7 +1,7 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import katex from 'katex';
 import { EditorSelection, EditorState, Prec } from '@codemirror/state';
-import { EditorView, keymap, highlightActiveLine } from '@codemirror/view';
+import { EditorView, keymap, highlightActiveLine, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { searchKeymap, openSearchPanel } from '@codemirror/search';
@@ -10,6 +10,9 @@ import { autocompletion, CompletionContext, CompletionResult } from '@codemirror
 import { ViewMode } from './TitleBar';
 import { NoteFixture, NoteMeta, TreeNodeItem } from '../types';
 import { ConflictBanner } from './ConflictBanner';
+import { ContextMenu, ContextMenuItem } from './ContextMenu';
+import { commandRegistry } from '../commands/registry';
+import * as ec from '../commands/editorCommands';
 
 export interface CenterPaneProps {
   note: NoteFixture;
@@ -36,25 +39,6 @@ export interface CenterPaneProps {
   savedScrollTop?: number;
   savedCursorPos?: number;
   onScrollOrCursorChange?: (scrollTop: number, cursorPos: number) => void;
-}
-
-/**
- * Format markdown selection helper for bold (**text**), italic (*text*), link ([text](url))
- */
-function wrapSelection(view: EditorView, before: string, after: string, placeholder = '') {
-  const { state, dispatch } = view;
-  const changes = state.changeByRange((range) => {
-    const selected = state.sliceDoc(range.from, range.to) || placeholder;
-    const insert = `${before}${selected}${after}`;
-    return {
-      changes: { from: range.from, to: range.to, insert },
-      range: range.empty
-        ? EditorSelection.range(range.from + before.length, range.from + before.length + placeholder.length)
-        : EditorSelection.range(range.from, range.from + insert.length),
-    };
-  });
-  dispatch(changes);
-  return true;
 }
 
 /**
@@ -182,6 +166,100 @@ function getAllNotePaths(tree: TreeNodeItem[]): Array<{ path: string; title?: st
   return result;
 }
 
+interface EditorCommandDef {
+  id: string;
+  title: string;
+  /** CodeMirror keymap key string, e.g. `'Mod-b'`. Omit when an existing default binding
+   *  (e.g. Select All's Mod-a from `defaultKeymap`) already covers it. */
+  key?: string;
+  shortcutDisplay: string;
+  section: 'insert' | 'format' | 'paragraph' | 'link' | 'clipboard';
+  run: ec.EditorCommand;
+  isEnabled?: (state: EditorState) => boolean;
+}
+
+/**
+ * Every Insert/Format/Paragraph/link/clipboard action, defined once and shared across the
+ * command palette, the CodeMirror keymap, and the editor context menu (M10.05, SPEC §9.3).
+ */
+const EDITOR_COMMANDS: EditorCommandDef[] = [
+  // Insert — always available.
+  { id: 'editor.insert_footnote', title: 'Footnote', key: 'Mod-Alt-f', shortcutDisplay: '⌘⌥F', section: 'insert', run: ec.insertFootnote },
+  { id: 'editor.insert_table', title: 'Table', key: 'Mod-Alt-t', shortcutDisplay: '⌘⌥T', section: 'insert', run: ec.insertTable },
+  { id: 'editor.insert_callout', title: 'Callout', key: 'Mod-Alt-q', shortcutDisplay: '⌘⌥Q', section: 'insert', run: ec.insertCallout() },
+  { id: 'editor.insert_hr', title: 'Horizontal Rule', key: 'Mod-Alt-h', shortcutDisplay: '⌘⌥H', section: 'insert', run: ec.insertHorizontalRule },
+  { id: 'editor.insert_code_block', title: 'Code Block', key: 'Mod-Alt-c', shortcutDisplay: '⌘⌥C', section: 'insert', run: ec.insertCodeBlock },
+  { id: 'editor.insert_math_block', title: 'Math Block', key: 'Mod-Alt-m', shortcutDisplay: '⌘⌥M', section: 'insert', run: ec.insertMathBlock },
+
+  // Format — enabled only with a non-empty selection.
+  { id: 'editor.format_bold', title: 'Bold', key: 'Mod-b', shortcutDisplay: '⌘B', section: 'format', run: ec.formatBold, isEnabled: ec.isFormatEnabled },
+  { id: 'editor.format_italic', title: 'Italic', key: 'Mod-i', shortcutDisplay: '⌘I', section: 'format', run: ec.formatItalic, isEnabled: ec.isFormatEnabled },
+  { id: 'editor.format_strikethrough', title: 'Strikethrough', key: 'Mod-Shift-x', shortcutDisplay: '⌘⇧X', section: 'format', run: ec.formatStrikethrough, isEnabled: ec.isFormatEnabled },
+  { id: 'editor.format_inline_code', title: 'Inline Code', key: 'Mod-Shift-c', shortcutDisplay: '⌘⇧C', section: 'format', run: ec.formatInlineCode, isEnabled: ec.isFormatEnabled },
+  { id: 'editor.format_comment', title: 'Comment', key: 'Mod-/', shortcutDisplay: '⌘/', section: 'format', run: ec.formatComment, isEnabled: ec.isFormatEnabled },
+
+  // Paragraph — enabled only when the cursor/selection is inside a block-level element.
+  { id: 'editor.paragraph_bullet_list', title: 'Bullet List', key: 'Mod-Shift-8', shortcutDisplay: '⌘⇧8', section: 'paragraph', run: ec.paragraphBulletList, isEnabled: ec.isParagraphEnabled },
+  { id: 'editor.paragraph_numbered_list', title: 'Numbered List', key: 'Mod-Shift-7', shortcutDisplay: '⌘⇧7', section: 'paragraph', run: ec.paragraphNumberedList, isEnabled: ec.isParagraphEnabled },
+  { id: 'editor.paragraph_task_list', title: 'Task List', key: 'Mod-Shift-9', shortcutDisplay: '⌘⇧9', section: 'paragraph', run: ec.paragraphTaskList, isEnabled: ec.isParagraphEnabled },
+  { id: 'editor.paragraph_h1', title: 'Heading 1', key: 'Mod-Alt-1', shortcutDisplay: '⌘⌥1', section: 'paragraph', run: ec.paragraphHeading(1), isEnabled: ec.isParagraphEnabled },
+  { id: 'editor.paragraph_h2', title: 'Heading 2', key: 'Mod-Alt-2', shortcutDisplay: '⌘⌥2', section: 'paragraph', run: ec.paragraphHeading(2), isEnabled: ec.isParagraphEnabled },
+  { id: 'editor.paragraph_h3', title: 'Heading 3', key: 'Mod-Alt-3', shortcutDisplay: '⌘⌥3', section: 'paragraph', run: ec.paragraphHeading(3), isEnabled: ec.isParagraphEnabled },
+  { id: 'editor.paragraph_h4', title: 'Heading 4', key: 'Mod-Alt-4', shortcutDisplay: '⌘⌥4', section: 'paragraph', run: ec.paragraphHeading(4), isEnabled: ec.isParagraphEnabled },
+  { id: 'editor.paragraph_h5', title: 'Heading 5', key: 'Mod-Alt-5', shortcutDisplay: '⌘⌥5', section: 'paragraph', run: ec.paragraphHeading(5), isEnabled: ec.isParagraphEnabled },
+  { id: 'editor.paragraph_h6', title: 'Heading 6', key: 'Mod-Alt-6', shortcutDisplay: '⌘⌥6', section: 'paragraph', run: ec.paragraphHeading(6), isEnabled: ec.isParagraphEnabled },
+  { id: 'editor.paragraph_body', title: 'Body', key: 'Mod-Alt-0', shortcutDisplay: '⌘⌥0', section: 'paragraph', run: ec.paragraphBody, isEnabled: ec.isParagraphEnabled },
+  { id: 'editor.paragraph_quote', title: 'Quote', key: 'Mod-Shift-.', shortcutDisplay: '⌘⇧.', section: 'paragraph', run: ec.paragraphQuote, isEnabled: ec.isParagraphEnabled },
+
+  // Links — the first reuses the M6 note-path autocomplete flow, the second is a bare skeleton.
+  { id: 'editor.insert_link', title: 'Add a link', key: 'Mod-Shift-k', shortcutDisplay: '⌘⇧K', section: 'link', run: ec.insertLinkWithAutocomplete },
+  { id: 'editor.insert_external_link', title: 'Add external link', key: 'Mod-k', shortcutDisplay: '⌘K', section: 'link', run: ec.insertExternalLink },
+
+  // Clipboard — via the Tauri clipboard API (SPEC §10.2 CSP), not `navigator.clipboard`.
+  { id: 'editor.cut', title: 'Cut', key: 'Mod-x', shortcutDisplay: '⌘X', section: 'clipboard', run: ec.clipboardCut, isEnabled: ec.isClipboardCutCopyEnabled },
+  { id: 'editor.copy', title: 'Copy', key: 'Mod-c', shortcutDisplay: '⌘C', section: 'clipboard', run: ec.clipboardCopy, isEnabled: ec.isClipboardCutCopyEnabled },
+  { id: 'editor.paste', title: 'Paste', key: 'Mod-v', shortcutDisplay: '⌘V', section: 'clipboard', run: ec.clipboardPaste },
+  // Select All already has its default keybinding (Mod-a) via `defaultKeymap`; listed here so
+  // it also gets a palette entry and a context-menu entry per SPEC §9.3.
+  { id: 'editor.select_all', title: 'Select all', shortcutDisplay: '⌘A', section: 'clipboard', run: ec.selectAllCommand },
+];
+
+/**
+ * Style `%%comment%%` spans in the editor with a muted/dashed treatment (M10.05) — the comment
+ * itself never reaches rendered HTML or search (flint-core strips it), this is purely a visual
+ * cue so the author can still see it exists while editing. Same-line spans only; a comment
+ * spanning a line break still round-trips correctly, it just isn't decorated across the break.
+ */
+function buildCommentDecorations(view: EditorView): DecorationSet {
+  const ranges: Array<{ from: number; to: number }> = [];
+  const commentRe = /%%[^%\n]*%%/g;
+  for (const { from, to } of view.visibleRanges) {
+    const text = view.state.doc.sliceString(from, to);
+    let match: RegExpExecArray | null;
+    commentRe.lastIndex = 0;
+    while ((match = commentRe.exec(text)) !== null) {
+      ranges.push({ from: from + match.index, to: from + match.index + match[0].length });
+    }
+  }
+  const decorations = ranges.map((r) => Decoration.mark({ class: 'cm-flint-comment' }).range(r.from, r.to));
+  return Decoration.set(decorations, true);
+}
+
+const commentDecorationPlugin = ViewPlugin.fromClass(
+  class {
+    decorations: DecorationSet;
+    constructor(view: EditorView) {
+      this.decorations = buildCommentDecorations(view);
+    }
+    update(update: ViewUpdate) {
+      if (update.docChanged || update.viewportChanged) {
+        this.decorations = buildCommentDecorations(update.view);
+      }
+    }
+  },
+  { decorations: (v) => v.decorations }
+);
+
 /**
  * Find link at position in text line
  */
@@ -257,8 +335,37 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   const onScrollOrCursorChangeRef = useRef(onScrollOrCursorChange);
   onScrollOrCursorChangeRef.current = onScrollOrCursorChange;
 
+  // The context menu only applies to the CodeMirror editor pane, not the reader; the editor
+  // stays mounted (just hidden) in read mode, so its handlers need this to stay current.
+  const viewModeRef = useRef(viewMode);
+  viewModeRef.current = viewMode;
+
   // Track the note path currently loaded in the editor instance
   const loadedNotePathRef = useRef<string>('');
+
+  const [contextMenuState, setContextMenuState] = useState<{ x: number; y: number } | null>(null);
+
+  // Register every Insert/Format/Paragraph/link/clipboard command once, per SPEC §9.3 — the
+  // handler always reads the currently-mounted EditorView from the ref, so this stays correct
+  // across note switches without re-registering.
+  useEffect(() => {
+    for (const cmd of EDITOR_COMMANDS) {
+      commandRegistry.register({
+        id: cmd.id,
+        title: cmd.title,
+        category: 'Editor',
+        shortcut: cmd.key,
+        shortcutDisplay: cmd.shortcutDisplay,
+        handler: () => {
+          const view = editorViewRef.current;
+          if (view) {
+            view.focus();
+            cmd.run(view);
+          }
+        },
+      });
+    }
+  }, []);
 
   // Render KaTeX formulas whenever note.renderedHtml or viewMode changes
   useEffect(() => {
@@ -460,6 +567,81 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     };
   }, [viewMode, note.path, note.headings]);
 
+  // Build the context-menu item list fresh on each open, so enabled/disabled reflects the
+  // selection/cursor at open time: the two link items, then Format/Paragraph/Insert as flyout
+  // submenus (keeps the top level short), then clipboard actions.
+  const buildMenuItems = (): ContextMenuItem[] => {
+    const view = editorViewRef.current;
+    if (!view) return [];
+    const { state } = view;
+
+    const sep = (id: string): ContextMenuItem => ({ id, label: '', separator: true, onClick: () => {} });
+
+    const toItem = (cmd: EditorCommandDef): ContextMenuItem => {
+      const enabled = cmd.isEnabled ? cmd.isEnabled(state) : true;
+      return {
+        id: cmd.id,
+        label: cmd.title,
+        shortcut: cmd.shortcutDisplay,
+        disabled: !enabled,
+        disabledReason: !enabled
+          ? cmd.section === 'format' || cmd.section === 'clipboard'
+            ? 'Select some text first'
+            : cmd.section === 'paragraph'
+            ? 'Place the cursor in a paragraph, list, or heading first'
+            : undefined
+          : undefined,
+        onClick: () => {
+          view.focus();
+          cmd.run(view);
+        },
+      };
+    };
+
+    const byIds = (...ids: string[]) =>
+      ids
+        .map((id) => EDITOR_COMMANDS.find((c) => c.id === id))
+        .filter((c): c is EditorCommandDef => !!c)
+        .map(toItem);
+
+    const formatSubmenu: ContextMenuItem[] = [
+      ...byIds('editor.format_bold', 'editor.format_italic', 'editor.format_strikethrough', 'editor.format_inline_code'),
+      sep('format-sep-1'),
+      ...byIds('editor.format_comment'),
+    ];
+
+    const paragraphSubmenu: ContextMenuItem[] = [
+      ...byIds('editor.paragraph_bullet_list', 'editor.paragraph_numbered_list', 'editor.paragraph_task_list'),
+      sep('paragraph-sep-1'),
+      ...byIds(
+        'editor.paragraph_h1',
+        'editor.paragraph_h2',
+        'editor.paragraph_h3',
+        'editor.paragraph_h4',
+        'editor.paragraph_h5',
+        'editor.paragraph_h6',
+        'editor.paragraph_body',
+        'editor.paragraph_quote'
+      ),
+    ];
+
+    const insertSubmenu: ContextMenuItem[] = [
+      ...byIds('editor.insert_footnote', 'editor.insert_table', 'editor.insert_callout', 'editor.insert_hr'),
+      sep('insert-sep-1'),
+      ...byIds('editor.insert_code_block', 'editor.insert_math_block'),
+    ];
+
+    return [
+      ...byIds('editor.insert_link', 'editor.insert_external_link'),
+      sep('sep-1'),
+      { id: 'group-format', label: 'Format', submenu: formatSubmenu, onClick: () => {} },
+      { id: 'group-paragraph', label: 'Paragraph', submenu: paragraphSubmenu, onClick: () => {} },
+      { id: 'group-insert', label: 'Insert', submenu: insertSubmenu, onClick: () => {} },
+      sep('sep-2'),
+      ...byIds('editor.cut', 'editor.copy', 'editor.paste', 'editor.select_all'),
+    ];
+  };
+
   // Navigate to link target helper
   const navigateToLink = (rawTarget: string) => {
     const isExternal =
@@ -561,18 +743,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       }
 
       const formattingKeymap = [
-        {
-          key: 'Mod-b',
-          run: (view: EditorView) => wrapSelection(view, '**', '**', 'bold text'),
-        },
-        {
-          key: 'Mod-i',
-          run: (view: EditorView) => wrapSelection(view, '*', '*', 'italic text'),
-        },
-        {
-          key: 'Mod-k',
-          run: (view: EditorView) => wrapSelection(view, '[', '](https://)', 'link text'),
-        },
+        ...EDITOR_COMMANDS.filter((cmd) => cmd.key).map((cmd) => ({ key: cmd.key as string, run: cmd.run })),
         {
           key: 'Mod-s',
           run: () => {
@@ -618,6 +789,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
           highlightActiveLine(),
           EditorView.lineWrapping,
           markdown(),
+          commentDecorationPlugin,
           autocompletion({
             override: [linkCompletionSource],
             activateOnTyping: true,
@@ -641,10 +813,33 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
               }
               return false;
             },
+            contextmenu: (event) => {
+              if (viewModeRef.current === 'read') return false;
+              event.preventDefault();
+              setContextMenuState({ x: event.clientX, y: event.clientY });
+              return true;
+            },
+            keydown: (event, view) => {
+              if (viewModeRef.current === 'read') return false;
+              // The OS "Menu" key, and Shift-F10 as its standard alternate, open the same menu
+              // anchored at the text cursor rather than the mouse (keyboard-only users).
+              if (event.key === 'ContextMenu' || (event.key === 'F10' && event.shiftKey)) {
+                event.preventDefault();
+                const coords = view.coordsAtPos(view.state.selection.main.head);
+                if (coords) {
+                  setContextMenuState({ x: coords.left, y: coords.bottom });
+                }
+                return true;
+              }
+              return false;
+            },
           }),
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {
               onContentChangeRef.current(update.state.doc.toString());
+            }
+            if (update.selectionSet) {
+              setContextMenuState(null);
             }
             if (update.focusChanged && !update.view.hasFocus) {
               if (onBlurSaveRef.current) {
@@ -817,6 +1012,15 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
           >
             <div ref={editorContainerRef} className="h-full" />
           </div>
+
+          {contextMenuState && viewMode !== 'read' && (
+            <ContextMenu
+              x={contextMenuState.x}
+              y={contextMenuState.y}
+              items={buildMenuItems()}
+              onClose={() => setContextMenuState(null)}
+            />
+          )}
 
           {/* Reader Pane: Mounted and toggled via CSS */}
           <div

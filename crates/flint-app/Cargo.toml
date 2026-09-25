@@ -19,4 +19,5 @@ notify.workspace = true
 ignore.workspace = true
 tauri = { version = "2.3", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
 

@@ -23,6 +23,7 @@ use syntect::highlighting::ThemeSet;
 use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
 use syntect::parsing::SyntaxSet;
 
+use crate::md_extensions::{parse_callout, strip_comments, CALLOUT_TYPES};
 use crate::{extract_headings, parse_front_matter, HeadingItem};
 
 /// Result returned from markdown rendering.
@@ -240,6 +241,84 @@ struct MathSpan {
     is_block: bool,
 }
 
+/// Render a fully-buffered blockquote's events as either an Obsidian-style callout
+/// (`> [!type]`) or a plain blockquote, per SPEC M10.05. An unrecognized callout type still
+/// renders as a styled blockquote rather than being dropped.
+fn render_callout_or_blockquote(events: Vec<Event<'_>>) -> Event<'_> {
+    let mut callout: Option<(String, usize, usize, String)> = None;
+
+    // The first paragraph's first line may be split across several adjacent `Text` events
+    // (pulldown-cmark splits text around bracket-like characters such as `[`/`]` even outside
+    // an actual link). Concatenate every Text event up to the first line break to recover the
+    // full first line before matching the callout marker against it.
+    if let Some(Event::Start(Tag::Paragraph)) = events.first() {
+        let mut first_line = String::new();
+        let mut end_idx = None;
+        for (idx, ev) in events.iter().enumerate().skip(1) {
+            match ev {
+                Event::Text(text) => first_line.push_str(text),
+                Event::SoftBreak | Event::HardBreak => {
+                    end_idx = Some(idx);
+                    break;
+                }
+                Event::End(TagEnd::Paragraph) => {
+                    end_idx = Some(idx);
+                    break;
+                }
+                _ => break,
+            }
+        }
+
+        if let (Some(end_idx), Some((ctype, rest))) = (
+            end_idx,
+            parse_callout(&first_line).map(|(t, r)| (t.to_string(), r.to_string())),
+        ) {
+            callout = Some((ctype, 1, end_idx, rest));
+        }
+    }
+
+    let mut inner_html = String::new();
+
+    if let Some((callout_type, marker_start, marker_end, rest)) = callout {
+        let rebuilt: Vec<Event> = events
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, ev)| {
+                if i == marker_start {
+                    if rest.is_empty() {
+                        None
+                    } else {
+                        Some(Event::Text(CowStr::Boxed(rest.clone().into_boxed_str())))
+                    }
+                } else if i > marker_start && i < marker_end {
+                    None
+                } else {
+                    Some(ev)
+                }
+            })
+            .collect();
+        html::push_html(&mut inner_html, rebuilt.into_iter());
+
+        let type_lc = callout_type.to_lowercase();
+        let class = if CALLOUT_TYPES.contains(&type_lc.as_str()) {
+            format!("callout callout-{}", type_lc)
+        } else {
+            "callout".to_string()
+        };
+        let html_out = format!(
+            "<div class=\"{}\" data-callout-type=\"{}\">{}</div>",
+            class,
+            html_escape::encode_double_quoted_attribute(&type_lc),
+            inner_html
+        );
+        Event::Html(CowStr::Boxed(html_out.into_boxed_str()))
+    } else {
+        html::push_html(&mut inner_html, events.into_iter());
+        let html_out = format!("<blockquote>{}</blockquote>", inner_html);
+        Event::Html(CowStr::Boxed(html_out.into_boxed_str()))
+    }
+}
+
 /// Convert local image relative path to Tauri asset protocol URL or placeholder.
 fn resolve_image_src(
     src: &str,
@@ -309,7 +388,8 @@ pub fn render_note_markdown(
         None
     };
 
-    let (protected_body, math_spans) = protect_math(body);
+    let body_without_comments = strip_comments(body);
+    let (protected_body, math_spans) = protect_math(&body_without_comments);
 
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -337,7 +417,38 @@ pub fn render_note_markdown(
     let mut image_title = String::new();
     let mut image_dest_url = String::new();
 
+    let mut blockquote_depth: i32 = 0;
+    let mut blockquote_buffer: Vec<Event> = Vec::new();
+
     for event in parser {
+        if blockquote_depth > 0 {
+            match &event {
+                Event::Start(Tag::BlockQuote(_)) => {
+                    blockquote_depth += 1;
+                    blockquote_buffer.push(event);
+                }
+                Event::End(TagEnd::BlockQuote(_)) => {
+                    blockquote_depth -= 1;
+                    if blockquote_depth == 0 {
+                        let events = std::mem::take(&mut blockquote_buffer);
+                        custom_events.push(render_callout_or_blockquote(events));
+                    } else {
+                        blockquote_buffer.push(event);
+                    }
+                }
+                _ => {
+                    blockquote_buffer.push(event);
+                }
+            }
+            continue;
+        }
+
+        if let Event::Start(Tag::BlockQuote(_)) = &event {
+            blockquote_depth += 1;
+            blockquote_buffer.clear();
+            continue;
+        }
+
         match event {
             Event::Start(Tag::CodeBlock(kind)) => {
                 in_code_block = true;
@@ -616,6 +727,7 @@ pub fn render_note_markdown(
     generic_attrs.insert("data-lang");
     generic_attrs.insert("data-math");
     generic_attrs.insert("data-target");
+    generic_attrs.insert("data-callout-type");
     tag_attributes.insert("div", generic_attrs.clone());
     tag_attributes.insert("span", generic_attrs.clone());
     tag_attributes.insert("h1", generic_attrs.clone());
@@ -815,5 +927,86 @@ $$
         assert!(res.html.contains("<hr"));
         assert!(res.html.contains("<p>Above</p>"));
         assert!(res.html.contains("<p>Below</p>"));
+    }
+
+    #[test]
+    fn test_render_callout_note() {
+        let md = "> [!note]\n> Heads up, this matters.\n";
+        let res = render_note_markdown(md, "dark", None, None);
+        assert!(res.html.contains("callout callout-note"));
+        assert!(res.html.contains("Heads up, this matters."));
+        assert!(!res.html.contains("[!note]"));
+        assert!(!res.html.contains("<blockquote>"));
+    }
+
+    #[test]
+    fn test_render_callout_unrecognized_type_still_renders() {
+        let md = "> [!bogus]\n> Still shown.\n";
+        let res = render_note_markdown(md, "dark", None, None);
+        assert!(res.html.contains("class=\"callout\""));
+        assert!(res.html.contains("Still shown."));
+        assert!(!res.html.contains("[!bogus]"));
+    }
+
+    #[test]
+    fn test_render_plain_blockquote_unaffected() {
+        let md = "> Just a normal quote.\n";
+        let res = render_note_markdown(md, "dark", None, None);
+        assert!(res.html.contains("<blockquote>"));
+        assert!(res.html.contains("Just a normal quote."));
+        assert!(!res.html.contains("callout"));
+    }
+
+    #[test]
+    fn test_render_comment_stripped_inline() {
+        let md = "Visible text %%hidden secret%% more visible text.";
+        let res = render_note_markdown(md, "dark", None, None);
+        assert!(res.html.contains("Visible text"));
+        assert!(res.html.contains("more visible text."));
+        assert!(!res.html.contains("hidden secret"));
+    }
+
+    #[test]
+    fn test_render_comment_stripped_across_linebreak() {
+        let md = "Before %%line one\nline two%% after.";
+        let res = render_note_markdown(md, "dark", None, None);
+        assert!(res.html.contains("Before"));
+        assert!(res.html.contains("after."));
+        assert!(!res.html.contains("line one"));
+        assert!(!res.html.contains("line two"));
+    }
+
+    #[test]
+    fn test_render_comment_not_stripped_in_code_fence() {
+        let md = "```\n%%kept literally%%\n```\n";
+        let res = render_note_markdown(md, "dark", None, None);
+        assert!(res.html.contains("%%kept literally%%"));
+    }
+
+    #[test]
+    fn test_render_comment_not_stripped_in_inline_code() {
+        let md = "Some `%%kept literally%%` text.";
+        let res = render_note_markdown(md, "dark", None, None);
+        assert!(res.html.contains("%%kept literally%%"));
+    }
+
+    #[test]
+    fn test_render_inserted_math_block_matches_handtyped() {
+        let inserted = "$$\n\n$$\n";
+        let handtyped = "$$\n\n$$\n";
+        let res_inserted = render_note_markdown(inserted, "dark", None, None);
+        let res_handtyped = render_note_markdown(handtyped, "dark", None, None);
+        assert_eq!(res_inserted.html, res_handtyped.html);
+        assert!(res_inserted.html.contains("flint-math-block"));
+    }
+
+    #[test]
+    fn test_render_inserted_code_block_matches_handtyped() {
+        let inserted = "```\n\n```\n";
+        let handtyped = "```\n\n```\n";
+        let res_inserted = render_note_markdown(inserted, "dark", None, None);
+        let res_handtyped = render_note_markdown(handtyped, "dark", None, None);
+        assert_eq!(res_inserted.html, res_handtyped.html);
+        assert!(res_inserted.html.contains("syntect-code"));
     }
 }

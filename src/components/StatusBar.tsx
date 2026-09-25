@@ -5,8 +5,12 @@ export interface StatusBarProps {
   noteCount: number;
   linkCount: number;
   unresolvedCount: number;
+  wordCount: number;
+  charCount: number;
   cursorLine?: number;
   cursorCol?: number;
+  selectionLength?: number;
+  lineEnding?: 'LF' | 'CRLF';
   indexingProgress?: { indexed: number; total: number } | null;
   isWatcherDegraded?: boolean;
   onClickUnresolved?: () => void;
@@ -17,8 +21,12 @@ export const StatusBar: React.FC<StatusBarProps> = ({
   noteCount,
   linkCount,
   unresolvedCount,
-  cursorLine = 1,
-  cursorCol = 1,
+  wordCount,
+  charCount,
+  cursorLine,
+  cursorCol,
+  selectionLength = 0,
+  lineEnding = 'LF',
   indexingProgress = null,
   isWatcherDegraded = false,
   onClickUnresolved,
@@ -28,6 +36,8 @@ export const StatusBar: React.FC<StatusBarProps> = ({
       <span className="text-[var(--text-2)] font-medium">{workspaceName}</span>
       <span>{noteCount.toLocaleString()} notes</span>
       <span>{linkCount.toLocaleString()} links</span>
+      <span>{wordCount.toLocaleString()} words</span>
+      <span>{charCount.toLocaleString()} chars</span>
       {unresolvedCount > 0 ? (
         <button
           onClick={onClickUnresolved}
@@ -50,12 +60,15 @@ export const StatusBar: React.FC<StatusBarProps> = ({
       )}
 
       <div className="ml-auto flex items-center gap-3.5">
-        <span>
-          Ln {cursorLine}, Col {cursorCol}
-        </span>
+        {cursorLine !== undefined && cursorCol !== undefined && (
+          <span>
+            Ln {cursorLine}, Col {cursorCol}
+            {selectionLength > 0 ? ` (${selectionLength} selected)` : ''}
+          </span>
+        )}
         <span>Markdown</span>
         <span>UTF-8</span>
-        <span>LF</span>
+        <span>{lineEnding}</span>
         {isWatcherDegraded ? (
           <span
             className="text-[var(--spark)] flex items-center gap-1"

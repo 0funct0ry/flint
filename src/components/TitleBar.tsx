@@ -33,22 +33,6 @@ export const TitleBar: React.FC<TitleBarProps> = ({
 
   return (
     <div className="flex items-center gap-3 h-[38px] shrink-0 px-3 border-b border-[var(--border)] bg-[var(--panel-2)] select-none">
-      {/* Window lights / controls indicator */}
-      <div className="flex gap-[7px] mr-1 items-center">
-        <i
-          className="w-[11px] h-[11px] rounded-full border border-[var(--border)]"
-          style={{ backgroundColor: theme === 'light' ? '#E4695E' : 'var(--border)' }}
-        />
-        <i
-          className="w-[11px] h-[11px] rounded-full border border-[var(--border)]"
-          style={{ backgroundColor: theme === 'light' ? '#E0B44B' : 'var(--border)' }}
-        />
-        <i
-          className="w-[11px] h-[11px] rounded-full border border-[var(--border)]"
-          style={{ backgroundColor: theme === 'light' ? '#68C05C' : 'var(--border)' }}
-        />
-      </div>
-
       {/* Workspace Breadcrumb */}
       <div className="flex items-center gap-1.5 text-[var(--muted)] text-xs truncate">
         <span>{root}</span>

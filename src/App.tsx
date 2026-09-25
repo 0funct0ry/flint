@@ -29,6 +29,7 @@ import {
 } from './types';
 import { api, isTauriEnvironment } from './services/ipc';
 import { renderMarkdownToHtml } from './services/markdown';
+import { countWords, countChars } from './services/textStats';
 
 interface HistoryEntry {
   path: string;
@@ -71,6 +72,11 @@ export const App: React.FC = () => {
   const [noteState, setNoteState] = useState<Record<string, NoteFixture>>(FIXTURE_NOTES);
   const [noteFingerprints, setNoteFingerprints] = useState<Record<string, Fingerprint>>({});
   const [isDirty, setIsDirty] = useState(false);
+  const [cursorPosition, setCursorPosition] = useState<{
+    line: number;
+    col: number;
+    selectionLength: number;
+  } | null>(null);
 
   // Conflict handling state
   const [showConflictBanner, setShowConflictBanner] = useState(false);
@@ -572,6 +578,7 @@ export const App: React.FC = () => {
       setCurrentNotePath(cleanPath);
       setActiveScrollTop(undefined);
       setActiveCursorPos(undefined);
+      setCursorPosition(null);
 
       await loadNote(cleanPath);
 
@@ -940,6 +947,7 @@ export const App: React.FC = () => {
       await saveNote(false);
     }
     setCurrentNotePath('');
+    setCursorPosition(null);
   }, [isDirty, saveNote]);
 
   // Register commands in registry per SPEC §9.3 & M4
@@ -1121,6 +1129,17 @@ export const App: React.FC = () => {
         renderedHtml: '',
         lastModifiedAgo: '',
       };
+
+  const textStats = React.useMemo(() => {
+    if (!currentNotePath) {
+      return { wordCount: 0, charCount: 0, lineEnding: 'LF' as const };
+    }
+    return {
+      wordCount: countWords(currentNote.content),
+      charCount: countChars(currentNote.content),
+      lineEnding: currentNote.content.includes('\r\n') ? ('CRLF' as const) : ('LF' as const),
+    };
+  }, [currentNotePath, currentNote.content]);
 
   const breadcrumb = currentNotePath
     ? `${workspaceInfo.name}/${currentNotePath.replace(/^projects\//, '')}`
@@ -1366,9 +1385,10 @@ export const App: React.FC = () => {
           indexedNotes={indexedNotes}
           savedScrollTop={activeScrollTop}
           savedCursorPos={activeCursorPos}
-          onScrollOrCursorChange={(scrollTop, cursorPos) => {
+          onScrollOrCursorChange={(scrollTop, cursorPos, cursorLine, cursorCol, selectionLength) => {
             currentScrollTopRef.current = scrollTop;
             currentCursorPosRef.current = cursorPos;
+            setCursorPosition({ line: cursorLine, col: cursorCol, selectionLength });
           }}
         />
 
@@ -1389,11 +1409,19 @@ export const App: React.FC = () => {
         noteCount={workspaceStats.note_count}
         linkCount={workspaceStats.link_count}
         unresolvedCount={workspaceStats.unresolved_count}
+        wordCount={textStats.wordCount}
+        charCount={textStats.charCount}
+        lineEnding={textStats.lineEnding}
         indexingProgress={indexingProgress}
         isWatcherDegraded={isWatcherDegraded}
         onClickUnresolved={() => setUnresolvedModalOpen(true)}
-        cursorLine={1}
-        cursorCol={1}
+        cursorLine={
+          currentNotePath && viewMode !== 'read' && cursorPosition ? cursorPosition.line : undefined
+        }
+        cursorCol={
+          currentNotePath && viewMode !== 'read' && cursorPosition ? cursorPosition.col : undefined
+        }
+        selectionLength={cursorPosition?.selectionLength}
       />
 
       {/* Command Palette Modal */}

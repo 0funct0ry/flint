@@ -13,6 +13,8 @@ describe('StatusBar & UnresolvedLinksModal (M7)', () => {
         noteCount={42}
         linkCount={120}
         unresolvedCount={3}
+        wordCount={100}
+        charCount={500}
         onClickUnresolved={onClickUnresolved}
       />
     );
@@ -33,6 +35,8 @@ describe('StatusBar & UnresolvedLinksModal (M7)', () => {
         noteCount={0}
         linkCount={0}
         unresolvedCount={0}
+        wordCount={0}
+        charCount={0}
         indexingProgress={{ indexed: 450, total: 1000 }}
       />
     );
@@ -47,6 +51,8 @@ describe('StatusBar & UnresolvedLinksModal (M7)', () => {
         noteCount={10}
         linkCount={5}
         unresolvedCount={0}
+        wordCount={0}
+        charCount={0}
         isWatcherDegraded={true}
       />
     );

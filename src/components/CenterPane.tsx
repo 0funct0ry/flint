@@ -38,7 +38,13 @@ export interface CenterPaneProps {
   indexedNotes?: NoteMeta[];
   savedScrollTop?: number;
   savedCursorPos?: number;
-  onScrollOrCursorChange?: (scrollTop: number, cursorPos: number) => void;
+  onScrollOrCursorChange?: (
+    scrollTop: number,
+    cursorPos: number,
+    cursorLine: number,
+    cursorCol: number,
+    selectionLength: number
+  ) => void;
 }
 
 /**
@@ -848,8 +854,18 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
             }
             if (onScrollOrCursorChangeRef.current) {
               const scroller = update.view.scrollDOM;
-              const cursor = update.state.selection.main.head;
-              onScrollOrCursorChangeRef.current(scroller.scrollTop, cursor);
+              const sel = update.state.selection.main;
+              const line = update.state.doc.lineAt(sel.head);
+              const cursorLine = line.number;
+              const cursorCol = sel.head - line.from + 1;
+              const selectionLength = Math.abs(sel.to - sel.from);
+              onScrollOrCursorChangeRef.current(
+                scroller.scrollTop,
+                sel.head,
+                cursorLine,
+                cursorCol,
+                selectionLength
+              );
             }
           }),
         ],

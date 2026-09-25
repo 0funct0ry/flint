@@ -2,6 +2,8 @@ export interface HeadingItem {
   level: number;
   text: string;
   anchor: string;
+  /** 0-based source line number of the heading, used to scroll the editor precisely. */
+  line?: number;
 }
 
 export interface LinkItem {

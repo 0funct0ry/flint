@@ -35,7 +35,7 @@ export interface LeftSidebarProps {
   onCommitInlineAction: (name: string) => Promise<void>;
   onCancelInlineAction: () => void;
   activeHeadingAnchor?: string;
-  onSelectHeading?: (anchor: string) => void;
+  onSelectHeading?: (heading: HeadingItem) => void;
   onClose?: () => void;
 }
 
@@ -859,7 +859,7 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
                 return (
                   <div
                     key={i}
-                    onClick={() => onSelectHeading && onSelectHeading(h.anchor)}
+                    onClick={() => onSelectHeading && onSelectHeading(h)}
                     className={`flex items-center gap-1.5 h-6 pr-2 text-[12px] cursor-pointer select-none transition-colors ${indentClass} ${
                       isActive
                         ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'

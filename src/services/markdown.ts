@@ -70,6 +70,7 @@ export function renderMarkdownToHtml(markdown: string): string {
   let inList: 'ul' | 'ol' | null = null;
   let inTable = false;
   let paragraphBuffer: string[] = [];
+  const slugCounts = new Map<string, number>();
 
   function flushParagraph() {
     if (paragraphBuffer.length > 0) {
@@ -156,7 +157,7 @@ export function renderMarkdownToHtml(markdown: string): string {
       flushTable();
       const level = headingMatch[1].length;
       const hText = headingMatch[2].trim();
-      const anchor = slugify(hText);
+      const anchor = dedupSlug(slugCounts, slugify(hText));
       htmlOutput.push(`<h${level} id="${anchor}">${formatInline(hText)}</h${level}>`);
       continue;
     }
@@ -311,6 +312,13 @@ export function slugify(text: string): string {
     .split('-')
     .filter((s) => s.length > 0)
     .join('-');
+}
+
+/** Disambiguate a slug against slugs already seen in the same note, appending -2, -3, ... on repeats. */
+export function dedupSlug(seen: Map<string, number>, baseSlug: string): string {
+  const count = (seen.get(baseSlug) || 0) + 1;
+  seen.set(baseSlug, count);
+  return count === 1 ? baseSlug : `${baseSlug}-${count}`;
 }
 
 function formatInline(text: string): string {

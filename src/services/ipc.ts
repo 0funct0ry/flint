@@ -17,7 +17,7 @@ import {
   WorkspaceStats,
 } from "../types";
 import { FIXTURE_NOTES } from "../fixtures/workspace";
-import { renderMarkdownToHtml, slugify } from "./markdown";
+import { renderMarkdownToHtml, slugify, dedupSlug } from "./markdown";
 
 export const isTauriEnvironment = (): boolean => {
   return typeof window !== "undefined" && Boolean((window as any).__TAURI_INTERNALS__);
@@ -106,7 +106,7 @@ export const api = {
       folder: path.split("/").slice(0, -1).join("/"),
       tags: [],
       content: `# ${path.split("/").pop()?.replace(/\.md$/, "") || "Untitled"}\n\nNote content...`,
-      headings: [{ level: 1, text: path.split("/").pop()?.replace(/\.md$/, "") || "Untitled", anchor: "title" }],
+      headings: [{ level: 1, text: path.split("/").pop()?.replace(/\.md$/, "") || "Untitled", anchor: "title", line: 0 }],
       outgoingLinks: [],
       backlinks: [],
       renderedHtml: `<p>Note content...</p>`,
@@ -268,15 +268,18 @@ export const api = {
       : browserMockStorage[path]?.content || FIXTURE_NOTES[path]?.content || "";
 
     const html = renderMarkdownToHtml(rawContent);
-    const headings: Array<{ level: number; text: string; anchor: string }> = [];
-    for (const line of rawContent.split('\n')) {
-      const trimmed = line.trim();
+    const headings: Array<{ level: number; text: string; anchor: string; line: number }> = [];
+    const slugCounts = new Map<string, number>();
+    const rawLines = rawContent.split('\n');
+    for (let i = 0; i < rawLines.length; i++) {
+      const trimmed = rawLines[i].trim();
       const match = trimmed.match(/^(#{1,6})\s+(.*)$/);
       if (match) {
         headings.push({
           level: match[1].length,
           text: match[2].trim(),
-          anchor: slugify(match[2].trim()),
+          anchor: dedupSlug(slugCounts, slugify(match[2].trim())),
+          line: i,
         });
       }
     }

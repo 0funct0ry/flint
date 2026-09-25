@@ -31,6 +31,9 @@ pub struct HeadingItem {
     pub level: u8,
     pub text: String,
     pub anchor: String,
+    /// 0-based source line number of the heading, used to scroll the editor
+    /// to the exact heading even when multiple headings share the same text.
+    pub line: usize,
 }
 
 /// A fingerprint of a note on disk for safe concurrent edit conflict detection (SPEC §8.3).
@@ -441,12 +444,27 @@ pub fn parse_front_matter(content: &str) -> (Option<String>, &str, Vec<String>) 
     (None, content, Vec::new())
 }
 
+/// Disambiguate a heading slug against slugs already seen in the same note,
+/// appending `-2`, `-3`, ... on repeats (matching common Markdown renderer
+/// conventions), so every heading in a note gets a unique anchor even when
+/// two headings share the same text (e.g. repeated "Usage" subsections).
+pub fn dedup_slug(seen: &mut std::collections::HashMap<String, u32>, base_slug: String) -> String {
+    let count = seen.entry(base_slug.clone()).or_insert(0);
+    *count += 1;
+    if *count == 1 {
+        base_slug
+    } else {
+        format!("{}-{}", base_slug, *count)
+    }
+}
+
 /// Extract heading outline from note Markdown content.
 pub fn extract_headings(content: &str) -> Vec<HeadingItem> {
     let mut headings = Vec::new();
     let mut in_code_block = false;
+    let mut slug_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
-    for line in content.lines() {
+    for (line_number, line) in content.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_code_block = !in_code_block;
@@ -469,7 +487,7 @@ pub fn extract_headings(content: &str) -> Vec<HeadingItem> {
                     let text = chars.as_str().trim();
                     if !text.is_empty() {
                         // Generate slug anchor
-                        let anchor = text
+                        let base_slug = text
                             .to_lowercase()
                             .chars()
                             .map(|ch| if ch.is_alphanumeric() { ch } else { '-' })
@@ -478,11 +496,13 @@ pub fn extract_headings(content: &str) -> Vec<HeadingItem> {
                             .filter(|s| !s.is_empty())
                             .collect::<Vec<_>>()
                             .join("-");
+                        let anchor = dedup_slug(&mut slug_counts, base_slug);
 
                         headings.push(HeadingItem {
                             level,
                             text: text.to_string(),
                             anchor,
+                            line: line_number,
                         });
                     }
                     break;

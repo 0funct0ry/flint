@@ -408,6 +408,7 @@ pub fn render_note_markdown(
 
     let mut current_heading_level = None;
     let mut current_heading_text = String::new();
+    let mut heading_iter = headings.iter();
 
     // Image state: collect alt text between Start(Image) and End(Image)
     let mut in_image = false;
@@ -490,15 +491,23 @@ pub fn render_note_markdown(
                         HeadingLevel::H6 => 6,
                     };
 
-                    let anchor = current_heading_text
-                        .to_lowercase()
-                        .chars()
-                        .map(|ch| if ch.is_alphanumeric() { ch } else { '-' })
-                        .collect::<String>()
-                        .split('-')
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("-");
+                    // Use the anchor already assigned by extract_headings, so the
+                    // rendered id matches the outline exactly even for duplicate
+                    // heading text (both walk headings in the same document order).
+                    let anchor = heading_iter
+                        .next()
+                        .map(|h| h.anchor.clone())
+                        .unwrap_or_else(|| {
+                            current_heading_text
+                                .to_lowercase()
+                                .chars()
+                                .map(|ch| if ch.is_alphanumeric() { ch } else { '-' })
+                                .collect::<String>()
+                                .split('-')
+                                .filter(|s| !s.is_empty())
+                                .collect::<Vec<_>>()
+                                .join("-")
+                        });
 
                     let h_html = format!(
                         "<h{} id=\"{}\">{}</h{}>",

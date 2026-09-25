@@ -1305,11 +1305,16 @@ export const App: React.FC = () => {
             onCommitInlineAction={handleCommitInlineAction}
             onCancelInlineAction={() => setInlineAction(null)}
             activeHeadingAnchor={activeHeadingAnchor}
-            onSelectHeading={(anchor) => {
-              setActiveHeadingAnchor(anchor);
-              setScrollToAnchor(anchor);
+            onSelectHeading={(heading) => {
+              setActiveHeadingAnchor(heading.anchor);
+              setScrollToAnchor(heading.anchor);
               // Clear scrollToAnchor after scrolling
               setTimeout(() => setScrollToAnchor(null), 300);
+              if (typeof heading.line === 'number') {
+                // heading.line is 0-based; scrollToLine is 1-based
+                setScrollToLine(heading.line + 1);
+                setTimeout(() => setScrollToLine(null), 300);
+              }
             }}
             onClose={() => setLeftSidebarVisible(false)}
           />

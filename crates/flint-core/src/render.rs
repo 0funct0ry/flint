@@ -24,7 +24,7 @@ use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
 use syntect::parsing::SyntaxSet;
 
 use crate::md_extensions::{parse_callout, strip_comments, CALLOUT_TYPES};
-use crate::{extract_headings, parse_front_matter, HeadingItem};
+use crate::{dedup_slug, extract_headings, parse_front_matter, slugify, HeadingItem};
 
 /// Result returned from markdown rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,7 +408,15 @@ pub fn render_note_markdown(
 
     let mut current_heading_level = None;
     let mut current_heading_text = String::new();
-    let mut heading_iter = headings.iter();
+    // Search cursor into `headings` (built by the separate `extract_headings` line
+    // scanner) rather than a plain iterator: the scanner and this real pulldown-cmark
+    // parse can disagree on what counts as a heading (e.g. setext headings, or headings
+    // inside constructs the scanner doesn't track), so we resync on each heading by
+    // matching slugified text going forward from the cursor instead of assuming the two
+    // passes stay positionally aligned.
+    let mut heading_search_start: usize = 0;
+    let mut orphan_slug_counts: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
 
     // Image state: collect alt text between Start(Image) and End(Image)
     let mut in_image = false;
@@ -491,23 +499,22 @@ pub fn render_note_markdown(
                         HeadingLevel::H6 => 6,
                     };
 
-                    // Use the anchor already assigned by extract_headings, so the
-                    // rendered id matches the outline exactly even for duplicate
-                    // heading text (both walk headings in the same document order).
-                    let anchor = heading_iter
-                        .next()
-                        .map(|h| h.anchor.clone())
-                        .unwrap_or_else(|| {
-                            current_heading_text
-                                .to_lowercase()
-                                .chars()
-                                .map(|ch| if ch.is_alphanumeric() { ch } else { '-' })
-                                .collect::<String>()
-                                .split('-')
-                                .filter(|s| !s.is_empty())
-                                .collect::<Vec<_>>()
-                                .join("-")
-                        });
+                    // Use the anchor already assigned by extract_headings, resynced by
+                    // matching slugified text forward from the search cursor so the
+                    // rendered id matches the outline entry even if the two heading
+                    // passes have drifted out of positional lockstep.
+                    let wanted_slug = slugify(&current_heading_text);
+                    let matched = headings[heading_search_start..]
+                        .iter()
+                        .position(|h| slugify(&h.text) == wanted_slug)
+                        .map(|offset| heading_search_start + offset);
+                    let anchor = match matched {
+                        Some(idx) => {
+                            heading_search_start = idx + 1;
+                            headings[idx].anchor.clone()
+                        }
+                        None => dedup_slug(&mut orphan_slug_counts, wanted_slug),
+                    };
 
                     let h_html = format!(
                         "<h{} id=\"{}\">{}</h{}>",
@@ -846,6 +853,41 @@ Content in sub section.
         assert_eq!(res.headings[0].anchor, "main-title");
         assert_eq!(res.headings[1].text, "Sub Heading");
         assert_eq!(res.headings[1].anchor, "sub-heading");
+    }
+
+    #[test]
+    fn test_render_setext_heading_does_not_desync_outline_anchors() {
+        // `extract_headings` (used for the outline) only recognizes ATX (`#`) headings,
+        // so a setext heading (underlined with `===`) is invisible to it but is still a
+        // real heading to pulldown-cmark. Regression test for a bug where this caused
+        // every subsequent ATX heading's rendered `id` to be assigned the wrong outline
+        // entry's anchor (see M-outline-click-to-scroll-fix).
+        let md = r#"Intro Section
+=============
+
+Some text.
+
+# Components
+
+Some component text.
+
+## Motion Semantics
+
+Some motion text.
+"#;
+        let res = render_note_markdown(md, "dark", None, None);
+        // The outline (from extract_headings) only sees the two ATX headings.
+        assert_eq!(res.headings.len(), 2);
+        assert_eq!(res.headings[0].text, "Components");
+        assert_eq!(res.headings[0].anchor, "components");
+        assert_eq!(res.headings[1].text, "Motion Semantics");
+        assert_eq!(res.headings[1].anchor, "motion-semantics");
+        // The rendered HTML must assign each ATX heading its own matching anchor,
+        // not the next outline entry's anchor shifted by the invisible setext heading.
+        assert!(res.html.contains("id=\"components\">Components"));
+        assert!(res
+            .html
+            .contains("id=\"motion-semantics\">Motion Semantics"));
     }
 
     #[test]

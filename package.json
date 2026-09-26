@@ -19,6 +19,7 @@
     "@codemirror/search": "^6.5.9",
     "@codemirror/state": "^6.5.2",
     "@codemirror/view": "^6.36.4",
+    "@lezer/highlight": "^1.2.3",
     "@tauri-apps/api": "^2.3.0",
     "@tauri-apps/plugin-clipboard-manager": "^2.3.3",
     "clsx": "^2.1.1",

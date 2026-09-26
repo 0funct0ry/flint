@@ -33,7 +33,7 @@ jobs:
       - name: Approve build scripts
         run: pnpm approve-builds --all
       - name: Build Flint.app bundle (M10.04)
-        run: cargo tauri build --bundles app
+        run: pnpm exec tauri build --bundles app
 
   frontend:
     name: Frontend Checks

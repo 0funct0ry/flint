@@ -5,7 +5,8 @@ import { EditorView, keymap, highlightActiveLine, drawSelection, Decoration, Dec
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { searchKeymap, openSearchPanel } from '@codemirror/search';
-import { bracketMatching } from '@codemirror/language';
+import { bracketMatching, HighlightStyle, syntaxHighlighting } from '@codemirror/language';
+import { tags } from '@lezer/highlight';
 import { autocompletion, CompletionContext, CompletionResult } from '@codemirror/autocomplete';
 import { ViewMode } from './TitleBar';
 import { NoteFixture, NoteMeta, TreeNodeItem } from '../types';
@@ -295,6 +296,23 @@ function findLinkAtPos(lineText: string, col: number): { target: string; isExter
   return null;
 }
 
+// Maps markdown syntax to the existing --kw/--str/--lnk/--cmt/--hd theme tokens (index.css)
+// rather than introducing a separate highlight-only palette.
+const markdownHighlightStyle = HighlightStyle.define([
+  { tag: tags.heading, color: 'var(--hd)', fontWeight: 600 },
+  { tag: tags.strong, color: 'var(--kw)', fontWeight: 700 },
+  { tag: tags.emphasis, color: 'var(--kw)', fontStyle: 'italic' },
+  { tag: tags.strikethrough, color: 'var(--faint)', textDecoration: 'line-through' },
+  { tag: tags.link, color: 'var(--lnk)', textDecoration: 'underline' },
+  { tag: tags.url, color: 'var(--lnk)' },
+  { tag: tags.monospace, color: 'var(--str)', fontFamily: 'var(--mono)' },
+  { tag: tags.quote, color: 'var(--muted)', fontStyle: 'italic' },
+  { tag: tags.list, color: 'var(--accent)' },
+  { tag: tags.contentSeparator, color: 'var(--border)' },
+  { tag: tags.processingInstruction, color: 'var(--cmt)' },
+  { tag: tags.meta, color: 'var(--cmt)' },
+]);
+
 export const CenterPane: React.FC<CenterPaneProps> = ({
   note,
   viewMode,
@@ -324,6 +342,23 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   const editorContainerRef = useRef<HTMLDivElement>(null);
   const readerContainerRef = useRef<HTMLDivElement>(null);
   const editorViewRef = useRef<EditorView | null>(null);
+
+  // Active while an outline/search jump is scrolling the panes. Scroll-spy and split-view sync
+  // stand down meanwhile; otherwise the sync drags the reader to the editor's top line and the
+  // spy overwrites the clicked heading's highlight with whatever heading sits there.
+  const programmaticScrollRef = useRef<{ active: boolean; timer: ReturnType<typeof setTimeout> | null }>({
+    active: false,
+    timer: null,
+  });
+  const holdProgrammaticScroll = (ms: number) => {
+    const s = programmaticScrollRef.current;
+    s.active = true;
+    if (s.timer) clearTimeout(s.timer);
+    s.timer = setTimeout(() => {
+      s.active = false;
+      s.timer = null;
+    }, ms);
+  };
 
   const onContentChangeRef = useRef(onContentChange);
   onContentChangeRef.current = onContentChange;
@@ -491,6 +526,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     if (!scrollToAnchor || !readerContainerRef.current) return;
     const targetElem = readerContainerRef.current.querySelector(`#${CSS.escape(scrollToAnchor)}`);
     if (targetElem) {
+      holdProgrammaticScroll(400);
       targetElem.scrollIntoView({ behavior: 'smooth', block: 'start' });
     }
   }, [scrollToAnchor]);
@@ -500,6 +536,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     if (!scrollToLine || scrollToLine < 1) return;
 
     if (editorViewRef.current) {
+      holdProgrammaticScroll(400);
       const view = editorViewRef.current;
       const totalLines = view.state.doc.lines;
       const targetLine = Math.min(Math.max(1, scrollToLine), totalLines);
@@ -519,6 +556,11 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     if (!reader || !onHeadingInView) return;
 
     const handleScroll = () => {
+      if (programmaticScrollRef.current.active) {
+        // Keep holding until the smooth scroll has been quiet for a moment.
+        holdProgrammaticScroll(150);
+        return;
+      }
       const headings = reader.querySelectorAll('h1, h2, h3, h4, h5, h6');
       let currentAnchor = '';
       const readerTop = reader.getBoundingClientRect().top;
@@ -538,6 +580,24 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     reader.addEventListener('scroll', handleScroll, { passive: true });
     return () => reader.removeEventListener('scroll', handleScroll);
   }, [onHeadingInView, note.renderedHtml]);
+
+  useEffect(() => {
+    const release = () => {
+      const s = programmaticScrollRef.current;
+      if (s.timer) clearTimeout(s.timer);
+      s.active = false;
+      s.timer = null;
+    };
+    const targets = [editorContainerRef.current, readerContainerRef.current].filter(
+      (el): el is HTMLDivElement => el !== null,
+    );
+    const events = ['wheel', 'touchstart', 'keydown', 'mousedown'] as const;
+    targets.forEach((el) => events.forEach((ev) => el.addEventListener(ev, release, { passive: true })));
+    return () => {
+      targets.forEach((el) => events.forEach((ev) => el.removeEventListener(ev, release)));
+      release();
+    };
+  }, []);
 
   // Synchronized scrolling in split view with source-line mapping (SPEC §8.1)
   useEffect(() => {
@@ -564,6 +624,10 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     };
 
     const handleEditorScroll = () => {
+      if (programmaticScrollRef.current.active) {
+        holdProgrammaticScroll(150);
+        return;
+      }
       if (scrollSource === 'reader') return;
       scrollSource = 'editor';
 
@@ -597,6 +661,10 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     };
 
     const handleReaderScroll = () => {
+      if (programmaticScrollRef.current.active) {
+        holdProgrammaticScroll(150);
+        return;
+      }
       if (scrollSource === 'editor') return;
       scrollSource = 'reader';
 
@@ -862,6 +930,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
           highlightActiveLine(),
           EditorView.lineWrapping,
           markdown(),
+          syntaxHighlighting(markdownHighlightStyle),
           commentDecorationPlugin,
           autocompletion({
             override: [linkCompletionSource],

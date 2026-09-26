@@ -448,6 +448,21 @@ pub fn parse_front_matter(content: &str) -> (Option<String>, &str, Vec<String>) 
     (None, content, Vec::new())
 }
 
+/// Normalize heading text to a slug: lowercase, non-alphanumeric runs become
+/// single hyphens. Formatting markup (`**`, `_`, `[`, `]`, ...) collapses away
+/// like any other non-alphanumeric run, so this is stable across representations
+/// of the same heading (e.g. raw Markdown text vs. its rendered plain text).
+pub fn slugify(text: &str) -> String {
+    text.to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
 /// Disambiguate a heading slug against slugs already seen in the same note,
 /// appending `-2`, `-3`, ... on repeats (matching common Markdown renderer
 /// conventions), so every heading in a note gets a unique anchor even when
@@ -490,16 +505,7 @@ pub fn extract_headings(content: &str) -> Vec<HeadingItem> {
                 } else if c.is_whitespace() {
                     let text = chars.as_str().trim();
                     if !text.is_empty() {
-                        // Generate slug anchor
-                        let base_slug = text
-                            .to_lowercase()
-                            .chars()
-                            .map(|ch| if ch.is_alphanumeric() { ch } else { '-' })
-                            .collect::<String>()
-                            .split('-')
-                            .filter(|s| !s.is_empty())
-                            .collect::<Vec<_>>()
-                            .join("-");
+                        let base_slug = slugify(text);
                         let anchor = dedup_slug(&mut slug_counts, base_slug);
 
                         headings.push(HeadingItem {

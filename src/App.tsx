@@ -285,6 +285,26 @@ export const App: React.FC = () => {
         setIsDirty(false);
         setShowConflictBanner(false);
 
+        // Re-render through the real backend pipeline so the reader pane picks up anything the
+        // JS fallback renderer can't reflect live (e.g. table column alignment) — mirrors
+        // `loadNote`'s render call, but keyed on the just-saved content rather than a fresh read.
+        api.noteRender(path, content, theme).then((renderRes) => {
+          setNoteState((prev) => {
+            const cur = prev[path];
+            if (!cur) return prev;
+            return {
+              ...prev,
+              [path]: {
+                ...cur,
+                renderedHtml: renderRes.html,
+                headings: renderRes.headings && renderRes.headings.length > 0 ? renderRes.headings : cur.headings,
+              },
+            };
+          });
+        }).catch((err) => {
+          console.warn(`Failed to re-render note ${path} after save:`, err);
+        });
+
         // Update stats and backlinks after save (M7)
         refreshStats();
         if (currentNotePath) {
@@ -331,7 +351,7 @@ export const App: React.FC = () => {
         }
       }
     },
-    [currentNotePath, refreshStats]
+    [currentNotePath, refreshStats, theme]
   );
 
   // Load workspace, tree, and listen to index events on mount (SPEC §6.2, §11, M7)

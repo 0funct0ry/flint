@@ -149,6 +149,89 @@ describe("LeftSidebar", () => {
     expect(screen.getByText("Permission denied accessing /secret")).toBeInTheDocument();
   });
 
+  // A tree whose folder names aren't in LeftSidebar's hardcoded default-expanded set
+  // (['projects', 'projects/payments', 'archive', 'reading', 'guides']), so these two tests can
+  // rely on "docs" genuinely starting collapsed.
+  const collapsibleTree: TreeNodeItem[] = [
+    {
+      id: "docs",
+      name: "docs",
+      path: "docs",
+      is_folder: true,
+      children: [
+        {
+          id: "docs/guide.md",
+          name: "guide.md",
+          path: "docs/guide.md",
+          is_folder: false,
+          is_note: true,
+        },
+      ],
+    },
+    { id: "daily.md", name: "daily.md", path: "daily.md", is_folder: false, is_note: true },
+  ];
+
+  it("auto-expands the target folder when a create-note/create-folder action starts on it", () => {
+    // "docs" starts collapsed, so its child inline-create row would otherwise mount nowhere
+    // until the user manually opened it first.
+    render(
+      <LeftSidebar
+        {...defaultProps}
+        treeData={collapsibleTree}
+        currentNotePath="daily.md"
+        inlineAction={{
+          type: "create-note",
+          targetPath: "docs",
+          initialValue: "Untitled.md",
+        }}
+      />
+    );
+
+    expect(screen.getByPlaceholderText("note-name")).toBeInTheDocument();
+  });
+
+  it("supports arrow-key navigation between rows and expand/collapse via Left/Right", () => {
+    render(<LeftSidebar {...defaultProps} treeData={collapsibleTree} currentNotePath="daily.md" />);
+
+    const docsRow = screen.getByText("docs").closest('[role="treeitem"]') as HTMLElement;
+    docsRow.focus();
+
+    // "docs" starts collapsed; Right expands it, revealing its child.
+    expect(screen.queryByText("guide.md")).not.toBeInTheDocument();
+    fireEvent.keyDown(docsRow, { key: "ArrowRight" });
+    expect(screen.getByText("guide.md")).toBeInTheDocument();
+
+    // Down moves focus to the next visible row.
+    fireEvent.keyDown(docsRow, { key: "ArrowDown" });
+    const guideRow = screen.getByText("guide.md").closest('[role="treeitem"]') as HTMLElement;
+    expect(guideRow).toHaveFocus();
+
+    // Left on a note (not a folder) hops up to its parent.
+    fireEvent.keyDown(guideRow, { key: "ArrowLeft" });
+    expect(docsRow).toHaveFocus();
+
+    // Left on an expanded folder collapses it.
+    fireEvent.keyDown(docsRow, { key: "ArrowLeft" });
+    expect(screen.queryByText("guide.md")).not.toBeInTheDocument();
+
+    // Up from the very first row has nothing above it and doesn't throw.
+    fireEvent.keyDown(docsRow, { key: "ArrowUp" });
+  });
+
+  it("opens the focused note on Enter and toggles a focused folder", () => {
+    const onSelect = vi.fn();
+    render(
+      <LeftSidebar {...defaultProps} treeData={collapsibleTree} currentNotePath="" onSelectNote={onSelect} />
+    );
+
+    const docsRow = screen.getByText("docs").closest('[role="treeitem"]') as HTMLElement;
+    fireEvent.keyDown(docsRow, { key: "Enter" });
+    const guideRow = screen.getByText("guide.md").closest('[role="treeitem"]') as HTMLElement;
+
+    fireEvent.keyDown(guideRow, { key: "Enter" });
+    expect(onSelect).toHaveBeenCalledWith("docs/guide.md");
+  });
+
   it("renders search tab controls and empty query state", () => {
     render(
       <LeftSidebar

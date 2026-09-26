@@ -354,14 +354,16 @@ button {
   line-height: 1.72 !important;
   font-family: var(--mono) !important;
 }
-.cm-content {
-  caret-color: var(--text) !important;
-}
-[data-theme="dark"] .cm-content {
-  caret-color: #FFFFFF !important;
-}
+/* Translucent so the drawn selection layer (painted behind the text) shows through on the
+   active line. */
 .cm-activeLine {
-  background-color: var(--panel-2) !important;
+  background-color: color-mix(in srgb, var(--panel-2) 55%, transparent) !important;
+}
+/* Same selection color focused or not, so the selection stays visible while the editor context
+   menu has focus. */
+.cm-editor .cm-selectionBackground,
+.cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground {
+  background: color-mix(in srgb, var(--accent) 38%, transparent) !important;
 }
 .cm-cursor,
 .cm-dropCursor,

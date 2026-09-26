@@ -24,7 +24,7 @@ jobs:
       - name: Install Node for Tauri build
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - uses: pnpm/action-setup@v3
         with:
           version: 11.0.4
@@ -45,7 +45,7 @@ jobs:
           version: 11.0.4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: 'pnpm'
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

@@ -84,11 +84,36 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   const [inlineValue, setInlineValue] = useState('');
   const [validationError, setValidationError] = useState<string | null>(null);
   const inlineInputRef = useRef<HTMLInputElement>(null);
+  const treeContainerRef = useRef<HTMLDivElement>(null);
+
+  // Keyboard tree navigation (Up/Down move focus between visible rows in document order;
+  // Left/Right collapse/expand a focused folder, or hop to its parent when already collapsed).
+  const getVisibleTreeItems = (): HTMLElement[] =>
+    Array.from(treeContainerRef.current?.querySelectorAll('[role="treeitem"]') ?? []) as HTMLElement[];
+
+  const focusTreeItemByPath = (path: string) => {
+    if (!path) return;
+    const el = treeContainerRef.current?.querySelector<HTMLElement>(`[data-path="${CSS.escape(path)}"]`);
+    el?.focus();
+  };
 
   useEffect(() => {
     if (inlineAction) {
       setInlineValue(inlineAction.initialValue);
       setValidationError(null);
+
+      // The inline create-note/create-folder row only renders inside its parent's expanded
+      // children — expand that parent now, or a create action started on a collapsed folder
+      // would mount nowhere and stay invisible until the user happens to toggle it open.
+      if (
+        (inlineAction.type === 'create-note' || inlineAction.type === 'create-folder') &&
+        inlineAction.targetPath
+      ) {
+        setExpandedFolders((prev) =>
+          prev.has(inlineAction.targetPath) ? prev : new Set(prev).add(inlineAction.targetPath)
+        );
+      }
+
       setTimeout(() => {
         if (inlineInputRef.current) {
           inlineInputRef.current.focus();
@@ -460,6 +485,10 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
                 }}
                 onBlur={handleInlineSubmit}
                 placeholder={inlineAction.type === 'create-folder' ? 'folder-name' : 'note-name'}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
                 className="w-full bg-transparent text-[13px] text-[var(--text)] focus:outline-none"
               />
             </div>
@@ -516,6 +545,10 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
                         }
                       }}
                       onBlur={handleInlineSubmit}
+                      autoComplete="off"
+                      autoCorrect="off"
+                      autoCapitalize="off"
+                      spellCheck={false}
                       className="w-full bg-transparent text-[13px] text-[var(--text)] focus:outline-none"
                     />
                   </div>
@@ -530,6 +563,8 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
                   role="treeitem"
                   aria-selected={isSelected}
                   aria-expanded={isFolder ? isExpanded : undefined}
+                  data-path={item.path}
+                  data-parent={currentParent}
                   draggable
                   onDragStart={(e) => handleDragStart(e, item)}
                   onDragOver={(e) => handleDragOver(e, item)}
@@ -551,12 +586,45 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
                     } else if (e.key === 'Delete' || e.key === 'Backspace') {
                       e.preventDefault();
                       onDeleteItem(item.path, isFolder, e.shiftKey || e.altKey);
+                    } else if (e.key === 'Enter') {
+                      e.preventDefault();
+                      if (isFolder) {
+                        toggleFolder(item.path);
+                        onSelectFolder?.(item.path);
+                      } else if (isNote) {
+                        onSelectNote(item.path);
+                        onSelectFolder?.(currentParent);
+                      }
+                    } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                      e.preventDefault();
+                      const items = getVisibleTreeItems();
+                      const idx = items.indexOf(e.currentTarget);
+                      const next = items[idx + (e.key === 'ArrowDown' ? 1 : -1)];
+                      next?.focus();
+                    } else if (e.key === 'ArrowRight') {
+                      if (isFolder) {
+                        e.preventDefault();
+                        if (!isExpanded) {
+                          toggleFolder(item.path);
+                        } else {
+                          const items = getVisibleTreeItems();
+                          items[items.indexOf(e.currentTarget) + 1]?.focus();
+                        }
+                      }
+                    } else if (e.key === 'ArrowLeft') {
+                      if (isFolder && isExpanded) {
+                        e.preventDefault();
+                        toggleFolder(item.path);
+                      } else if (currentParent) {
+                        e.preventDefault();
+                        focusTreeItemByPath(currentParent);
+                      }
                     }
                   }}
                   tabIndex={0}
                   style={{ paddingLeft: `${depth * 14 + 10}px` }}
-                  className={`group flex items-center gap-2 h-[26px] pr-2 text-[var(--text-2)] cursor-pointer whitespace-nowrap select-none rounded-[4px] mx-1 hover:bg-[var(--panel-2)] transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent)] ${
-                    isSelected ? 'bg-[#2b3040] text-[#ffffff] font-medium' : ''
+                  className={`group flex items-center gap-2 h-[26px] pr-2 text-[var(--text-2)] cursor-pointer whitespace-nowrap select-none rounded-[4px] mx-1 hover:bg-[var(--panel-2)] transition-colors focus:outline-none focus:ring-1 focus:ring-inset focus:ring-[var(--accent)] ${
+                    isSelected ? 'bg-[#2b3040] text-[#ffffff] font-medium' : 'focus:bg-[var(--sel)] focus:text-[var(--text)]'
                   } ${isDropTarget ? 'ring-2 ring-[var(--accent)] bg-[var(--accent-soft)]' : ''} ${
                     !isNote && !isFolder ? 'text-[var(--text-2)] opacity-80' : ''
                   }`}
@@ -711,6 +779,7 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
         {/* WORKSPACE TREE TAB */}
         {activeTab === 'tree' && (
           <div
+            ref={treeContainerRef}
             role="tree"
             aria-label="Workspace file tree"
             tabIndex={0}

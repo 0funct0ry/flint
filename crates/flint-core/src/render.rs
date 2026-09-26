@@ -638,13 +638,19 @@ pub fn render_note_markdown(
                     custom_events.push(Event::Html(CowStr::Boxed(missing_html.into_boxed_str())));
                 }
             }
-            Event::Start(Tag::Table(_)) => {
+            Event::Start(Tag::Table(alignments)) => {
+                // Wrap in a scrolling container, but still forward the original `Table` event
+                // (with its column alignments) to `html::push_html` — it tracks alignment state
+                // internally and needs to see this event to emit `style="text-align: …"` on each
+                // `<th>`/`<td>`, not just the synthetic wrapper markup.
                 custom_events.push(Event::Html(CowStr::Borrowed(
-                    "<div class=\"table-container\" style=\"overflow-x:auto;\"><table>",
+                    "<div class=\"table-container\" style=\"overflow-x:auto;\">",
                 )));
+                custom_events.push(Event::Start(Tag::Table(alignments)));
             }
             Event::End(TagEnd::Table) => {
-                custom_events.push(Event::Html(CowStr::Borrowed("</table></div>")));
+                custom_events.push(Event::End(TagEnd::Table));
+                custom_events.push(Event::Html(CowStr::Borrowed("</div>")));
             }
             other => {
                 if current_heading_level.is_none() && !in_image {
@@ -791,6 +797,30 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_render_table_column_alignment_survives_sanitization() {
+        let md = "| Left | Center | Right | None |\n\
+                  |:---|:---:|---:|---|\n\
+                  | a | b | c | d |\n";
+        let res = render_note_markdown(md, "dark", None, None);
+        assert!(res
+            .html
+            .contains(r#"<th style="text-align: left">Left</th>"#));
+        assert!(res
+            .html
+            .contains(r#"<th style="text-align: center">Center</th>"#));
+        assert!(res
+            .html
+            .contains(r#"<th style="text-align: right">Right</th>"#));
+        assert!(res.html.contains("<th>None</th>"));
+        assert!(res.html.contains(r#"<td style="text-align: left">a</td>"#));
+        assert!(res
+            .html
+            .contains(r#"<td style="text-align: center">b</td>"#));
+        assert!(res.html.contains(r#"<td style="text-align: right">c</td>"#));
+        assert!(res.html.contains("<td>d</td>"));
+    }
 
     #[test]
     fn test_render_front_matter_skip_and_headings() {

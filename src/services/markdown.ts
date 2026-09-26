@@ -69,8 +69,14 @@ export function renderMarkdownToHtml(markdown: string): string {
 
   let inList: 'ul' | 'ol' | null = null;
   let inTable = false;
+  let tableAlignments: Array<'left' | 'center' | 'right' | null> = [];
+  let pendingHeaderCells: string[] | null = null;
   let paragraphBuffer: string[] = [];
   const slugCounts = new Map<string, number>();
+
+  function alignmentStyle(align: 'left' | 'center' | 'right' | null): string {
+    return align ? ` style="text-align: ${align}"` : '';
+  }
 
   function flushParagraph() {
     if (paragraphBuffer.length > 0) {
@@ -95,8 +101,18 @@ export function renderMarkdownToHtml(markdown: string): string {
 
   function flushTable() {
     if (inTable) {
+      if (pendingHeaderCells) {
+        // Table ended right after its header, with no separator row at all — emit it plain.
+        htmlOutput.push(`<div style="overflow-x:auto"><table><thead><tr>`);
+        pendingHeaderCells.forEach((cell) => {
+          htmlOutput.push(`<th>${formatInline(cell)}</th>`);
+        });
+        htmlOutput.push(`</tr></thead><tbody>`);
+        pendingHeaderCells = null;
+      }
       htmlOutput.push(`</tbody></table></div>`);
       inTable = false;
+      tableAlignments = [];
     }
   }
 
@@ -182,23 +198,50 @@ export function renderMarkdownToHtml(markdown: string): string {
         .split('|')
         .map((c) => c.trim());
 
-      // Check if separator line (e.g. |---|---|)
+      // Check if separator line (e.g. |---|---|), capturing each column's `:---:`-style
+      // alignment marker. The header row is buffered rather than emitted immediately, since
+      // its alignment isn't known until this separator (the line right after it) is parsed.
       const isSeparator = cells.every((c) => /^:?-+:?$/.test(c));
-      if (isSeparator) {
+      if (isSeparator && pendingHeaderCells) {
+        tableAlignments = cells.map((c) => {
+          const left = c.startsWith(':');
+          const right = c.endsWith(':');
+          if (left && right) return 'center';
+          if (right) return 'right';
+          if (left) return 'left';
+          return null;
+        });
+        htmlOutput.push(`<div style="overflow-x:auto"><table><thead><tr>`);
+        pendingHeaderCells.forEach((cell, i) => {
+          htmlOutput.push(`<th${alignmentStyle(tableAlignments[i] ?? null)}>${formatInline(cell)}</th>`);
+        });
+        htmlOutput.push(`</tr></thead><tbody>`);
+        pendingHeaderCells = null;
         continue;
       }
 
       if (!inTable) {
         inTable = true;
+        tableAlignments = [];
+        pendingHeaderCells = cells;
+      } else if (pendingHeaderCells) {
+        // Malformed table (header not followed by a separator row) — emit the buffered header
+        // with no alignment, then fall through to render this line as a body row.
         htmlOutput.push(`<div style="overflow-x:auto"><table><thead><tr>`);
-        cells.forEach((cell) => {
+        pendingHeaderCells.forEach((cell) => {
           htmlOutput.push(`<th>${formatInline(cell)}</th>`);
         });
         htmlOutput.push(`</tr></thead><tbody>`);
-      } else {
+        pendingHeaderCells = null;
         htmlOutput.push(`<tr>`);
         cells.forEach((cell) => {
           htmlOutput.push(`<td>${formatInline(cell)}</td>`);
+        });
+        htmlOutput.push(`</tr>`);
+      } else {
+        htmlOutput.push(`<tr>`);
+        cells.forEach((cell, i) => {
+          htmlOutput.push(`<td${alignmentStyle(tableAlignments[i] ?? null)}>${formatInline(cell)}</td>`);
         });
         htmlOutput.push(`</tr>`);
       }

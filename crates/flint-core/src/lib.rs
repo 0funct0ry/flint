@@ -1279,9 +1279,9 @@ pub fn build_workspace_tree(
         }
 
         // Sort folders case-insensitively
-        folders.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        folders.sort_by_key(|a| a.name.to_lowercase());
         // Sort files case-insensitively
-        files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        files.sort_by_key(|a| a.name.to_lowercase());
 
         let mut all = folders;
         all.extend(files);
@@ -1733,7 +1733,7 @@ pub fn rewrite_markdown_links(
     }
 
     // Sort replacements descending by start position to apply from back to front
-    replacements.sort_by(|a, b| b.0.cmp(&a.0));
+    replacements.sort_by_key(|a| std::cmp::Reverse(a.0));
 
     let mut updated = content.to_string();
     let count = replacements.len();

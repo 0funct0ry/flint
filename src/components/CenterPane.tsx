@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import katex from 'katex';
 import { EditorSelection, EditorState, Prec } from '@codemirror/state';
-import { EditorView, keymap, highlightActiveLine, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from '@codemirror/view';
+import { EditorView, keymap, highlightActiveLine, drawSelection, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { searchKeymap, openSearchPanel } from '@codemirror/search';
@@ -11,8 +11,10 @@ import { ViewMode } from './TitleBar';
 import { NoteFixture, NoteMeta, TreeNodeItem } from '../types';
 import { ConflictBanner } from './ConflictBanner';
 import { ContextMenu, ContextMenuItem } from './ContextMenu';
+import { TableBuilderModal, TableBuilderInitial } from './TableBuilderModal';
 import { commandRegistry } from '../commands/registry';
 import * as ec from '../commands/editorCommands';
+import { parseDelimitedSelection, ColumnAlignment } from '../commands/tableBuilder';
 
 export interface CenterPaneProps {
   note: NoteFixture;
@@ -172,6 +174,14 @@ function getAllNotePaths(tree: TreeNodeItem[]): Array<{ path: string; title?: st
   return result;
 }
 
+/**
+ * Bridge from the module-level `EDITOR_COMMANDS` table (shared across the palette, keymap, and
+ * context menu) into the single mounted `CenterPane` instance's React state — the only command
+ * that needs to open a modal rather than dispatch straight into CodeMirror. Set on mount, cleared
+ * on unmount.
+ */
+let openTableBuilder: ((view: EditorView) => void) | null = null;
+
 interface EditorCommandDef {
   id: string;
   title: string;
@@ -192,6 +202,7 @@ const EDITOR_COMMANDS: EditorCommandDef[] = [
   // Insert — always available.
   { id: 'editor.insert_footnote', title: 'Footnote', key: 'Mod-Alt-f', shortcutDisplay: '⌘⌥F', section: 'insert', run: ec.insertFootnote },
   { id: 'editor.insert_table', title: 'Table', key: 'Mod-Alt-t', shortcutDisplay: '⌘⌥T', section: 'insert', run: ec.insertTable },
+  { id: 'editor.insert_table_builder', title: 'Table Builder', key: 'Mod-Alt-Shift-t', shortcutDisplay: '⌘⌥⇧T', section: 'insert', run: (view) => { openTableBuilder?.(view); return true; } },
   { id: 'editor.insert_callout', title: 'Callout', key: 'Mod-Alt-q', shortcutDisplay: '⌘⌥Q', section: 'insert', run: ec.insertCallout() },
   { id: 'editor.insert_hr', title: 'Horizontal Rule', key: 'Mod-Alt-h', shortcutDisplay: '⌘⌥H', section: 'insert', run: ec.insertHorizontalRule },
   { id: 'editor.insert_code_block', title: 'Code Block', key: 'Mod-Alt-c', shortcutDisplay: '⌘⌥C', section: 'insert', run: ec.insertCodeBlock },
@@ -350,6 +361,59 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   const loadedNotePathRef = useRef<string>('');
 
   const [contextMenuState, setContextMenuState] = useState<{ x: number; y: number } | null>(null);
+
+  const [tableBuilderState, setTableBuilderState] = useState<{
+    initial: TableBuilderInitial;
+    selectionRange: { from: number; to: number } | null;
+  } | null>(null);
+
+  // Bridge `editor.insert_table_builder`'s `run` (defined once, module-level, in
+  // `EDITOR_COMMANDS`) into this instance's modal state — see `openTableBuilder`'s doc comment.
+  useEffect(() => {
+    openTableBuilder = (view) => {
+      const { state } = view;
+      const range = state.selection.main;
+      const selectedText = state.sliceDoc(range.from, range.to);
+      const parsed = range.empty ? null : parseDelimitedSelection(selectedText);
+
+      const initial: TableBuilderInitial = parsed
+        ? {
+            headers: parsed.headers,
+            alignments: parsed.headers.map(() => 'none' as ColumnAlignment),
+            bodyRowCount: Math.max(1, parsed.bodyRowCount),
+            detectedDelimiter: parsed.delimiter,
+          }
+        : {
+            headers: ['', ''],
+            alignments: ['none', 'none'],
+            bodyRowCount: 1,
+          };
+
+      setTableBuilderState({
+        initial,
+        selectionRange: parsed ? { from: range.from, to: range.to } : null,
+      });
+    };
+    return () => {
+      openTableBuilder = null;
+    };
+  }, []);
+
+  const handleTableBuilderInsert = (markdown: string, replaceSelection: boolean) => {
+    const view = editorViewRef.current;
+    setTableBuilderState(null);
+    if (!view) return;
+    view.focus();
+    const { state } = view;
+    const from = replaceSelection && tableBuilderState?.selectionRange ? tableBuilderState.selectionRange.from : state.selection.main.head;
+    const to = replaceSelection && tableBuilderState?.selectionRange ? tableBuilderState.selectionRange.to : state.selection.main.head;
+    // Cursor lands in the first header cell: right after "| " on the first line.
+    const firstCellOffset = 2;
+    view.dispatch({
+      changes: { from, to, insert: markdown },
+      selection: EditorSelection.cursor(from + firstCellOffset),
+    });
+  };
 
   // Register every Insert/Format/Paragraph/link/clipboard command once, per SPEC §9.3 — the
   // handler always reads the currently-mounted EditorView from the ref, so this stays correct
@@ -632,7 +696,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     ];
 
     const insertSubmenu: ContextMenuItem[] = [
-      ...byIds('editor.insert_footnote', 'editor.insert_table', 'editor.insert_callout', 'editor.insert_hr'),
+      ...byIds('editor.insert_footnote', 'editor.insert_table', 'editor.insert_table_builder', 'editor.insert_callout', 'editor.insert_hr'),
       sep('insert-sep-1'),
       ...byIds('editor.insert_code_block', 'editor.insert_math_block'),
     ];
@@ -791,6 +855,9 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
         doc: note.content,
         extensions: [
           history(),
+          // CodeMirror-drawn selection layer instead of the native one, so the selection stays
+          // visible when focus moves elsewhere (e.g. into the editor context menu).
+          drawSelection(),
           bracketMatching(),
           highlightActiveLine(),
           EditorView.lineWrapping,
@@ -1035,6 +1102,15 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
               y={contextMenuState.y}
               items={buildMenuItems()}
               onClose={() => setContextMenuState(null)}
+            />
+          )}
+
+          {tableBuilderState && (
+            <TableBuilderModal
+              isOpen={true}
+              initial={tableBuilderState.initial}
+              onInsert={handleTableBuilderInsert}
+              onCancel={() => setTableBuilderState(null)}
             />
           )}
 

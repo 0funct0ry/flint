@@ -154,12 +154,13 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
     }
 
     // Scroll selected treeitem into view if present
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       const selectedEl = document.querySelector('[role="treeitem"][aria-selected="true"]');
       if (selectedEl) {
         selectedEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
       }
     }, 50);
+    return () => clearTimeout(timer);
   }, [currentNotePath]);
 
   // Search panel state

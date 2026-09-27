@@ -3,6 +3,7 @@ import { render, screen, fireEvent, act } from '@testing-library/react';
 import { CenterPane } from '../components/CenterPane';
 import { commandRegistry } from '../commands/registry';
 import { NoteFixture } from '../types';
+import { SettingsProvider } from '../context/SettingsContext';
 
 describe('Table builder (M10.08)', () => {
   const sampleNote: NoteFixture = {
@@ -20,19 +21,22 @@ describe('Table builder (M10.08)', () => {
 
   it('opens via editor.insert_table_builder and inserts a blank 2x1 table at the cursor', async () => {
     render(
-      <CenterPane
-        note={sampleNote}
-        viewMode="edit"
-        isDirty={false}
-        onContentChange={vi.fn()}
-        onNavigateRelative={vi.fn()}
-        showConflictBanner={false}
-        onKeepVersion={vi.fn()}
-        onLoadFromDisk={vi.fn()}
-        onShowDifferences={vi.fn()}
-        onBack={vi.fn()}
-        onForward={vi.fn()}
-      />
+      <SettingsProvider>
+        <CenterPane
+          note={sampleNote}
+          viewMode="edit"
+          isDirty={false}
+          onContentChange={vi.fn()}
+          onNavigateRelative={vi.fn()}
+          showConflictBanner={false}
+          onKeepVersion={vi.fn()}
+          onLoadFromDisk={vi.fn()}
+          onShowDifferences={vi.fn()}
+          onBack={vi.fn()}
+          onForward={vi.fn()}
+        />
+
+      </SettingsProvider>
     );
 
     act(() => {
@@ -51,19 +55,22 @@ describe('Table builder (M10.08)', () => {
 
   it('supports Escape to cancel without inserting', async () => {
     render(
-      <CenterPane
-        note={sampleNote}
-        viewMode="edit"
-        isDirty={false}
-        onContentChange={vi.fn()}
-        onNavigateRelative={vi.fn()}
-        showConflictBanner={false}
-        onKeepVersion={vi.fn()}
-        onLoadFromDisk={vi.fn()}
-        onShowDifferences={vi.fn()}
-        onBack={vi.fn()}
-        onForward={vi.fn()}
-      />
+      <SettingsProvider>
+        <CenterPane
+          note={sampleNote}
+          viewMode="edit"
+          isDirty={false}
+          onContentChange={vi.fn()}
+          onNavigateRelative={vi.fn()}
+          showConflictBanner={false}
+          onKeepVersion={vi.fn()}
+          onLoadFromDisk={vi.fn()}
+          onShowDifferences={vi.fn()}
+          onBack={vi.fn()}
+          onForward={vi.fn()}
+        />
+
+      </SettingsProvider>
     );
 
     act(() => {

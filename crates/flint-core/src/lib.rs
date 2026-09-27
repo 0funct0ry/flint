@@ -5,7 +5,7 @@
 pub mod config;
 pub mod md_extensions;
 pub mod render;
-pub use config::{config_get, config_set};
+pub use config::{config_get, config_reset, config_set, validate_ignore_patterns};
 pub use render::{render_note_markdown, RenderResult};
 
 use serde::{Deserialize, Serialize};
@@ -1137,125 +1137,10 @@ pub fn resolve_workspace_root(
     }
 }
 
-/// Retrieve the path to the global Flint config file (SPEC §3.1, M10.04).
-/// Returns `$XDG_CONFIG_HOME/flint/config.json` if set, else `~/.config/flint/config.json`.
-pub fn get_global_config_path() -> Option<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.trim().is_empty() {
-            return Some(PathBuf::from(xdg).join("flint").join("config.json"));
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.trim().is_empty() {
-            return Some(
-                PathBuf::from(home)
-                    .join(".config")
-                    .join("flint")
-                    .join("config.json"),
-            );
-        }
-    }
-    None
-}
-
-/// Load the global configuration JSON, if present.
-pub fn load_global_config() -> Option<serde_json::Value> {
-    let path = get_global_config_path()?;
-    if !path.exists() {
-        return None;
-    }
-    let data = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
-}
-
-/// Read the remembered `lastWorkspace` path from global configuration, if it exists and is a directory.
-pub fn get_last_workspace() -> Option<PathBuf> {
-    let config = load_global_config()?;
-    let last_ws_str = config.get("lastWorkspace")?.as_str()?;
-    let path = PathBuf::from(last_ws_str);
-    if path.is_dir() {
-        path.canonicalize().ok()
-    } else {
-        None
-    }
-}
-
-/// Maximum number of entries kept in the `recentWorkspaces` list.
-const MAX_RECENT_WORKSPACES: usize = 8;
-
-/// Persist the `lastWorkspace` canonical path to the global configuration file, and push
-/// it to the front of `recentWorkspaces` (deduplicated, most-recent-first, capped).
-pub fn save_last_workspace(ws_root: &Path) -> Result<(), std::io::Error> {
-    let config_path = match get_global_config_path() {
-        Some(p) => p,
-        None => return Ok(()),
-    };
-
-    if let Some(parent) = config_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut config_val = if config_path.exists() {
-        fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .unwrap_or_else(|| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-
-    let canonical = ws_root
-        .canonicalize()
-        .unwrap_or_else(|_| ws_root.to_path_buf());
-    let canonical_str = canonical.display().to_string();
-
-    if let Some(obj) = config_val.as_object_mut() {
-        obj.insert(
-            "lastWorkspace".to_string(),
-            serde_json::Value::String(canonical_str.clone()),
-        );
-
-        let mut recent: Vec<String> = obj
-            .get("recentWorkspaces")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        recent.retain(|p| p != &canonical_str);
-        recent.insert(0, canonical_str);
-        recent.truncate(MAX_RECENT_WORKSPACES);
-
-        obj.insert(
-            "recentWorkspaces".to_string(),
-            serde_json::Value::Array(recent.into_iter().map(serde_json::Value::String).collect()),
-        );
-    }
-
-    let formatted = serde_json::to_string_pretty(&config_val)?;
-    fs::write(&config_path, formatted)?;
-    Ok(())
-}
-
-/// Read the remembered `recentWorkspaces` list from global configuration, most-recent-first.
-/// Entries that no longer exist as directories on disk are filtered out.
-pub fn get_recent_workspaces() -> Vec<PathBuf> {
-    let Some(config) = load_global_config() else {
-        return Vec::new();
-    };
-    let Some(entries) = config.get("recentWorkspaces").and_then(|v| v.as_array()) else {
-        return Vec::new();
-    };
-
-    entries
-        .iter()
-        .filter_map(|v| v.as_str())
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .collect()
-}
+pub use crate::config::{
+    get_global_config_path, get_last_workspace, get_recent_workspaces, load_global_config,
+    save_last_workspace,
+};
 
 /// Ensure `<workspace>/.flint/config.json` exists idempotently (SPEC §3.1, §12).
 pub fn bootstrap_workspace(root: &Path) -> Result<PathBuf, std::io::Error> {
@@ -1265,37 +1150,7 @@ pub fn bootstrap_workspace(root: &Path) -> Result<PathBuf, std::io::Error> {
     }
     let config_path = flint_dir.join("config.json");
     if !config_path.exists() {
-        let default_config = serde_json::json!({
-            "version": 1,
-            "theme": "system",
-            "editor": {
-                "fontSize": 14,
-                "fontFamily": "IBM Plex Mono",
-                "softWrap": true,
-                "tabSize": 2,
-                "showLineNumbers": false,
-                "vimMode": false
-            },
-            "markdown": {
-                "math": true,
-                "tables": true,
-                "footnotes": true,
-                "smartPunctuation": true
-            },
-            "behaviour": {
-                "autosaveMs": 400,
-                "rewriteLinksOnRename": true,
-                "deleteToTrash": true,
-                "newNoteFolder": "",
-                "defaultMode": "edit"
-            },
-            "ui": {
-                "leftSidebar": "tree",
-                "rightSidebarVisible": true,
-                "showNonNoteFiles": false
-            },
-            "ignore": ["node_modules/**", ".obsidian/**"]
-        });
+        let default_config = crate::config::FlintConfig::default();
         fs::write(&config_path, serde_json::to_string_pretty(&default_config)?)?;
     }
     Ok(config_path)
@@ -1321,6 +1176,7 @@ pub fn is_default_ignored(name: &str) -> bool {
 pub fn build_workspace_tree(
     root: &Path,
     show_non_note_files: bool,
+    ignore_patterns: &[String],
 ) -> Result<Vec<TreeNodeItem>, WorkspaceError> {
     if !root.exists() {
         return Err(WorkspaceError::NotFound(root.to_path_buf()));
@@ -1329,10 +1185,23 @@ pub fn build_workspace_tree(
         return Err(WorkspaceError::NotADirectory(root.to_path_buf()));
     }
 
+    let ignore_set = if ignore_patterns.is_empty() {
+        None
+    } else {
+        let mut builder = globset::GlobSetBuilder::new();
+        for pat in ignore_patterns {
+            if let Ok(glob) = globset::Glob::new(pat) {
+                builder.add(glob);
+            }
+        }
+        builder.build().ok()
+    };
+
     fn scan_dir(
         root: &Path,
         current: &Path,
         show_non_notes: bool,
+        ignore_set: &Option<globset::GlobSet>,
     ) -> Result<Vec<TreeNodeItem>, WorkspaceError> {
         let mut entries = match fs::read_dir(current) {
             Ok(rd) => rd,
@@ -1353,10 +1222,21 @@ pub fn build_workspace_tree(
 
             let rel_path = path.strip_prefix(root).unwrap_or(&path);
             let posix_rel = to_posix_path(rel_path);
-
             let is_dir = path.is_dir();
+
+            if let Some(set) = ignore_set {
+                // For a directory, also probe with a trailing slash: a pattern like
+                // "vendor/**" doesn't match the literal string "vendor", only paths under it,
+                // so without this an ignored directory would still show up (empty) in the tree.
+                let matched =
+                    set.is_match(&posix_rel) || (is_dir && set.is_match(format!("{posix_rel}/")));
+                if matched {
+                    continue;
+                }
+            }
+
             if is_dir {
-                let children = scan_dir(root, &path, show_non_notes)?;
+                let children = scan_dir(root, &path, show_non_notes, ignore_set)?;
                 folders.push(TreeNodeItem {
                     id: posix_rel.clone(),
                     name: name_str.to_string(),
@@ -1401,7 +1281,7 @@ pub fn build_workspace_tree(
         Ok(all)
     }
 
-    scan_dir(root, root, show_non_note_files)
+    scan_dir(root, root, show_non_note_files, &ignore_set)
 }
 
 /// Outcome of resolving a raw link target (SPEC §6.3).
@@ -2849,7 +2729,7 @@ mod tests {
         fs::write(root.join("LICENSE"), "MIT License").unwrap();
 
         // Tree without non-notes
-        let tree = build_workspace_tree(root, false).unwrap();
+        let tree = build_workspace_tree(root, false, &[]).unwrap();
         assert_eq!(tree.len(), 2); // projects/ (folder) and daily.md (note)
         assert_eq!(tree[0].name, "projects");
         assert!(tree[0].is_folder);
@@ -2857,8 +2737,28 @@ mod tests {
         assert_eq!(tree[1].title.as_deref(), Some("Daily Log"));
 
         // Tree with non-notes
-        let tree_with_all = build_workspace_tree(root, true).unwrap();
+        let tree_with_all = build_workspace_tree(root, true, &[]).unwrap();
         assert_eq!(tree_with_all.len(), 3); // projects/, daily.md, LICENSE
+    }
+
+    #[test]
+    fn workspace_tree_respects_configured_ignore_globs() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("vendor")).unwrap();
+        fs::write(root.join("vendor/lib.md"), "# Vendored").unwrap();
+        fs::write(root.join("keep.md"), "# Keep").unwrap();
+
+        // No ignore patterns: both notes present.
+        let tree = build_workspace_tree(root, false, &[]).unwrap();
+        assert_eq!(tree.len(), 2);
+
+        // With a configured glob not covered by the hardcoded baseline: vendor/ excluded.
+        let ignore = vec!["vendor/**".to_string()];
+        let tree = build_workspace_tree(root, false, &ignore).unwrap();
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].name, "keep.md");
     }
 
     #[test]

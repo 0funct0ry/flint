@@ -160,3 +160,73 @@ export interface DoctorReport {
   unreadable_files: string[];
 }
 
+// --- Config (SPEC §12, M10.1) ---------------------------------------------
+
+export type ConfigOrigin = "global" | "workspace";
+
+export interface ConfigNotice {
+  path: string;
+  field: string;
+  message: string;
+}
+
+export interface ConfigGetResult {
+  config: unknown;
+  origins: Record<string, ConfigOrigin>;
+  notice: ConfigNotice | null;
+}
+
+export interface EditorConfig {
+  fontSize: number;
+  fontFamily: string;
+  softWrap: boolean;
+  tabSize: number;
+  showLineNumbers: boolean;
+  vimMode: boolean;
+}
+
+export interface MarkdownConfig {
+  math: boolean;
+  tables: boolean;
+  footnotes: boolean;
+  smartPunctuation: boolean;
+}
+
+export interface BehaviourConfig {
+  autosaveMs: number;
+  rewriteLinksOnRename: boolean;
+  deleteToTrash: boolean;
+  newNoteFolder: string;
+  defaultMode: string;
+}
+
+export interface UiConfig {
+  leftSidebar: string;
+  rightSidebarVisible: boolean;
+  showNonNoteFiles: boolean;
+}
+
+export interface LayoutConfig {
+  splitOrientation?: 'horizontal' | 'vertical';
+  splitRatio?: number;
+  leftSidebarWidth?: number;
+  rightSidebarWidth?: number;
+  leftSidebarCollapsed?: boolean;
+  rightSidebarCollapsed?: boolean;
+  activeLeftTab?: string;
+  lastOpenNote?: string;
+  noteModes?: Record<string, string>; // path -> 'edit'|'read'|'split'
+}
+
+export interface FlintConfig {
+  version: number;
+  theme: string;
+  editor: EditorConfig;
+  markdown: MarkdownConfig;
+  behaviour: BehaviourConfig;
+  ui: UiConfig;
+  ignore: string[];
+  layout?: LayoutConfig;
+  [key: string]: unknown;
+}
+

@@ -186,7 +186,7 @@ fn run() -> Result<u8, (u8, String)> {
             .map_err(map_ws_error)?;
 
             let config_path = ws_root.join(".flint/config.json");
-            let tree = build_workspace_tree(&ws_root, false).map_err(map_ws_error)?;
+            let tree = build_workspace_tree(&ws_root, false, &[]).map_err(map_ws_error)?;
 
             let mut note_count = 0;
             fn count_notes(items: &[flint_core::TreeNodeItem]) -> usize {
@@ -310,7 +310,7 @@ fn run() -> Result<u8, (u8, String)> {
             )
             .map_err(map_ws_error)?;
 
-            let tree = build_workspace_tree(&ws_root, false).map_err(map_ws_error)?;
+            let tree = build_workspace_tree(&ws_root, false, &[]).map_err(map_ws_error)?;
 
             fn list_notes(
                 items: &[flint_core::TreeNodeItem],

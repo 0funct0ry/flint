@@ -16,6 +16,8 @@ import {
   TreeNodeItem,
   WorkspaceInfo,
   WorkspaceStats,
+  ConfigGetResult,
+  FlintConfig,
 } from "../types";
 import { FIXTURE_NOTES } from "../fixtures/workspace";
 import { renderMarkdownToHtml, slugify, dedupSlug } from "./markdown";
@@ -30,7 +32,78 @@ const browserMockStorage: Record<
   string,
   { content: string; hash: string; modified: number }
 > = {};
-const browserMockConfig: Record<string, unknown> = {};
+const DEFAULT_CONFIG: FlintConfig = {
+  version: 1,
+  theme: "system",
+  editor: {
+    fontSize: 14,
+    fontFamily: "IBM Plex Mono",
+    softWrap: true,
+    tabSize: 2,
+    showLineNumbers: false,
+    vimMode: false,
+  },
+  markdown: {
+    math: true,
+    tables: true,
+    footnotes: true,
+    smartPunctuation: true,
+  },
+  behaviour: {
+    autosaveMs: 400,
+    rewriteLinksOnRename: true,
+    deleteToTrash: true,
+    newNoteFolder: "",
+    defaultMode: "edit",
+  },
+  ui: {
+    leftSidebar: "tree",
+    rightSidebarVisible: true,
+    showNonNoteFiles: false,
+  },
+  ignore: ["node_modules/**", ".obsidian/**"],
+  layout: {},
+};
+
+const browserMockConfig: FlintConfig = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
+
+// Dotted paths explicitly overridden via configSet(), mirroring the real backend's
+// workspace-vs-global `origins` map (present = "workspace" override, absent = default).
+const browserMockOrigins: Record<string, "workspace"> = {};
+
+function getAtPath(obj: unknown, path: string): unknown {
+  const parts = path.split(".");
+  let cur: any = obj;
+  for (const part of parts) {
+    if (cur === null || cur === undefined) return undefined;
+    cur = cur[part];
+  }
+  return cur;
+}
+
+function setAtPath(obj: Record<string, unknown>, path: string, value: unknown): void {
+  const parts = path.split(".");
+  let cur: any = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i];
+    if (typeof cur[part] !== "object" || cur[part] === null) {
+      cur[part] = {};
+    }
+    cur = cur[part];
+  }
+  cur[parts[parts.length - 1]] = value;
+}
+
+function deleteAtPath(obj: Record<string, unknown>, path: string): void {
+  const parts = path.split(".");
+  let cur: any = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i];
+    if (typeof cur[part] !== "object" || cur[part] === null) return;
+    cur = cur[part];
+  }
+  delete cur[parts[parts.length - 1]];
+}
 const browserMockTree: TreeNodeItem[] = [
   {
     id: "projects",
@@ -588,19 +661,67 @@ export const api = {
     return [];
   },
 
+  /** Fetch a single dotted-path config value (unwraps the backend's ConfigGetResult). */
   async configGet<T = unknown>(key: string): Promise<T | null> {
     if (isTauriEnvironment()) {
-      return await invoke<T | null>("config_get", { key });
+      const result = await invoke<ConfigGetResult>("config_get", { key });
+      return (result.config as T) ?? null;
     }
-    const raw = browserMockConfig[key];
+    const raw = getAtPath(browserMockConfig, key);
     return raw === undefined ? null : (raw as T);
+  },
+
+  /** Fetch the full merged config plus per-path origins and any parse-failure notice. */
+  async configGetAll(): Promise<ConfigGetResult> {
+    if (isTauriEnvironment()) {
+      return await invoke<ConfigGetResult>("config_get", { key: null });
+    }
+    return {
+      config: JSON.parse(JSON.stringify(browserMockConfig)),
+      origins: { ...browserMockOrigins },
+      notice: null,
+    };
   },
 
   async configSet(key: string, value: unknown): Promise<void> {
     if (isTauriEnvironment()) {
       return await invoke<void>("config_set", { key, value });
     }
-    browserMockConfig[key] = value;
+    setAtPath(browserMockConfig as unknown as Record<string, unknown>, key, value);
+    browserMockOrigins[key] = "workspace";
+  },
+
+  async configReset(key: string): Promise<void> {
+    if (isTauriEnvironment()) {
+      return await invoke<void>("config_reset", { key });
+    }
+    const defaultValue = getAtPath(DEFAULT_CONFIG, key);
+    if (defaultValue === undefined) {
+      deleteAtPath(browserMockConfig as unknown as Record<string, unknown>, key);
+    } else {
+      setAtPath(browserMockConfig as unknown as Record<string, unknown>, key, JSON.parse(JSON.stringify(defaultValue)));
+    }
+    delete browserMockOrigins[key];
+  },
+
+  async configValidateIgnore(patterns: string[]): Promise<(string | null)[]> {
+    if (isTauriEnvironment()) {
+      return await invoke<(string | null)[]>("config_validate_ignore", { patterns });
+    }
+    // Dev-mode fallback: a simple glob-syntax sanity check, not a full validator.
+    return patterns.map((pattern) => {
+      const trimmed = pattern.trim();
+      if (!trimmed) return null;
+      const openBrackets = (trimmed.match(/\[/g) || []).length;
+      const closeBrackets = (trimmed.match(/\]/g) || []).length;
+      if (openBrackets !== closeBrackets) {
+        return "Unbalanced [ ] in glob pattern";
+      }
+      if (trimmed.includes("\0")) {
+        return "Pattern contains a NUL byte";
+      }
+      return null;
+    });
   },
 };
 

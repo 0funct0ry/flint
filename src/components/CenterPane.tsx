@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import katex from 'katex';
-import { EditorSelection, EditorState, Prec } from '@codemirror/state';
-import { EditorView, keymap, highlightActiveLine, drawSelection, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from '@codemirror/view';
+import { Compartment, EditorSelection, EditorState, Prec } from '@codemirror/state';
+import { EditorView, keymap, highlightActiveLine, drawSelection, lineNumbers, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { markdown } from '@codemirror/lang-markdown';
 import { searchKeymap, openSearchPanel } from '@codemirror/search';
@@ -18,6 +18,7 @@ import * as ec from '../commands/editorCommands';
 import { parseDelimitedSelection, ColumnAlignment } from '../commands/tableBuilder';
 import { setOutlineEditDispatcher } from '../services/outlineEditBridge';
 import { findTaskMarkers } from '../services/taskList';
+import { useSettings } from '../context/SettingsContext';
 
 export interface CenterPaneProps {
   note: NoteFixture;
@@ -344,6 +345,23 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   const editorContainerRef = useRef<HTMLDivElement>(null);
   const readerContainerRef = useRef<HTMLDivElement>(null);
   const editorViewRef = useRef<EditorView | null>(null);
+
+  const { config } = useSettings();
+
+  // Compartments (M10.1 task 6): let editor.fontSize/fontFamily/tabSize/showLineNumbers/softWrap
+  // be reconfigured live from Settings via view.dispatch({ effects: compartment.reconfigure(...) })
+  // without recreating the EditorState/EditorView — preserving cursor position and undo history.
+  const fontCompartmentRef = useRef(new Compartment());
+  const tabSizeCompartmentRef = useRef(new Compartment());
+  const lineNumbersCompartmentRef = useRef(new Compartment());
+  const lineWrappingCompartmentRef = useRef(new Compartment());
+
+  const fontTheme = (fontSize: number, fontFamily: string) =>
+    EditorView.theme({
+      '&': { fontSize: `${fontSize}px` },
+      '.cm-content': { fontFamily: `"${fontFamily}", monospace` },
+      '.cm-gutters': { fontFamily: `"${fontFamily}", monospace` },
+    });
 
   // Active while an outline/search jump is scrolling the panes. Scroll-spy and split-view sync
   // stand down meanwhile; otherwise the sync drags the reader to the editor's top line and the
@@ -944,7 +962,10 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
           drawSelection(),
           bracketMatching(),
           highlightActiveLine(),
-          EditorView.lineWrapping,
+          lineWrappingCompartmentRef.current.of(config.editor.softWrap ? [EditorView.lineWrapping] : []),
+          fontCompartmentRef.current.of(fontTheme(config.editor.fontSize, config.editor.fontFamily)),
+          tabSizeCompartmentRef.current.of(EditorState.tabSize.of(config.editor.tabSize)),
+          lineNumbersCompartmentRef.current.of(config.editor.showLineNumbers ? [lineNumbers()] : []),
           markdown(),
           syntaxHighlighting(markdownHighlightStyle),
           commentDecorationPlugin,
@@ -1049,7 +1070,53 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
         });
       }
     }
+    // The initial extensions bake in the config values at *creation* time only; live changes to
+    // them are applied by the reconfigure effects below via their own compartments, so config.*
+    // is deliberately excluded here — including it would recreate the EditorState on every
+    // settings change and drop cursor position / undo history.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [note.path, note.content, isDirty, savedCursorPos, savedScrollTop]);
+
+  // Live-preview settings (M10.1 task 6): reconfigure the relevant compartments in place on
+  // config change, instead of recreating the EditorState/EditorView — this keeps cursor
+  // position, scroll position, and undo history intact while typing.
+  useEffect(() => {
+    const view = editorViewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: fontCompartmentRef.current.reconfigure(
+        fontTheme(config.editor.fontSize, config.editor.fontFamily)
+      ),
+    });
+  }, [config.editor.fontSize, config.editor.fontFamily]);
+
+  useEffect(() => {
+    const view = editorViewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: tabSizeCompartmentRef.current.reconfigure(EditorState.tabSize.of(config.editor.tabSize)),
+    });
+  }, [config.editor.tabSize]);
+
+  useEffect(() => {
+    const view = editorViewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: lineNumbersCompartmentRef.current.reconfigure(
+        config.editor.showLineNumbers ? [lineNumbers()] : []
+      ),
+    });
+  }, [config.editor.showLineNumbers]);
+
+  useEffect(() => {
+    const view = editorViewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: lineWrappingCompartmentRef.current.reconfigure(
+        config.editor.softWrap ? [EditorView.lineWrapping] : []
+      ),
+    });
+  }, [config.editor.softWrap]);
 
   // Clean up on unmount
   useEffect(() => {

@@ -10,6 +10,8 @@ import { DiffViewer } from './components/DiffViewer';
 import { Toast, ToastMessage } from './components/Toast';
 import { DeleteConfirmModal } from './components/DeleteConfirmModal';
 import { UnresolvedLinksModal } from './components/UnresolvedLinksModal';
+import { SettingsPanel } from './components/SettingsPanel';
+import { useSettings } from './context/SettingsContext';
 import {
   FIXTURE_NOTES,
   FIXTURE_WORKSPACE_NAME,
@@ -39,11 +41,19 @@ interface HistoryEntry {
 }
 
 export const App: React.FC = () => {
+  const { config, loaded: settingsLoaded, refresh: refreshSettings, setField: setSettingsField } = useSettings();
   const [theme, setTheme] = useState<'light' | 'dark'>('dark');
   const [viewMode, setViewMode] = useState<ViewMode>('split');
   const [leftTab, setLeftTab] = useState<LeftTab>('tree');
   const [leftSidebarVisible, setLeftSidebarVisible] = useState(true);
   const [rightSidebarVisible, setRightSidebarVisible] = useState(true);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+
+  // Layout persistence (SPEC §12 `layout`, M10.1 task 7). Seeded from config.layout once the
+  // config first loads (see the settingsLoaded effect below) — a one-frame flash to these
+  // defaults is possible since the config fetch is async and happens after first mount.
+  const layoutSeededRef = useRef(false);
+  const layoutSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Live workspace state
   const [workspaceInfo, setWorkspaceInfo] = useState<WorkspaceInfo>({
@@ -371,6 +381,7 @@ export const App: React.FC = () => {
           if (info.start_collapsed) {
             setLeftSidebarVisible(false);
           }
+          void refreshSettings();
         }
         const tree = await api.workspaceTree(false);
         if (mounted) {
@@ -528,6 +539,53 @@ export const App: React.FC = () => {
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme);
   }, [theme]);
+
+  // Seed layout state (left/right sidebar visibility + active left tab) from config.layout the
+  // first time settings finish loading. Deferred to a `useEffect` rather than the initial
+  // `useState` value since the config fetch is async — this accepts a possible one-frame flash
+  // to the hardcoded defaults above rather than blocking first paint on the config round-trip.
+  useEffect(() => {
+    if (!settingsLoaded || layoutSeededRef.current) return;
+    layoutSeededRef.current = true;
+    const layout = config.layout;
+    if (!layout) return;
+    if (typeof layout.leftSidebarCollapsed === 'boolean') {
+      setLeftSidebarVisible(!layout.leftSidebarCollapsed);
+    }
+    if (typeof layout.rightSidebarCollapsed === 'boolean') {
+      setRightSidebarVisible(!layout.rightSidebarCollapsed);
+    }
+    if (layout.activeLeftTab) {
+      setLeftTab(layout.activeLeftTab as LeftTab);
+    }
+    if (layout.lastOpenNote) {
+      handleSelectNote(layout.lastOpenNote);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsLoaded]);
+
+  // Persist sidebar-visibility / active-tab layout changes, debounced (400-500ms) like the
+  // existing autosave pattern, so rapid toggles don't fire a config_set per event.
+  useEffect(() => {
+    if (!layoutSeededRef.current) return;
+    if (layoutSaveTimerRef.current) clearTimeout(layoutSaveTimerRef.current);
+    layoutSaveTimerRef.current = setTimeout(() => {
+      setSettingsField('layout.leftSidebarCollapsed', !leftSidebarVisible);
+      setSettingsField('layout.rightSidebarCollapsed', !rightSidebarVisible);
+      setSettingsField('layout.activeLeftTab', leftTab);
+    }, 450);
+    return () => {
+      if (layoutSaveTimerRef.current) clearTimeout(layoutSaveTimerRef.current);
+    };
+  }, [leftSidebarVisible, rightSidebarVisible, leftTab, setSettingsField]);
+
+  // Note navigation is low-frequency: persist `lastOpenNote` immediately, no debounce.
+  useEffect(() => {
+    if (!layoutSeededRef.current) return;
+    if (currentNotePath) {
+      setSettingsField('layout.lastOpenNote', currentNotePath);
+    }
+  }, [currentNotePath, setSettingsField]);
 
   // Recently opened workspaces, shown on the onboarding screen (M10.04)
   const [recentWorkspaces, setRecentWorkspaces] = useState<string[]>([]);
@@ -1118,6 +1176,14 @@ export const App: React.FC = () => {
       title: 'Toggle light / dark theme',
       handler: () => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark')),
     });
+
+    commandRegistry.register({
+      id: 'view.open_settings',
+      title: 'Settings',
+      shortcut: '⌘,',
+      shortcutDisplay: '⌘,',
+      handler: () => setSettingsOpen((prev) => !prev),
+    });
   }, [cycleViewMode, handleCloseNote, handleStartCreateFolder, handleStartCreateNote, saveNote]);
 
   // Global keydown listeners
@@ -1168,6 +1234,9 @@ export const App: React.FC = () => {
       } else if (mod && e.key.toLowerCase() === 'o') {
         e.preventDefault();
         handleOpenFolder();
+      } else if (mod && e.key === ',') {
+        e.preventDefault();
+        setSettingsOpen((prev) => !prev);
       }
     };
 
@@ -1253,13 +1322,13 @@ export const App: React.FC = () => {
         console.warn(`Failed to update outgoing links for ${targetPath}:`, err);
       });
 
-    // Debounce autosave 400ms
+    // Debounce autosave per config.behaviour.autosaveMs (settings-configurable, M10.1)
     if (autosaveTimerRef.current) {
       clearTimeout(autosaveTimerRef.current);
     }
     autosaveTimerRef.current = setTimeout(() => {
       saveNote(false);
-    }, 400);
+    }, config.behaviour.autosaveMs);
   };
 
   return (
@@ -1383,10 +1452,15 @@ export const App: React.FC = () => {
         onToggleLeftSidebar={() => setLeftSidebarVisible((prev) => !prev)}
         rightSidebarVisible={rightSidebarVisible}
         onToggleRightSidebar={() => setRightSidebarVisible((prev) => !prev)}
+        onOpenSettings={() => setSettingsOpen((prev) => !prev)}
       />
 
-      {/* Main body with sidebars & editor/reader */}
+      {/* Main body with sidebars & editor/reader, or the full-pane Settings panel (M10.1) */}
       <div className="flex-1 flex min-h-0">
+        {settingsOpen ? (
+          <SettingsPanel onClose={() => setSettingsOpen(false)} />
+        ) : (
+        <>
         {leftSidebarVisible && (
           <LeftSidebar
             activeTab={leftTab}
@@ -1481,6 +1555,8 @@ export const App: React.FC = () => {
             onClose={() => setRightSidebarVisible(false)}
             onFrontmatterSave={handleFrontmatterSave}
           />
+        )}
+        </>
         )}
       </div>
 

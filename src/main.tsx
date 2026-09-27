@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import 'katex/dist/katex.min.css';
 import { App } from './App';
+import { SettingsProvider } from './context/SettingsContext';
 import './index.css';
 
 // Flint is a chromeless desktop app (SPEC §9.2) — it never relies on the host browser/webview's
@@ -11,6 +12,8 @@ document.addEventListener('contextmenu', (e) => e.preventDefault());
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(
   <React.StrictMode>
-    <App />
+    <SettingsProvider>
+      <App />
+    </SettingsProvider>
   </React.StrictMode>
 );

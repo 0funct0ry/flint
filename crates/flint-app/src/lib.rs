@@ -237,7 +237,7 @@ fn spawn_filesystem_watcher(
             let mut last_scan_map: HashMap<String, u64> = HashMap::new();
 
             // Initial scan
-            if let Ok(tree) = build_workspace_tree(&root, true) {
+            if let Ok(tree) = build_workspace_tree(&root, true, &[]) {
                 fn populate_map(items: &[TreeNodeItem], map: &mut HashMap<String, u64>) {
                     for item in items {
                         map.insert(item.path.clone(), 0);
@@ -478,7 +478,7 @@ fn workspace_open(
         .unwrap_or("workspace")
         .to_string();
 
-    let tree = build_workspace_tree(&root, true).unwrap_or_default();
+    let tree = build_workspace_tree(&root, true, &[]).unwrap_or_default();
     let is_empty = tree.is_empty();
 
     let info = WorkspaceInfo {
@@ -574,7 +574,13 @@ fn workspace_tree(
 ) -> Result<Vec<TreeNodeItem>, String> {
     let root = get_workspace_root(&state)?;
     let show_non_notes = show_non_note_files.unwrap_or(false);
-    build_workspace_tree(&root, show_non_notes).map_err(|e| e.to_string())
+    let ignore = flint_core::config_get(&root, None)
+        .ok()
+        .map(|r| r.config)
+        .and_then(|v| v.get("ignore").cloned())
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok())
+        .unwrap_or_default();
+    build_workspace_tree(&root, show_non_notes, &ignore).map_err(|e| e.to_string())
 }
 
 /// Read a note's content, metadata, and fingerprint safely (SPEC §8.3, §11).
@@ -970,18 +976,38 @@ fn workspace_doctor(state: State<AppState>) -> Result<flint_core::DoctorReport, 
     flint_core::check_workspace_health(&root)
 }
 
-/// Read a single per-workspace config key (SPEC §11, M10.09). Returns `null` if unset.
+/// Read config (SPEC §11, §12, M10.1). With `key`: single dotted-path lookup against the merged
+/// global+workspace config (`null` if unset). Without `key`: the full merged config, per-path
+/// origins, and an optional notice if a config file failed to load and fell back to defaults.
 #[tauri::command]
-fn config_get(key: String, state: State<AppState>) -> Result<Option<serde_json::Value>, String> {
+fn config_get(
+    key: Option<String>,
+    state: State<AppState>,
+) -> Result<flint_core::config::ConfigGetResult, String> {
     let root = get_workspace_root(&state)?;
-    flint_core::config_get(&root, &key).map_err(|e| e.to_string())
+    flint_core::config_get(&root, key.as_deref()).map_err(|e| e.to_string())
 }
 
-/// Write a single per-workspace config key to `.flint/config.json` (SPEC §11, M10.09).
+/// Write a single per-workspace config key to `.flint/config.json` (SPEC §11, §12, M10.1).
 #[tauri::command]
 fn config_set(key: String, value: serde_json::Value, state: State<AppState>) -> Result<(), String> {
     let root = get_workspace_root(&state)?;
     flint_core::config_set(&root, &key, value).map_err(|e| e.to_string())
+}
+
+/// Delete a workspace override for `key`, falling back to the global default (SPEC §11, §12,
+/// M10.1). A no-op if the key wasn't overridden.
+#[tauri::command]
+fn config_reset(key: String, state: State<AppState>) -> Result<(), String> {
+    let root = get_workspace_root(&state)?;
+    flint_core::config_reset(&root, &key).map_err(|e| e.to_string())
+}
+
+/// Validate a list of ignore-glob lines, one result per line: `None` if valid, `Some(message)`
+/// if invalid (SPEC §11, §12, M10.1).
+#[tauri::command]
+fn config_validate_ignore(patterns: Vec<String>) -> Vec<Option<String>> {
+    flint_core::validate_ignore_patterns(&patterns)
 }
 
 /// Open an external URL in the default system browser (SPEC §6.3, §11, M6).
@@ -1066,7 +1092,9 @@ pub fn build_app(
             choose_folder,
             recent_workspaces,
             config_get,
-            config_set
+            config_set,
+            config_reset,
+            config_validate_ignore
         ])
 }
 

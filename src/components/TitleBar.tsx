@@ -13,6 +13,7 @@ export interface TitleBarProps {
   onToggleLeftSidebar?: () => void;
   rightSidebarVisible?: boolean;
   onToggleRightSidebar?: () => void;
+  onOpenSettings?: () => void;
 }
 
 export const TitleBar: React.FC<TitleBarProps> = ({
@@ -26,6 +27,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
   onToggleLeftSidebar,
   rightSidebarVisible = true,
   onToggleRightSidebar,
+  onOpenSettings,
 }) => {
   const parts = breadcrumb.split('/');
   const root = parts[0] || 'projects';
@@ -138,6 +140,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
 
         {/* Settings Button */}
         <button
+          onClick={onOpenSettings}
           className="w-[26px] h-[24px] grid place-items-center rounded-[5px] text-[var(--muted)] hover:bg-[var(--panel)] hover:text-[var(--text)] transition-colors text-xs"
           title="Settings (⌘,)"
           aria-label="Settings"

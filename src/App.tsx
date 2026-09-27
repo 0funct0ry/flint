@@ -18,6 +18,7 @@ import {
 import { commandRegistry } from './commands/registry';
 import {
   Fingerprint,
+  FrontMatterField,
   IndexProgressEvent,
   LinkItem,
   NoteContent,
@@ -254,6 +255,7 @@ export const App: React.FC = () => {
             renderedHtml,
             outgoingLinks,
             backlinks,
+            frontMatterFields: noteContent.front_matter_fields,
           },
         };
       });
@@ -316,7 +318,8 @@ export const App: React.FC = () => {
             });
           });
 
-          // Refresh note metadata (tags, title, headings) from backend
+          // Refresh note metadata (tags, title, headings, front-matter fields) from backend —
+          // keeps the Frontmatter panel in sync with fields added/edited by hand in the buffer.
           api.noteRead(currentNotePath).then((readNote) => {
             setNoteState((prev) => {
               const cur = prev[currentNotePath];
@@ -328,6 +331,7 @@ export const App: React.FC = () => {
                   tags: readNote.meta.tags,
                   title: readNote.meta.title,
                   headings: readNote.meta.headings,
+                  frontMatterFields: readNote.front_matter_fields,
                 },
               };
             });
@@ -690,6 +694,54 @@ export const App: React.FC = () => {
       }
     },
     [showToast]
+  );
+
+  // Frontmatter panel: persist an edited/added/deleted field set through the same
+  // atomic-write + fingerprint-conflict path as `note_write` (SPEC §5.3, M10.10).
+  const handleFrontmatterSave = useCallback(
+    async (fields: FrontMatterField[]) => {
+      const path = currentNotePath;
+      if (!path) return;
+      try {
+        const newFingerprint = await api.frontmatterSet(
+          path,
+          fields,
+          noteFingerprints[path]
+        );
+        setNoteFingerprints((prev) => ({ ...prev, [path]: newFingerprint }));
+
+        const refreshed = await api.noteRead(path);
+        setNoteState((prev) => {
+          const cur = prev[path];
+          if (!cur) return prev;
+          return {
+            ...prev,
+            [path]: {
+              ...cur,
+              title: refreshed.meta.title,
+              tags: refreshed.meta.tags,
+              headings: refreshed.meta.headings,
+              content: refreshed.content,
+              frontMatterFields: refreshed.front_matter_fields,
+            },
+          };
+        });
+      } catch (err: any) {
+        const errMsg = err?.message || String(err);
+        if (errMsg.toLowerCase().includes('conflict')) {
+          setShowConflictBanner(true);
+          try {
+            const diskNote = await api.noteRead(path);
+            setDiskVersionContent(diskNote.content);
+          } catch {
+            setDiskVersionContent('');
+          }
+        } else {
+          showToast(`Failed to save front matter: ${errMsg}`);
+        }
+      }
+    },
+    [currentNotePath, noteFingerprints, showToast]
   );
 
   // History back / forward with cursor and scroll restoration
@@ -1427,6 +1479,7 @@ export const App: React.FC = () => {
             onCreateNote={handleCreateBrokenNote}
             onOpenExternal={handleOpenExternal}
             onClose={() => setRightSidebarVisible(false)}
+            onFrontmatterSave={handleFrontmatterSave}
           />
         )}
       </div>

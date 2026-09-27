@@ -48,9 +48,11 @@ export interface EnclosingBlock {
   to: number;
 }
 
-/** Walk up the Lezer syntax tree from the cursor to find an enclosing Markdown block node. */
-export function findEnclosingBlock(state: EditorState): EnclosingBlock | null {
-  const pos = state.selection.main.head;
+/** Walk up the Lezer syntax tree from `pos` to find an enclosing Markdown block node. A blank
+ *  line belongs to no block (it sits directly under `Document`), so this returns `null` there
+ *  even though a real block may be adjacent — callers that care about a whole selection should
+ *  use `findEnclosingBlock`, which scans past blank lines instead of stopping at one. */
+function blockAt(state: EditorState, pos: number): EnclosingBlock | null {
   let node = syntaxTree(state).resolveInner(pos, -1);
   while (node) {
     if (BLOCK_NODE_NAMES.has(node.name)) {
@@ -58,6 +60,34 @@ export function findEnclosingBlock(state: EditorState): EnclosingBlock | null {
     }
     if (!node.parent) break;
     node = node.parent;
+  }
+  return null;
+}
+
+/**
+ * Find a Markdown block node touched by the selection.
+ *
+ * Paragraph actions (`applyToSelectedLines`) apply to every line the selection spans, not just
+ * the line the cursor happens to sit on, so enablement has to match: checking only
+ * `selection.main.head` broke in two cases — a selection with a blank line at its head end
+ * (`head` can be either boundary, since dragging bottom-to-top puts `head` at the earlier
+ * offset, not always the later one), and a selection made backward (bottom-to-top or
+ * end-to-beginning), where `head` lands on whichever edge the drag started or ended on rather
+ * than the edge that contains content. Both cases resolved to the syntax tree's `Document` root
+ * (a blank line belongs to no block) and disabled every paragraph command. Fixed by scanning
+ * every line the selection spans — in every range, for multi-cursor selections — for the first
+ * one that resolves to a block, instead of trusting a single point.
+ */
+export function findEnclosingBlock(state: EditorState): EnclosingBlock | null {
+  for (const range of state.selection.ranges) {
+    const startLine = state.doc.lineAt(range.from).number;
+    const endLine = state.doc.lineAt(range.to).number;
+    for (let ln = startLine; ln <= endLine; ln++) {
+      const line = state.doc.line(ln);
+      if (line.text.trim() === '') continue;
+      const found = blockAt(state, line.from) ?? blockAt(state, line.to);
+      if (found) return found;
+    }
   }
   return null;
 }

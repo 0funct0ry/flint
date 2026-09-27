@@ -195,9 +195,19 @@ button {
   font-size: 14px;
   line-height: 1.6;
 }
-.reader-content li.task-list-item {
+/* Only an unordered task list ("- [ ] …") hides its marker — a checkbox replaces the bullet.
+   An ordered task list ("1. [ ] …") keeps its number; the checkbox sits alongside it. Spacing is
+   done with margin on the checkbox rather than `display: flex` on the `<li>` itself — flex would
+   remove the `<li>`'s marker box entirely, hiding an ordered list's numbers along with it. */
+.reader-content ul li.task-list-item {
   list-style-type: none;
   margin-left: -20px;
+}
+.reader-content li.task-list-item input[type="checkbox"] {
+  cursor: pointer;
+  margin-right: 6px;
+  position: relative;
+  top: 1px;
 }
 .reader-content code {
   font-family: var(--mono);

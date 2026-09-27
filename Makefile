@@ -8,7 +8,8 @@ TAURI = $(PNPM) tauri
 # Default target
 .DEFAULT_GOAL := help
 
-.PHONY: all help clean build build-release clippy test test-backend test-frontend fmt
+.PHONY: all help clean build build-release clippy test test-backend test-frontend fmt \
+	ci ci-fmt-check ci-clippy ci-rust-test ci-rust-build ci-lint ci-typecheck ci-frontend-test ci-frontend-build ci-tauri-build
 
 all: build
 
@@ -57,3 +58,44 @@ fmt: ## Format Rust and Frontend code
 	@$(CARGO) fmt --all
 	@echo "Formatting Frontend code..."
 	@$(PNPM) lint --fix
+
+# ---------------------------------------------------------------------------
+# CI parity targets — each one runs the exact command used in the matching
+# .github/workflows/ci.yml step, so a green `make ci` here means CI won't fail.
+# ---------------------------------------------------------------------------
+
+ci: ci-fmt-check ci-clippy ci-rust-test ci-lint ci-typecheck ci-frontend-test ci-frontend-build ## Run every check the GitHub Actions CI workflow runs (excludes the native app bundle build; see ci-tauri-build)
+	@echo ""
+	@echo "✅ All CI checks passed."
+
+ci-fmt-check: ## [rust job] cargo fmt --check
+	@echo "==> cargo fmt --check"
+	@$(CARGO) fmt --check
+
+ci-clippy: ## [rust job] cargo clippy --workspace --locked -- -D warnings
+	@echo "==> cargo clippy --workspace --locked -- -D warnings"
+	@$(CARGO) clippy --workspace --locked -- -D warnings
+
+ci-rust-test: ## [rust job] cargo test --workspace --locked
+	@echo "==> cargo test --workspace --locked"
+	@$(CARGO) test --workspace --locked
+
+ci-lint: ## [frontend job] pnpm lint
+	@echo "==> pnpm lint"
+	@$(PNPM) lint
+
+ci-typecheck: ## [frontend job] pnpm typecheck
+	@echo "==> pnpm typecheck"
+	@$(PNPM) typecheck
+
+ci-frontend-test: ## [frontend job] pnpm test
+	@echo "==> pnpm test"
+	@$(PNPM) test
+
+ci-frontend-build: ## [frontend job] pnpm build
+	@echo "==> pnpm build"
+	@$(PNPM) build
+
+ci-tauri-build: ## [rust job] pnpm exec tauri build --bundles app (slow, produces a full Flint.app bundle; not part of `make ci` by default)
+	@echo "==> pnpm exec tauri build --bundles app"
+	@$(PNPM) exec tauri build --bundles app

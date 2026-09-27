@@ -16,6 +16,8 @@ import { TableBuilderModal, TableBuilderInitial } from './TableBuilderModal';
 import { commandRegistry } from '../commands/registry';
 import * as ec from '../commands/editorCommands';
 import { parseDelimitedSelection, ColumnAlignment } from '../commands/tableBuilder';
+import { setOutlineEditDispatcher } from '../services/outlineEditBridge';
+import { findTaskMarkers } from '../services/taskList';
 
 export interface CenterPaneProps {
   note: NoteFixture;
@@ -182,19 +184,6 @@ function getAllNotePaths(tree: TreeNodeItem[]): Array<{ path: string; title?: st
  * on unmount.
  */
 let openTableBuilder: ((view: EditorView) => void) | null = null;
-
-/**
- * Same bridge pattern as `openTableBuilder`, for the M10.09 outline panel: reorder, copy-section,
- * move-to-new-note, and delete all need to dispatch a single transaction into the currently
- * mounted `EditorView` from outside this component. Set on mount, cleared on unmount.
- */
-let applyOutlineEditBridge: ((changes: { from: number; to: number; insert: string }[]) => void) | null = null;
-
-/** Dispatch one or more changes as a single CodeMirror transaction (one undo step) into the
- *  currently mounted editor, if any. Used by the outline panel (M10.09) via `LeftSidebar`. */
-export function applyOutlineEdit(changes: { from: number; to: number; insert: string }[]): void {
-  applyOutlineEditBridge?.(changes);
-}
 
 interface EditorCommandDef {
   id: string;
@@ -448,16 +437,16 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   }, []);
 
   // Bridge outline-panel edits (M10.09) into this instance's live EditorView — see
-  // `applyOutlineEdit`'s doc comment.
+  // `applyOutlineEdit`'s doc comment in `services/outlineEditBridge`.
   useEffect(() => {
-    applyOutlineEditBridge = (changes) => {
+    setOutlineEditDispatcher((changes) => {
       const view = editorViewRef.current;
       if (!view || changes.length === 0) return;
       view.focus();
       view.dispatch({ changes });
-    };
+    });
     return () => {
-      applyOutlineEditBridge = null;
+      setOutlineEditDispatcher(null);
     };
   }, []);
 
@@ -1074,6 +1063,33 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
 
   // Handle reader link clicks
   const handleReaderClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    // Task-list checkboxes are two-way: clicking one in Read or Split mode toggles the
+    // corresponding `[ ]`/`[x]` marker in the source buffer (see `services/taskList.ts`), the
+    // same as editing the buffer directly would. `preventDefault` stops the checkbox's own
+    // native check-state toggle so the DOM doesn't visibly flip ahead of, or independently of,
+    // the buffer edit that drives the next render.
+    const checkbox = (e.target as HTMLElement).closest(
+      'input[type="checkbox"][data-task-index]'
+    ) as HTMLInputElement | null;
+    if (checkbox) {
+      e.preventDefault();
+      const taskIndex = Number(checkbox.getAttribute('data-task-index'));
+      const view = editorViewRef.current;
+      if (view && Number.isInteger(taskIndex)) {
+        const marker = findTaskMarkers(view.state.doc.toString())[taskIndex];
+        if (marker) {
+          view.dispatch({
+            changes: {
+              from: marker.charOffset,
+              to: marker.charOffset + 1,
+              insert: marker.checked ? ' ' : 'x',
+            },
+          });
+        }
+      }
+      return;
+    }
+
     const target = (e.target as HTMLElement).closest('a');
     if (target) {
       const href = target.getAttribute('href');

@@ -14,7 +14,7 @@ import {
 } from '../services/outline';
 import { ContextMenu, ContextMenuItem } from './ContextMenu';
 import { DeleteConfirmModal } from './DeleteConfirmModal';
-import { applyOutlineEdit } from './CenterPane';
+import { applyOutlineEdit } from '../services/outlineEditBridge';
 
 const CONFIRM_MOVE_TO_NEW_NOTE_KEY = 'outline.confirmMoveToNewNote';
 

@@ -68,6 +68,7 @@ export function renderMarkdownToHtml(markdown: string): string {
   let codeBlockContent: string[] = [];
 
   let inList: 'ul' | 'ol' | null = null;
+  let taskIndex = 0;
   let inTable = false;
   let tableAlignments: Array<'left' | 'center' | 'right' | null> = [];
   let pendingHeaderCells: string[] | null = null;
@@ -250,22 +251,29 @@ export function renderMarkdownToHtml(markdown: string): string {
       flushTable();
     }
 
-    // Task list / Unordered list items: - [ ] or - [x] or - item / * item
-    const taskMatch = trimmed.match(/^[-*+]\s+\[([ xX])\]\s+(.*)$/);
+    // Task list items: "- [ ] …" / "* [x] …" (unordered) or "1. [ ] …" (ordered) — pulldown-cmark
+    // (the real backend's renderer) recognizes task markers in either list type, so this mock
+    // matches both to keep dev-preview rendering consistent with it.
+    const taskMatch = trimmed.match(/^(?:[-*+]|\d+[.)])\s+\[([ xX])\]\s+(.*)$/);
     if (taskMatch) {
       flushParagraph();
       flushTable();
-      if (inList !== 'ul') {
+      const listType: 'ul' | 'ol' = /^\d+[.)]/.test(trimmed) ? 'ol' : 'ul';
+      if (inList !== listType) {
         flushList();
-        htmlOutput.push(`<ul>`);
-        inList = 'ul';
+        htmlOutput.push(listType === 'ol' ? `<ol>` : `<ul>`);
+        inList = listType;
       }
       const isChecked = taskMatch[1].toLowerCase() === 'x';
       const itemText = taskMatch[2];
+      const index = taskIndex++;
+      // Spacing and (for an unordered task list only) hiding the bullet are both handled by
+      // `.reader-content li.task-list-item` in `src/index.css`, matching the real backend's
+      // renderer, which has no inline style to strip through ammonia sanitization anyway.
       htmlOutput.push(
-        `<li class="task-list-item"><input type="checkbox" disabled ${
+        `<li class="task-list-item"><input type="checkbox" data-task-index="${index}" ${
           isChecked ? 'checked' : ''
-        } style="margin-right:6px;" />${formatInline(itemText)}</li>`
+        } />${formatInline(itemText)}</li>`
       );
       continue;
     }

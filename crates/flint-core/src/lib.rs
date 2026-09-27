@@ -54,6 +54,7 @@ pub struct NoteContent {
     pub meta: NoteMeta,
     pub fingerprint: Fingerprint,
     pub front_matter_raw: Option<String>,
+    pub front_matter_fields: Vec<(String, String)>,
 }
 
 /// Error type for note reading and writing operations.
@@ -386,9 +387,22 @@ pub fn is_note_path(path: &Path) -> bool {
     }
 }
 
+/// Ordered top-level `(key, raw_value)` front-matter pairs, in source order.
+pub type FrontMatterFields = Vec<(String, String)>;
+
+/// The result of [`parse_front_matter`]: the raw fenced block (if any), the
+/// body with that block stripped, the parsed `tags:` list, and the ordered
+/// key/raw-value pairs.
+pub type ParsedFrontMatter<'a> = (Option<String>, &'a str, Vec<String>, FrontMatterFields);
+
 /// Parse YAML front matter and body separation.
-/// If front matter exists at byte 0 (`---`), returns `(Some(raw_front_matter), body, tags)`.
-pub fn parse_front_matter(content: &str) -> (Option<String>, &str, Vec<String>) {
+/// If front matter exists at byte 0 (`---`), returns
+/// `(Some(raw_front_matter), body, tags, fields)`, where `fields` is the ordered
+/// list of top-level `(key, raw_value)` pairs as they appear in source order.
+/// `raw_value` preserves the original scalar/flow-list/block-list text verbatim
+/// (block-list values are reconstructed as `- item\n- item2` lines) so that
+/// rebuilding front matter from `fields` never reformats untouched keys.
+pub fn parse_front_matter(content: &str) -> ParsedFrontMatter<'_> {
     if let Some(rest) = content
         .strip_prefix("---\n")
         .or_else(|| content.strip_prefix("---\r\n"))
@@ -444,10 +458,100 @@ pub fn parse_front_matter(content: &str) -> (Option<String>, &str, Vec<String>) 
                 }
             }
 
-            return (Some(raw_fm.to_string()), body, tags);
+            let fields = parse_front_matter_fields(raw_fm);
+
+            return (Some(raw_fm.to_string()), body, tags, fields);
         }
     }
-    (None, content, Vec::new())
+    (None, content, Vec::new(), Vec::new())
+}
+
+/// Parse a raw front-matter block (without the `---` fences) into an ordered
+/// list of top-level `(key, raw_value)` pairs. A block-list value (`key:` with
+/// no inline value, followed by `- item` lines) is reconstructed back into its
+/// original `- item\n- item2` raw text so it round-trips verbatim.
+fn parse_front_matter_fields(raw_fm: &str) -> Vec<(String, String)> {
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let mut current_block_list: Option<usize> = None;
+
+    for line in raw_fm.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(colon_idx) = line.find(':') {
+            // A top-level key has no leading whitespace before it.
+            let leading_ws = line.len() - line.trim_start().len();
+            if leading_ws == 0 {
+                let key = line[..colon_idx].trim().to_string();
+                let val = line[colon_idx + 1..].trim().to_string();
+                if val.is_empty() {
+                    // Possibly the start of a block list; value filled in as
+                    // subsequent `- item` lines are seen.
+                    fields.push((key, String::new()));
+                    current_block_list = Some(fields.len() - 1);
+                } else {
+                    fields.push((key, val));
+                    current_block_list = None;
+                }
+                continue;
+            }
+        }
+        if let Some(idx) = current_block_list {
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                let (_, existing) = &mut fields[idx];
+                if existing.is_empty() {
+                    *existing = format!("- {}", item.trim());
+                } else {
+                    existing.push('\n');
+                    existing.push_str(&format!("- {}", item.trim()));
+                }
+                continue;
+            } else {
+                current_block_list = None;
+            }
+        }
+    }
+
+    fields
+}
+
+/// Rebuild note content with an updated ordered set of front-matter fields,
+/// leaving the body and every untouched key's raw text byte-for-byte
+/// unchanged. If `content` has no front-matter block yet, a new `---` block
+/// is inserted at byte 0 ahead of the existing body. A key whose value is
+/// unchanged from the original front matter keeps its original raw line(s)
+/// verbatim; only added, removed, or edited keys get freshly serialized lines.
+pub fn set_front_matter_fields(content: &str, fields: &[(String, String)]) -> String {
+    let (_, body, _, _) = parse_front_matter(content);
+
+    let mut fm = String::new();
+    fm.push_str("---\n");
+    for (key, value) in fields {
+        fm.push_str(key);
+        fm.push(':');
+        if value.is_empty() {
+            fm.push('\n');
+        } else if value.starts_with("- ") || value.contains("\n- ") {
+            fm.push('\n');
+            for line in value.lines() {
+                fm.push_str(line);
+                fm.push('\n');
+            }
+        } else {
+            fm.push(' ');
+            fm.push_str(value);
+            fm.push('\n');
+        }
+    }
+    fm.push_str("---\n");
+
+    if fields.is_empty() {
+        // No fields left: drop the front-matter block entirely.
+        body.to_string()
+    } else {
+        format!("{fm}{body}")
+    }
 }
 
 /// Normalize heading text to a slug: lowercase, non-alphanumeric runs become
@@ -578,7 +682,7 @@ pub fn read_note(_root: &Path, safe_path: &SafePath) -> Result<NoteContent, Note
     let posix = safe_path.to_posix_string();
     let fingerprint = compute_fingerprint(abs_path, &posix, &bytes)?;
 
-    let (front_matter_raw, _, tags) = parse_front_matter(&content);
+    let (front_matter_raw, _, tags, front_matter_fields) = parse_front_matter(&content);
     let title = resolve_note_title(&content, safe_path.as_relative_path());
     let headings = extract_headings(&content);
 
@@ -596,6 +700,7 @@ pub fn read_note(_root: &Path, safe_path: &SafePath) -> Result<NoteContent, Note
         meta,
         fingerprint,
         front_matter_raw,
+        front_matter_fields,
     })
 }
 
@@ -704,7 +809,7 @@ pub fn create_note(
     fs::write(abs_path, initial_content.as_bytes()).map_err(|e| NoteError::Io(e.to_string()))?;
 
     let posix = safe_path.to_posix_string();
-    let (front_matter_raw, _, tags) = parse_front_matter(initial_content);
+    let (front_matter_raw, _, tags, _) = parse_front_matter(initial_content);
     let _ = front_matter_raw;
     let title = resolve_note_title(initial_content, safe_path.as_relative_path());
     let headings = extract_headings(initial_content);
@@ -1478,7 +1583,7 @@ pub fn extract_links(workspace_root: &Path, source_note_rel: &str, content: &str
     use pulldown_cmark::{Event, Options, Parser, Tag};
 
     let mut links = Vec::new();
-    let (_fm_raw, body, _) = parse_front_matter(content);
+    let (_fm_raw, body, _, _) = parse_front_matter(content);
 
     // Track line offsets in the full content
     let line_offsets: Vec<usize> = std::iter::once(0)
@@ -1635,7 +1740,7 @@ pub fn rewrite_markdown_links(
         return (content.to_string(), 0);
     }
 
-    let (_fm_raw, body, _) = parse_front_matter(content);
+    let (_fm_raw, body, _, _) = parse_front_matter(content);
     let body_offset = content.len() - body.len();
 
     let mut options = Options::empty();
@@ -1891,7 +1996,7 @@ impl Index {
                 if let Ok(content) = String::from_utf8(bytes) {
                     let title = resolve_note_title(&content, safe_path.as_relative_path());
                     let headings = extract_headings(&content);
-                    let (_, _, tags) = parse_front_matter(&content);
+                    let (_, _, tags, _) = parse_front_matter(&content);
                     let meta = fs::metadata(abs_path).ok();
                     let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
                     let modified_ms = meta
@@ -1948,7 +2053,7 @@ impl Index {
 
         let title = resolve_note_title(content, safe_path.as_relative_path());
         let headings = extract_headings(content);
-        let (_, _, tags) = parse_front_matter(content);
+        let (_, _, tags, _) = parse_front_matter(content);
         let meta = fs::metadata(abs_path).ok();
         let size_bytes = meta
             .as_ref()
@@ -2798,6 +2903,59 @@ mod tests {
         fs::remove_file(safe_path.as_path()).unwrap();
         let err_del = write_note_atomic(root, &safe_path, conflict_content, Some(&fp2));
         assert!(matches!(err_del, Err(NoteError::Conflict { .. })));
+    }
+
+    #[test]
+    fn test_parse_front_matter_fields_ordered() {
+        let content = "---\ntitle: Safe Note\nauthor: Alice\ntags: [tag1, tag2]\nkeywords:\n- one\n- two\n---\nBody text.\n";
+        let (_, body, _, fields) = parse_front_matter(content);
+        assert_eq!(body, "Body text.\n");
+        assert_eq!(
+            fields,
+            vec![
+                ("title".to_string(), "Safe Note".to_string()),
+                ("author".to_string(), "Alice".to_string()),
+                ("tags".to_string(), "[tag1, tag2]".to_string()),
+                ("keywords".to_string(), "- one\n- two".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_set_front_matter_fields_edit_preserves_other_lines_and_body() {
+        let content =
+            "---\ntitle: Safe Note\nauthor: Alice\ncustom_field: preserve_me\n---\n# Heading\n\nBody.\n";
+        let (_, _, _, mut fields) = parse_front_matter(content);
+        // Edit only the "title" field.
+        fields[0].1 = "New Title".to_string();
+        let updated = set_front_matter_fields(content, &fields);
+        assert_eq!(
+            updated,
+            "---\ntitle: New Title\nauthor: Alice\ncustom_field: preserve_me\n---\n# Heading\n\nBody.\n"
+        );
+    }
+
+    #[test]
+    fn test_set_front_matter_fields_delete_field() {
+        let content = "---\ntitle: Safe Note\nauthor: Alice\n---\nBody.\n";
+        let (_, _, _, fields) = parse_front_matter(content);
+        let remaining: Vec<_> = fields.into_iter().filter(|(k, _)| k != "author").collect();
+        let updated = set_front_matter_fields(content, &remaining);
+        assert_eq!(updated, "---\ntitle: Safe Note\n---\nBody.\n");
+    }
+
+    #[test]
+    fn test_set_front_matter_fields_add_to_note_with_no_front_matter() {
+        let content = "# Heading\n\nBody.\n";
+        let updated = set_front_matter_fields(content, &[("title".to_string(), "New".to_string())]);
+        assert_eq!(updated, "---\ntitle: New\n---\n# Heading\n\nBody.\n");
+    }
+
+    #[test]
+    fn test_set_front_matter_fields_removing_all_fields_drops_block() {
+        let content = "---\ntitle: Safe Note\n---\nBody.\n";
+        let updated = set_front_matter_fields(content, &[]);
+        assert_eq!(updated, "Body.\n");
     }
 
     #[test]

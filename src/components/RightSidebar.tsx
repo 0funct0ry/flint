@@ -1,5 +1,6 @@
-import React from 'react';
-import { NoteFixture } from '../types';
+import React, { useRef, useState } from 'react';
+import { FrontMatterField, NoteFixture } from '../types';
+import { FrontmatterPanel } from './FrontmatterPanel';
 
 export interface RightSidebarProps {
   note: NoteFixture;
@@ -7,7 +8,14 @@ export interface RightSidebarProps {
   onCreateNote?: (path: string) => void;
   onOpenExternal?: (url: string) => void;
   onClose?: () => void;
+  onFrontmatterSave?: (fields: FrontMatterField[]) => void;
 }
+
+type RightTab = 'links' | 'frontmatter';
+const RIGHT_TABS: { id: RightTab; label: string }[] = [
+  { id: 'links', label: 'Links' },
+  { id: 'frontmatter', label: 'Frontmatter' },
+];
 
 export const RightSidebar: React.FC<RightSidebarProps> = ({
   note,
@@ -15,23 +23,49 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
   onCreateNote,
   onOpenExternal,
   onClose,
+  onFrontmatterSave,
 }) => {
+  const [activeTab, setActiveTab] = useState<RightTab>('links');
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+
   const totalBacklinks = note.backlinks.reduce(
     (acc, b) => acc + b.occurrences.length,
     0
   );
 
+  const handleTabKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    const delta = e.key === 'ArrowRight' ? 1 : -1;
+    const nextIndex = (index + delta + RIGHT_TABS.length) % RIGHT_TABS.length;
+    setActiveTab(RIGHT_TABS[nextIndex].id);
+    tabRefs.current[nextIndex]?.focus();
+  };
+
   return (
     <aside className="w-[250px] shrink-0 flex flex-col bg-[var(--panel)] border-l border-[var(--border)] min-h-0 select-none">
       {/* Tabs */}
       <div className="flex items-center h-[31px] shrink-0 border-b border-[var(--border)]" role="tablist">
-        <button
-          role="tab"
-          aria-selected="true"
-          className="px-3 h-full text-[11.5px] tracking-wide text-[var(--text)] font-medium shadow-[inset_0_-2px_0_var(--accent)]"
-        >
-          Links
-        </button>
+        {RIGHT_TABS.map((tab, index) => (
+          <button
+            key={tab.id}
+            ref={(el) => { tabRefs.current[index] = el; }}
+            role="tab"
+            id={`right-tab-${tab.id}`}
+            aria-selected={activeTab === tab.id}
+            aria-controls={`right-tabpanel-${tab.id}`}
+            tabIndex={activeTab === tab.id ? 0 : -1}
+            onClick={() => setActiveTab(tab.id)}
+            onKeyDown={(e) => handleTabKeyDown(e, index)}
+            className={`px-3 h-full text-[11.5px] tracking-wide font-medium transition-colors ${
+              activeTab === tab.id
+                ? 'text-[var(--text)] shadow-[inset_0_-2px_0_var(--accent)]'
+                : 'text-[var(--faint)] hover:text-[var(--text-2)]'
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
 
         {onClose && (
           <button
@@ -45,7 +79,25 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
         )}
       </div>
 
-      <div className="flex-1 overflow-auto py-2 min-h-0">
+      {activeTab === 'frontmatter' ? (
+        <div
+          role="tabpanel"
+          id="right-tabpanel-frontmatter"
+          aria-labelledby="right-tab-frontmatter"
+          className="flex-1 overflow-auto min-h-0"
+        >
+          <FrontmatterPanel
+            fields={note.frontMatterFields || []}
+            onSave={(fields) => onFrontmatterSave?.(fields)}
+          />
+        </div>
+      ) : (
+      <div
+        role="tabpanel"
+        id="right-tabpanel-links"
+        aria-labelledby="right-tab-links"
+        className="flex-1 overflow-auto py-2 min-h-0"
+      >
         {/* Backlinks Section */}
         <div className="px-3 py-1.5 text-[11px] font-medium text-[var(--faint)]">
           Backlinks · {totalBacklinks} from {note.backlinks.length} {note.backlinks.length === 1 ? 'note' : 'notes'}
@@ -180,6 +232,7 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
           ))
         )}
       </div>
+      )}
     </aside>
   );
 };

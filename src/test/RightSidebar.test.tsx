@@ -96,4 +96,77 @@ describe('RightSidebar', () => {
     fireEvent.click(externalLink);
     expect(onOpenExternal).toHaveBeenCalledWith('https://flint.sh');
   });
+
+  it('switches to the Frontmatter tab via click and shows its fields', () => {
+    const onNavigate = vi.fn();
+    const noteWithFrontmatter: NoteFixture = {
+      ...sampleNote,
+      frontMatterFields: [
+        ['title', 'Settlement windows'],
+        ['tags', '[payments, bbps]'],
+      ],
+    };
+
+    render(<RightSidebar note={noteWithFrontmatter} onNavigate={onNavigate} />);
+
+    expect(screen.queryByText('title')).not.toBeInTheDocument();
+
+    const frontmatterTab = screen.getByRole('tab', { name: 'Frontmatter' });
+    fireEvent.click(frontmatterTab);
+
+    expect(frontmatterTab).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText('title')).toBeInTheDocument();
+    expect(screen.getByText('[payments, bbps]')).toBeInTheDocument();
+  });
+
+  it('traverses tabs with arrow keys', () => {
+    const onNavigate = vi.fn();
+    render(<RightSidebar note={sampleNote} onNavigate={onNavigate} />);
+
+    const linksTab = screen.getByRole('tab', { name: 'Links' });
+    const frontmatterTab = screen.getByRole('tab', { name: 'Frontmatter' });
+
+    linksTab.focus();
+    fireEvent.keyDown(linksTab, { key: 'ArrowRight' });
+    expect(frontmatterTab).toHaveAttribute('aria-selected', 'true');
+
+    fireEvent.keyDown(frontmatterTab, { key: 'ArrowLeft' });
+    expect(linksTab).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('shows the empty state with an Add field row when there is no front matter', () => {
+    const onNavigate = vi.fn();
+    render(<RightSidebar note={sampleNote} onNavigate={onNavigate} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Frontmatter' }));
+
+    expect(screen.getByText('No front-matter fields.')).toBeInTheDocument();
+    expect(screen.getByText('+ Add field')).toBeInTheDocument();
+  });
+
+  it('calls onFrontmatterSave with an edited field value', () => {
+    const onNavigate = vi.fn();
+    const onFrontmatterSave = vi.fn();
+    const noteWithFrontmatter: NoteFixture = {
+      ...sampleNote,
+      frontMatterFields: [['title', 'Settlement windows']],
+    };
+
+    render(
+      <RightSidebar
+        note={noteWithFrontmatter}
+        onNavigate={onNavigate}
+        onFrontmatterSave={onFrontmatterSave}
+      />
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: 'Frontmatter' }));
+    fireEvent.click(screen.getByText('Settlement windows'));
+
+    const input = screen.getByLabelText('Value for row 1');
+    fireEvent.change(input, { target: { value: 'New Title' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    expect(onFrontmatterSave).toHaveBeenCalledWith([['title', 'New Title']]);
+  });
 });

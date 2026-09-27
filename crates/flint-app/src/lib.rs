@@ -3,9 +3,9 @@ use flint_core::{
     delete_path, duplicate_note, get_last_workspace, get_recent_workspaces, is_default_ignored,
     is_note_path, read_note, rename_path, render_note_markdown, resolve_workspace_root,
     resolve_workspace_target, rewrite_workspace_links_for_rename, save_last_workspace,
-    to_posix_path, write_note_atomic, BacklinkGroup, Fingerprint, Index, Link, NoteContent,
-    NoteMeta, RenderResult, ResolvedWorkspaceTarget, SafePath, TreeNodeItem, WorkspaceInfo,
-    WorkspaceStats,
+    set_front_matter_fields, to_posix_path, write_note_atomic, BacklinkGroup, Fingerprint, Index,
+    Link, NoteContent, NoteMeta, RenderResult, ResolvedWorkspaceTarget, SafePath, TreeNodeItem,
+    WorkspaceInfo, WorkspaceStats,
 };
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
@@ -615,6 +615,40 @@ fn note_write(
     Ok(fp)
 }
 
+/// Set a note's front-matter fields (ordered key/value pairs), rebuilding only
+/// the front-matter block while leaving the body untouched, and persisting
+/// through the same atomic write + fingerprint conflict check + incremental
+/// index update path as `note_write` (SPEC §5.3, §8.3, §10.3, §11, M10.10).
+#[tauri::command]
+fn frontmatter_set(
+    path: String,
+    fields: Vec<(String, String)>,
+    fingerprint: Option<Fingerprint>,
+    state: State<AppState>,
+) -> Result<Fingerprint, String> {
+    let root = get_workspace_root(&state)?;
+    let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
+    let posix = safe_path.to_posix_string();
+
+    let current = read_note(&root, &safe_path).map_err(|e| e.to_string())?;
+    let new_content = set_front_matter_fields(&current.content, &fields);
+
+    let fp = write_note_atomic(&root, &safe_path, &new_content, fingerprint.as_ref())
+        .map_err(|e| e.to_string())?;
+
+    record_suppressed_write(
+        &state.suppressed_writes,
+        &posix,
+        Some(fp.content_hash.clone()),
+    );
+
+    if let Ok(mut lock) = state.index.write() {
+        lock.insert_or_update_note(&root, &safe_path, &new_content);
+    }
+
+    Ok(fp)
+}
+
 /// Create a new note at path and update index (SPEC §11, M4).
 #[tauri::command]
 fn note_create(
@@ -1018,6 +1052,7 @@ pub fn build_app(
             workspace_doctor,
             note_read,
             note_write,
+            frontmatter_set,
             note_create,
             note_rename,
             note_duplicate,

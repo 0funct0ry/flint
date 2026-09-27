@@ -57,11 +57,15 @@ export interface NoteMeta {
   tags: string[];
 }
 
+/** Ordered `[key, rawValue]` front-matter pair, preserving source order and raw scalar/flow/block value text. */
+export type FrontMatterField = [string, string];
+
 export interface NoteContent {
   content: string;
   meta: NoteMeta;
   fingerprint: Fingerprint;
   front_matter_raw?: string | null;
+  front_matter_fields: FrontMatterField[];
 }
 
 export interface NoteFixture {
@@ -69,6 +73,7 @@ export interface NoteFixture {
   title: string;
   folder: string;
   frontMatter?: Record<string, any>;
+  frontMatterFields?: FrontMatterField[];
   content: string;
   renderedHtml: string;
   headings: HeadingItem[];

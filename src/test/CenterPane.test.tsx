@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import { CenterPane } from '../components/CenterPane';
 import { NoteFixture } from '../types';
 
@@ -112,5 +112,41 @@ describe('CenterPane', () => {
     expect(blockElem).toBeInTheDocument();
     expect(blockElem).toHaveAttribute('data-rendered', 'true');
     expect(blockElem?.querySelector('.katex-display')).toBeInTheDocument();
+  });
+
+  it('toggles a task checkbox in the reader pane back into the source buffer', () => {
+    const taskNote: NoteFixture = {
+      ...sampleNote,
+      content: '# Build Task\n\n- [ ] Task 1\n- [ ] Task 2\n',
+      renderedHtml:
+        '<h1>Build Task</h1><ul>' +
+        '<li class="task-list-item"><input type="checkbox" data-task-index="0">Task 1</li>' +
+        '<li class="task-list-item"><input type="checkbox" data-task-index="1">Task 2</li>' +
+        '</ul>',
+    };
+    const onContentChange = vi.fn();
+
+    render(
+      <CenterPane
+        note={taskNote}
+        viewMode="read"
+        isDirty={false}
+        onContentChange={onContentChange}
+        onNavigateRelative={vi.fn()}
+        showConflictBanner={false}
+        onKeepVersion={vi.fn()}
+        onLoadFromDisk={vi.fn()}
+        onShowDifferences={vi.fn()}
+        onBack={vi.fn()}
+        onForward={vi.fn()}
+      />
+    );
+
+    const checkboxes = document.querySelectorAll('input[type="checkbox"][data-task-index]');
+    expect(checkboxes).toHaveLength(2);
+
+    fireEvent.click(checkboxes[1]);
+
+    expect(onContentChange).toHaveBeenCalledWith('# Build Task\n\n- [ ] Task 1\n- [x] Task 2\n');
   });
 });

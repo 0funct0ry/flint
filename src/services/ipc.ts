@@ -6,6 +6,7 @@ import {
   ContentSearchOptions,
   DoctorReport,
   Fingerprint,
+  FrontMatterField,
   LinkItem,
   NameHit,
   NoteContent,
@@ -18,13 +19,17 @@ import {
 } from "../types";
 import { FIXTURE_NOTES } from "../fixtures/workspace";
 import { renderMarkdownToHtml, slugify, dedupSlug } from "./markdown";
+import { parseFrontMatter, setFrontMatterFields } from "./frontmatter";
 
 export const isTauriEnvironment = (): boolean => {
   return typeof window !== "undefined" && Boolean((window as any).__TAURI_INTERNALS__);
 };
 
 // Fallback in-memory storage for browser dev/test
-const browserMockStorage: Record<string, { content: string; hash: string; modified: number }> = {};
+const browserMockStorage: Record<
+  string,
+  { content: string; hash: string; modified: number }
+> = {};
 const browserMockConfig: Record<string, unknown> = {};
 const browserMockTree: TreeNodeItem[] = [
   {
@@ -119,6 +124,11 @@ export const api = {
     const hash = stored ? stored.hash : "mock-hash-" + content.length;
     const modified = stored ? stored.modified : Date.now();
 
+    // Derive front matter straight from the note's actual content on every read (matching the
+    // real backend's `parse_front_matter`), so fields added/edited by hand in the buffer or the
+    // markdown file show up in the panel without a separate cache to keep in sync.
+    const { raw: frontMatterRaw, fields: frontMatterFields } = parseFrontMatter(content);
+
     return {
       content,
       meta: {
@@ -135,7 +145,8 @@ export const api = {
         modified_ms: modified,
         content_hash: hash,
       },
-      front_matter_raw: fixture.frontMatter ? JSON.stringify(fixture.frontMatter) : null,
+      front_matter_raw: frontMatterRaw,
+      front_matter_fields: frontMatterFields,
     };
   },
 
@@ -155,6 +166,40 @@ export const api = {
     }
 
     const newHash = "mock-hash-" + content.length + "-" + Date.now();
+    const now = Date.now();
+    browserMockStorage[path] = {
+      content,
+      hash: newHash,
+      modified: now,
+    };
+
+    return {
+      path,
+      size_bytes: content.length,
+      modified_ms: now,
+      content_hash: newHash,
+    };
+  },
+
+  async frontmatterSet(
+    path: string,
+    fields: FrontMatterField[],
+    fingerprint?: Fingerprint
+  ): Promise<Fingerprint> {
+    if (isTauriEnvironment()) {
+      return await invoke<Fingerprint>("frontmatter_set", { path, fields, fingerprint });
+    }
+
+    // Mock conflict check in browser environment, mirroring noteWrite.
+    const current = browserMockStorage[path];
+    if (fingerprint && current && current.hash !== fingerprint.content_hash) {
+      throw new Error("Conflict detected: note on disk was modified externally");
+    }
+
+    const fixture = FIXTURE_NOTES[path];
+    const previousContent = current ? current.content : fixture?.content || "";
+    const content = setFrontMatterFields(previousContent, fields);
+    const newHash = "mock-hash-" + content.length + "-" + Date.now() + "-fm";
     const now = Date.now();
     browserMockStorage[path] = {
       content,

@@ -33,6 +33,34 @@ describe('M10.02 Markdown Sanitization & Slugification', () => {
     expect(rendered).toContain('<h2 id="my-section-heading">My Section Heading!</h2>');
   });
 
+  it('renders task-list checkboxes as clickable and indexed in document order', () => {
+    const md = '- [x] Done item\n- [ ] Todo item\n1. [ ] Ordered task\n';
+    const rendered = renderMarkdownToHtml(md);
+    expect(rendered).not.toContain('disabled');
+    expect(rendered).not.toContain('style="margin-right');
+    expect(rendered).toContain('<input type="checkbox" data-task-index="0" checked');
+    expect(rendered).toContain('<input type="checkbox" data-task-index="1" ');
+    expect(rendered).toContain('<input type="checkbox" data-task-index="2" ');
+  });
+
+  it('keeps a task item inside its correct list container (ul vs ol)', () => {
+    // An unordered task list's bullet is hidden by `.reader-content ul li.task-list-item` in
+    // index.css; an ordered task list keeps its number, so it must stay inside an `<ol>`.
+    const unordered = renderMarkdownToHtml('- [ ] Task 1\n- [ ] Task 2\n');
+    expect(unordered).toContain('<ul>');
+    expect(unordered).not.toContain('<ol>');
+
+    const ordered = renderMarkdownToHtml('1. [ ] Task 1\n2. [ ] Task 2\n');
+    expect(ordered).toContain('<ol>');
+    expect(ordered).not.toContain('<ul>');
+  });
+
+  it('does not give a plain (non-task) list item the task-list-item class', () => {
+    const rendered = renderMarkdownToHtml('- [ ] A task\n- A plain item\n');
+    expect(rendered).toContain('<li class="task-list-item">');
+    expect(rendered).toContain('<li>A plain item</li>');
+  });
+
   it('renders plain images with ![alt](src)', () => {
     const md = '![Logo](https://example.com/logo.png)';
     const rendered = renderMarkdownToHtml(md);

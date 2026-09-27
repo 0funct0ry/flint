@@ -244,6 +244,12 @@ struct MathSpan {
 /// Render a fully-buffered blockquote's events as either an Obsidian-style callout
 /// (`> [!type]`) or a plain blockquote, per SPEC M10.05. An unrecognized callout type still
 /// renders as a styled blockquote rather than being dropped.
+///
+/// Note: this uses pulldown-cmark's own default HTML output for the buffered events, so a task
+/// checkbox inside a blockquote renders as the library's plain `disabled` checkbox rather than
+/// the clickable, `data-task-index`-numbered one the main event loop produces — matching
+/// `findTaskMarkers` (`src/services/taskList.ts`), which likewise does not match a
+/// blockquote-prefixed task line. Interactive checkboxes inside blockquotes are not supported.
 fn render_callout_or_blockquote(events: Vec<Event<'_>>) -> Event<'_> {
     let mut callout: Option<(String, usize, usize, String)> = None;
 
@@ -377,7 +383,7 @@ pub fn render_note_markdown(
     workspace_root: Option<&Path>,
     note_relative_path: Option<&str>,
 ) -> RenderResult {
-    let (_fm_raw, body, _) = parse_front_matter(raw_content);
+    let (_fm_raw, body, _, _) = parse_front_matter(raw_content);
     let headings = extract_headings(raw_content);
     let is_dark = theme.eq_ignore_ascii_case("dark");
 
@@ -399,12 +405,18 @@ pub fn render_note_markdown(
     options.insert(Options::ENABLE_SMART_PUNCTUATION);
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
 
-    let parser = Parser::new_ext(&protected_body, options);
+    let mut parser = Parser::new_ext(&protected_body, options).peekable();
 
     let mut custom_events = Vec::new();
     let mut in_code_block = false;
     let mut code_block_lang = String::new();
     let mut code_block_buf = String::new();
+    // Numbers every task-list checkbox in document order so the frontend can map a click on the
+    // Nth rendered checkbox back to the Nth task marker in the raw source (`findTaskMarkers` in
+    // `src/services/taskList.ts`) and toggle it in place. A checkbox inside a blockquote is
+    // rendered via `render_callout_or_blockquote` instead (plain pulldown-cmark output, disabled,
+    // uncounted here) — see that function's own note.
+    let mut task_index: usize = 0;
 
     let mut current_heading_level = None;
     let mut current_heading_text = String::new();
@@ -429,7 +441,7 @@ pub fn render_note_markdown(
     let mut blockquote_depth: i32 = 0;
     let mut blockquote_buffer: Vec<Event> = Vec::new();
 
-    for event in parser {
+    while let Some(event) = parser.next() {
         if blockquote_depth > 0 {
             match &event {
                 Event::Start(Tag::BlockQuote(_)) => {
@@ -659,6 +671,31 @@ pub fn render_note_markdown(
                 custom_events.push(Event::End(TagEnd::Table));
                 custom_events.push(Event::Html(CowStr::Borrowed("</div>")));
             }
+            Event::Start(Tag::Item) => {
+                // pulldown-cmark's own `<li>` never carries a class (see `html.rs`'s
+                // `Tag::Item` arm), so a plain list and a task list are visually
+                // indistinguishable without this: a task item gets `class="task-list-item"`
+                // (which `src/index.css` uses to hide the bullet/number marker and space the
+                // checkbox from its label), a non-task item is forwarded unchanged and keeps its
+                // bullet or number. Peeking one event ahead is safe because pulldown-cmark always
+                // emits `TaskListMarker` as the first child of a task list item's `Item` node.
+                if matches!(parser.peek(), Some(Event::TaskListMarker(_))) {
+                    custom_events.push(Event::Html(CowStr::Borrowed(
+                        "<li class=\"task-list-item\">",
+                    )));
+                } else {
+                    custom_events.push(Event::Start(Tag::Item));
+                }
+            }
+            Event::TaskListMarker(checked) => {
+                let index = task_index;
+                task_index += 1;
+                let input_html = format!(
+                    "<input type=\"checkbox\" data-task-index=\"{index}\"{checked_attr}/>",
+                    checked_attr = if checked { " checked=\"\"" } else { "" }
+                );
+                custom_events.push(Event::Html(CowStr::Boxed(input_html.into_boxed_str())));
+            }
             other => {
                 if current_heading_level.is_none() && !in_image {
                     custom_events.push(other);
@@ -739,6 +776,7 @@ pub fn render_note_markdown(
     input_attrs.insert("disabled");
     input_attrs.insert("checked");
     input_attrs.insert("class");
+    input_attrs.insert("data-task-index");
     tag_attributes.insert("input", input_attrs);
 
     let mut generic_attrs = HashSet::new();
@@ -906,7 +944,50 @@ Some motion text.
         assert!(res.html.contains("<td>1</td>"));
         assert!(res.html.contains("type=\"checkbox\""));
         assert!(res.html.contains("checked"));
-        assert!(res.html.contains("disabled"));
+    }
+
+    #[test]
+    fn test_render_task_checkboxes_are_interactive_and_numbered_in_order() {
+        let md = "- [x] Done item\n- [ ] Todo item\n- [ ] Third item\n";
+        let res = render_note_markdown(md, "light", None, None);
+        // Not `disabled` — a task checkbox is a real two-way control the frontend can click.
+        assert!(!res.html.contains("disabled"));
+        assert!(res
+            .html
+            .contains("<input type=\"checkbox\" data-task-index=\"0\" checked=\"\">"));
+        assert!(res
+            .html
+            .contains("<input type=\"checkbox\" data-task-index=\"1\">"));
+        assert!(res
+            .html
+            .contains("<input type=\"checkbox\" data-task-index=\"2\">"));
+    }
+
+    #[test]
+    fn test_render_task_checkboxes_in_ordered_list() {
+        // pulldown-cmark recognizes task markers in ordered lists too (SPEC-observed behavior,
+        // not GFM-strict), and the frontend's checkbox click handler relies on that holding.
+        let md = "1. [ ] Task 1\n2. [x] Task 2\n";
+        let res = render_note_markdown(md, "light", None, None);
+        assert!(res
+            .html
+            .contains("<input type=\"checkbox\" data-task-index=\"0\">"));
+        assert!(res
+            .html
+            .contains("<input type=\"checkbox\" data-task-index=\"1\" checked=\"\">"));
+        // Still an `<ol>`, and the item carries `task-list-item` for CSS (see `src/index.css`)
+        // to space the checkbox from its label — but keeps its number, unlike an unordered list.
+        assert!(res.html.contains("<ol>"));
+        assert!(res.html.contains("<li class=\"task-list-item\">"));
+    }
+
+    #[test]
+    fn test_render_task_list_item_gets_class_plain_list_item_does_not() {
+        let md = "- [ ] A task\n- A plain item\n";
+        let res = render_note_markdown(md, "light", None, None);
+        assert!(res.html.contains("<li class=\"task-list-item\">"));
+        // The plain item must not pick up the task class, and must render as an ordinary `<li>`.
+        assert!(res.html.contains("<li>A plain item</li>"));
     }
 
     #[test]

@@ -18,6 +18,7 @@ import {
   FIXTURE_ROOT_PATH,
 } from './fixtures/workspace';
 import { commandRegistry } from './commands/registry';
+import { APP_COMMANDS } from './commands/appCommands';
 import {
   Fingerprint,
   FrontMatterField,
@@ -1080,110 +1081,40 @@ export const App: React.FC = () => {
     setCursorPosition(null);
   }, [isDirty, saveNote]);
 
-  // Register commands in registry per SPEC §9.3 & M4
+  // Register commands in registry per SPEC §9.3 & M4. Metadata (id/title/shortcut) lives in
+  // src/commands/appCommands.ts — the single source of truth the docs site's shortcut table is
+  // generated from — and only the live handlers are wired up here.
   useEffect(() => {
-    commandRegistry.register({
-      id: 'file.new_note',
-      title: 'New note',
-      shortcut: '⌘N',
-      shortcutDisplay: '⌘N',
-      handler: () => handleStartCreateNote(),
-    });
-
-    commandRegistry.register({
-      id: 'file.new_folder',
-      title: 'New folder',
-      shortcut: '⌘⇧N',
-      shortcutDisplay: '⌘⇧N',
-      handler: () => handleStartCreateFolder(),
-    });
-
-    commandRegistry.register({
-      id: 'file.close',
-      title: 'Close active note',
-      shortcut: '⌘W',
-      shortcutDisplay: '⌘W',
-      handler: () => handleCloseNote(),
-    });
-
-    commandRegistry.register({
-      id: 'palette.notes',
-      title: 'Search notes by name',
-      shortcut: '⌘P',
-      shortcutDisplay: '⌘P',
-      handler: () => {
+    const handlers: Partial<Record<string, () => void>> = {
+      'file.new_note': () => handleStartCreateNote(),
+      'file.new_folder': () => handleStartCreateFolder(),
+      'file.close': () => handleCloseNote(),
+      'palette.notes': () => {
         setPaletteMode('notes');
         setPaletteOpen(true);
       },
-    });
-
-    commandRegistry.register({
-      id: 'palette.commands',
-      title: 'Show all commands',
-      shortcut: '⌘⇧P',
-      shortcutDisplay: '⌘⇧P',
-      handler: () => {
+      'palette.commands': () => {
         setPaletteMode('commands');
         setPaletteOpen(true);
       },
-    });
-
-    commandRegistry.register({
-      id: 'search.content',
-      title: 'Search content in workspace',
-      shortcut: '⌘⇧F',
-      shortcutDisplay: '⌘⇧F',
-      handler: () => {
+      'search.content': () => {
         setLeftSidebarVisible(true);
         setLeftTab('search');
       },
-    });
+      'file.save': () => saveNote(false),
+      'view.cycle_mode': cycleViewMode,
+      'view.toggle_left_sidebar': () => setLeftSidebarVisible((prev) => !prev),
+      'view.toggle_right_sidebar': () => setRightSidebarVisible((prev) => !prev),
+      'theme.toggle': () => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark')),
+      'view.open_settings': () => setSettingsOpen((prev) => !prev),
+    };
 
-    commandRegistry.register({
-      id: 'file.save',
-      title: 'Save note now',
-      shortcut: '⌘S',
-      shortcutDisplay: '⌘S',
-      handler: () => saveNote(false),
-    });
-
-    commandRegistry.register({
-      id: 'view.cycle_mode',
-      title: 'Cycle view mode (edit / read / split)',
-      shortcut: '⌘E',
-      shortcutDisplay: '⌘E',
-      handler: cycleViewMode,
-    });
-
-    commandRegistry.register({
-      id: 'view.toggle_left_sidebar',
-      title: 'Toggle left sidebar',
-      shortcut: '⌘B',
-      shortcutDisplay: '⌘B',
-      handler: () => setLeftSidebarVisible((prev) => !prev),
-    });
-
-    commandRegistry.register({
-      id: 'view.toggle_right_sidebar',
-      title: 'Toggle right sidebar',
-      shortcut: '⌘⌥B',
-      shortcutDisplay: '⌘⌥B',
-      handler: () => setRightSidebarVisible((prev) => !prev),
-    });
-
-    commandRegistry.register({
-      id: 'theme.toggle',
-      title: 'Toggle light / dark theme',
-      handler: () => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark')),
-    });
-
-    commandRegistry.register({
-      id: 'view.open_settings',
-      title: 'Settings',
-      shortcut: '⌘,',
-      shortcutDisplay: '⌘,',
-      handler: () => setSettingsOpen((prev) => !prev),
-    });
+    for (const meta of APP_COMMANDS) {
+      const handler = handlers[meta.id];
+      if (handler) {
+        commandRegistry.register({ ...meta, handler });
+      }
+    }
   }, [cycleViewMode, handleCloseNote, handleStartCreateFolder, handleStartCreateNote, saveNote]);
 
   // Global keydown listeners

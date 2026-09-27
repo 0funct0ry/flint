@@ -1,0 +1,30 @@
+---
+title: Keyboard Shortcuts
+description: Every keyboard shortcut Flint registers, generated from the app's command registry.
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="note">
+This page is generated at build time from `src/commands/appCommands.ts` — the same command
+registry the app uses at runtime — by `docs/scripts/generate-shortcuts.mjs`. Edit that file, not
+this one; changes here are overwritten on the next build.
+</Aside>
+
+| Command | Shortcut | ID |
+| --- | --- | --- |
+| New note | `⌘N` | `file.new_note` |
+| New folder | `⌘⇧N` | `file.new_folder` |
+| Close active note | `⌘W` | `file.close` |
+| Search notes by name | `⌘P` | `palette.notes` |
+| Show all commands | `⌘⇧P` | `palette.commands` |
+| Search content in workspace | `⌘⇧F` | `search.content` |
+| Save note now | `⌘S` | `file.save` |
+| Cycle view mode (edit / read / split) | `⌘E` | `view.cycle_mode` |
+| Toggle left sidebar | `⌘B` | `view.toggle_left_sidebar` |
+| Toggle right sidebar | `⌘⌥B` | `view.toggle_right_sidebar` |
+| Settings | `⌘,` | `view.open_settings` |
+
+Commands with no keyboard shortcut (available only via the command palette, `⌘⇧P`):
+
+- Toggle light / dark theme (`theme.toggle`)

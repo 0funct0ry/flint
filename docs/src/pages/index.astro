@@ -1,0 +1,260 @@
+---
+// Site root: the marketing/landing page, kept as a plain Astro page (not an MDX doc, not
+// Starlight's DocsLayout) so it can be iterated on independently of the docs content.
+// Structure and copy follow internal-docs/MARKETING-MOCKUP.html; palette follows the same
+// Flint token table as docs/src/styles/custom.css and the shipped app (SPEC §9.2).
+
+// '/flint/' on GitHub Pages, '/' in local dev — normalized to always end in '/'.
+const rawBase = import.meta.env.BASE_URL;
+const base = rawBase.endsWith('/') ? rawBase : `${rawBase}/`;
+const version = '0.1.0';
+const repo = 'https://github.com/0funct0ry/flint';
+// Stubbed against the GitHub Releases URL pattern until M10.3 publishes real assets.
+const releaseBase = `${repo}/releases/download/v${version}`;
+const downloads = [
+  { platform: 'macOS', file: `Flint-${version}-universal.dmg`, href: `${releaseBase}/Flint-${version}-universal.dmg` },
+  { platform: 'Linux', file: `flint_${version}_amd64.AppImage · .deb`, href: `${releaseBase}/flint_${version}_amd64.AppImage` },
+  { platform: 'Windows', file: `Flint-${version}-x64.msi`, href: `${releaseBase}/Flint-${version}-x64.msi` },
+];
+const features = [
+  { tag: 'workspace', title: 'Any directory, including the one your agent already reads', body: 'Point Flint at the same folder your coding agent uses for context — CLAUDE.md, SPEC.md, whatever you keep it in. Flint adds a single .flint/ folder for its own settings; delete it and nothing else changes.' },
+  { tag: 'links', title: 'Ordinary Markdown links, the kind agents already parse', body: '[rails](./rails.md) works in Flint, on GitHub, and in every tool your agent already reads. Rename a note and the links pointing at it — including the ones your context files reference — are updated.' },
+  { tag: 'backlinks', title: 'See what depends on a context file before you touch it', body: 'Every note shows what links to it, down to the line and the sentence. Before you rewrite a shared CLAUDE.md or spec, know what else is reading it.' },
+  { tag: 'search', title: 'Names and full text, across everything your agent can see', body: 'Fuzzy name search in the command palette; literal or regex content search across the workspace. Both run directly against the same files your agent does.' },
+  { tag: 'rendering', title: 'Tables, math, footnotes, code — what specs are made of', body: 'GitHub-flavoured Markdown plus LaTeX math and highlighted code fences. Edit, read, or split view — the same rendering your context files get everywhere else.' },
+  { tag: 'safety', title: 'It will not lose the context you depend on', body: 'Atomic saves, deletes to the system trash, and a prompt rather than a silent overwrite when a context file changes on disk under unsaved edits — including changes an agent makes while you are mid-edit.' },
+];
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Flint — The Markdown IDE for AI context</title>
+    <meta
+      name="description"
+      content="Flint is the local-first IDE for the Markdown your AI tools already read — CLAUDE.md, specs, project notes. An editor, reader, links, search, and backlinks over plain .md files. No account, no network calls."
+    />
+    <link rel="icon" href={`${base}flint-icon.png`} type="image/png" />
+    <link rel="stylesheet" href={`${base}marketing.css`} />
+  </head>
+  <body>
+    <header>
+      <div class="wrap nav">
+        <a class="logo" href={base}>
+          <img class="mark mark-light" src={`${base}flint-icon.png`} alt="" width="19" height="19" />
+          <img class="mark mark-dark" src={`${base}flint-icon-dark.png`} alt="" width="19" height="19" />
+          Flint
+        </a>
+        <a class="lk" href="#how">How it works</a>
+        <a class="lk" href="#cli">CLI</a>
+        <a class="lk" href="#scope">Scope</a>
+        <a class="lk" href={`${base}docs/`}>Docs</a>
+        <div class="right">
+          <button class="btn" id="theme-toggle" aria-label="Toggle theme">◐</button>
+          <a class="lk icon-lk" href={repo} aria-label="View source on GitHub">
+            <svg viewBox="0 0 16 16" width="18" height="18" fill="currentColor" aria-hidden="true">
+              <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
+                0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53
+                .63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95
+                0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68
+                0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82
+                2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2
+                0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+            </svg>
+          </a>
+          <a class="btn solid" href="#download">Download</a>
+        </div>
+      </div>
+    </header>
+
+    <section class="hero">
+      <div class="wrap">
+        <h1>The Markdown IDE for AI context.</h1>
+        <p class="sub">
+          Flint is where you write and organize the Markdown your AI tools already read —
+          <code>CLAUDE.md</code>, specs, project notes. An editor, a reader, links, search, and
+          backlinks on top of it. The files stay plain <code>.md</code>, exactly where your agent
+          expects them.
+        </p>
+
+        <div class="cmd">
+          <span class="p">$</span><span>flint</span><span class="c">~/notes</span>
+          <button id="copy-cmd" type="button">Copy</button>
+        </div>
+
+        <div class="meta">
+          <span>macOS · Linux · Windows</span>
+          <span>Rust and Tauri · single binary</span>
+          <span>No account, no network calls</span>
+          <span>MIT licensed</span>
+        </div>
+
+        <div class="frame">
+          <div class="bar"><i></i><i></i><i></i><span style="margin-left:6px">Flint</span></div>
+          <img
+            class="screenshot"
+            src={`${base}app-screenshot.png`}
+            alt="Screenshot of the Flint app showing a three-pane layout: workspace tree on the left, a rendered note in the center, and backlinks on the right."
+            width="1200"
+            height="700"
+          />
+        </div>
+      </div>
+    </section>
+
+    <div class="principle">
+      <div class="wrap">
+        <p>
+          The filesystem is where your context lives. Markdown files are what your agents read.
+          <em>Flint is only the interface.</em>
+        </p>
+      </div>
+    </div>
+
+    <section id="how">
+      <div class="wrap">
+        <div class="kicker">How it works</div>
+        <h2 class="t">Point it at the folder your agents already read.</h2>
+        <p class="lead">
+          There is no import step and no proprietary format. Flint reads the same directory your
+          AI tools already load as context, indexes the Markdown links between those files in
+          memory, and watches for changes. Edit one by hand, or let an agent write to it, and Flint
+          follows along within a moment.
+        </p>
+
+        <div class="cols">
+          {
+            features.map((f) => (
+              <div class="cell">
+                <span class="g">{f.tag}</span>
+                <h3>{f.title}</h3>
+                <p>{f.body}</p>
+              </div>
+            ))
+          }
+        </div>
+      </div>
+    </section>
+
+    <section class="tight" id="cli" style="border-top:1px solid var(--border);background:var(--panel)">
+      <div class="wrap">
+        <div class="kicker">Command line</div>
+        <h2 class="t">Launched from the terminal, because that is where your agents run too.</h2>
+        <p class="lead">
+          Flint is one binary. Run it on a path to open the window; run a subcommand to script
+          against the same context files your agents read, no window required.
+        </p>
+
+        <div class="term">
+          <div><span class="p">$</span> flint .</div>
+          <div class="o">opening ~/notes · 412 notes · 1 203 links</div>
+          <div>&nbsp;</div>
+          <div><span class="p">$</span> flint search <span class="c">"deemed acceptance"</span></div>
+          <div class="o">projects/payments/settlement.md:38: Document deemed acceptance at `T+3`</div>
+          <div>&nbsp;</div>
+          <div><span class="p">$</span> flint doctor</div>
+          <div class="o">1 unresolved link  projects/payments/settlement.md:31 → ./recon-2026.md</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="scope">
+      <div class="wrap">
+        <div class="kicker">Scope</div>
+        <h2 class="t">Browse, edit, render, link, navigate, search, backlinks, live watching.</h2>
+        <p class="lead">
+          That's what shipped in v{version}. Flint is deliberately small — an IDE for the Markdown
+          you already maintain, not a new place to store it.
+        </p>
+        <ul class="plain">
+          <li>Browse a workspace as a file tree, including the folder your agent already uses for context.</li>
+          <li>Edit Markdown with a real editor: syntax highlighting, tables, and shortcuts.</li>
+          <li>Render GitHub-flavoured Markdown, math, and footnotes — see a spec the way your agent parses it.</li>
+          <li>Link notes together with ordinary Markdown links, the kind every agent already resolves.</li>
+          <li>Navigate links and backlinks without leaving the keyboard.</li>
+          <li>Search note names and full text across the workspace.</li>
+          <li>See backlinks with the exact line and sentence they came from, so you know what depends on a context file before you edit it.</li>
+          <li>Watch the workspace for changes made outside Flint — including ones an agent makes — and stay in sync.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="tight" id="download" style="border-top:1px solid var(--border);background:var(--panel)">
+      <div class="wrap">
+        <div class="kicker">Download · v{version}</div>
+        <h2 class="t">One binary. It is the app and the CLI.</h2>
+        <div class="dl">
+          {
+            downloads.map((d) => (
+              <a href={d.href}>
+                <b>{d.platform}</b>
+                <span>{d.file}</span>
+              </a>
+            ))
+          }
+        </div>
+        <p class="lead" style="margin-top:22px">
+          Installers are built in CI from the tagged commit. Flint has no updater — it never
+          contacts a server, so updates come from your package manager or a new download.
+        </p>
+      </div>
+    </section>
+
+    <footer>
+      <div class="wrap">
+        <div class="fgrid">
+          <div>
+            <strong>Product</strong>
+            <a href="#how">How it works</a><a href="#cli">Command line</a>
+            <a href="#scope">Scope</a><a href="#download">Download</a>
+          </div>
+          <div>
+            <strong>Documentation</strong>
+            <a href={`${base}docs/getting-started/`}>Getting started</a>
+            <a href={`${base}docs/concepts/`}>Concepts</a>
+            <a href={`${base}docs/cli-reference/`}>CLI reference</a>
+            <a href={`${base}docs/faq/`}>FAQ</a>
+          </div>
+          <div>
+            <strong>Project</strong>
+            <a href={repo}>Source</a>
+            <a href={`${repo}/releases`}>Releases</a>
+            <a href={`${repo}/issues`}>Report an issue</a>
+          </div>
+          <div style="margin-left:auto;max-width:26ch">
+            <strong>Flint</strong>
+            <span style="color:var(--faint);font-size:13px"
+              >An editor for the context that powers your agents, with none of the lock-in.</span
+            >
+          </div>
+        </div>
+        <div class="fbase">
+          <span>MIT licensed</span><span>0funct0ry/flint</span>
+          <span>v{version}</span>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      const KEY = 'flint-theme';
+      const root = document.documentElement;
+      function apply(theme: string) {
+        root.dataset.theme = theme;
+      }
+      const stored = localStorage.getItem(KEY);
+      if (stored) apply(stored);
+
+      document.getElementById('theme-toggle')?.addEventListener('click', () => {
+        const next = root.dataset.theme === 'dark' ? 'light' : 'dark';
+        apply(next);
+        localStorage.setItem(KEY, next);
+      });
+
+      document.getElementById('copy-cmd')?.addEventListener('click', () => {
+        navigator.clipboard?.writeText('flint ~/notes');
+      });
+    </script>
+  </body>
+</html>

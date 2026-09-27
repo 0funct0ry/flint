@@ -1,0 +1,84 @@
+/* Flint token table (SPEC §9.2), mapped onto Starlight's own CSS variables so the docs +
+ * marketing site look like the same product as the app, not a different one.
+ *
+ * IMPORTANT: only override the *semantic* Starlight variables (bg, text, accent, hairline,
+ * inline-code) — never the raw --sl-color-gray-1..7 / --sl-color-white / --sl-color-black
+ * scale. Those are relied on, in their Starlight-default proportions, by other built-in
+ * pieces (Expressive Code's code-block frame in particular) to keep correct contrast in dark
+ * mode. Starlight's own baseline `:root` (no `data-theme` attribute) is its *dark* palette;
+ * `:root[data-theme='light']` is the override — match that convention here rather than
+ * introducing our own inverted one, or dark mode breaks in exactly the way light-mode-shaped
+ * grays end up as a code block's dark-mode background.
+ */
+
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;450;500;600&display=swap');
+
+:root {
+  /* Dark palette (Starlight's baseline, unscoped `:root`, mirrors its own convention) */
+  --flint-canvas: #15171b;
+  --flint-panel: #1b1e23;
+  --flint-panel-2: #22262c;
+  --flint-border: #2a2e35;
+  --flint-text: #e3e6ea;
+  --flint-text-2: #c3c9d2;
+  --flint-muted: #868e9b;
+  --flint-faint: #636b78;
+  --flint-accent: #7ba3d6;
+  --flint-accent-soft: #1f2b3a;
+  --flint-spark: #c98a2e;
+  --flint-ui: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  --flint-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --sl-font: var(--flint-ui);
+  --sl-font-mono: var(--flint-mono);
+  --sl-color-bg: var(--flint-canvas);
+  --sl-color-bg-nav: var(--flint-panel);
+  --sl-color-bg-sidebar: var(--flint-panel);
+  --sl-color-bg-inline-code: var(--flint-panel-2);
+  --sl-color-text: var(--flint-text);
+  --sl-color-text-accent: var(--flint-accent);
+  --sl-color-accent-low: var(--flint-accent-soft);
+  --sl-color-accent: var(--flint-accent);
+  --sl-color-accent-high: var(--flint-accent);
+  --sl-color-hairline-light: var(--flint-border);
+  --sl-color-hairline: var(--flint-border);
+  --sl-color-hairline-shade: var(--flint-border);
+}
+
+:root[data-theme='light'] {
+  --flint-canvas: #f6f7f8;
+  --flint-panel: #ffffff;
+  --flint-panel-2: #f0f2f4;
+  --flint-border: #e2e5e9;
+  --flint-text: #171a1f;
+  --flint-text-2: #3d4451;
+  --flint-muted: #697586;
+  --flint-faint: #9aa3b0;
+  --flint-accent: #3d6ea8;
+  --flint-accent-soft: #e6edf6;
+  --flint-spark: #b9791f;
+
+  --sl-color-bg: var(--flint-canvas);
+  --sl-color-bg-nav: var(--flint-panel);
+  --sl-color-bg-sidebar: var(--flint-canvas);
+  --sl-color-bg-inline-code: var(--flint-panel-2);
+  --sl-color-text: var(--flint-text);
+  --sl-color-text-accent: var(--flint-accent);
+  --sl-color-accent-low: var(--flint-accent-soft);
+  --sl-color-accent: var(--flint-accent);
+  --sl-color-accent-high: var(--flint-accent);
+  --sl-color-hairline-light: var(--flint-border);
+  --sl-color-hairline: var(--flint-border);
+  --sl-color-hairline-shade: var(--flint-border);
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+}
+
+/* The site logo's transparent-background square canvas still benefits from rounded
+ * corners so it reads as a deliberate icon chip. Starlight swaps light/dark PNGs itself
+ * (see astro.config.mjs's logo: { light, dark }) — this only affects the frame around it. */
+.site-title img {
+  border-radius: 6px;
+}

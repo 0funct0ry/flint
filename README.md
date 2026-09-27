@@ -6,6 +6,8 @@ Flint owns no data — every note stays a plain, portable Markdown file that rem
 
 **Governing principle:** the filesystem is the workspace, Markdown files are the knowledge base, Flint is the interface for working with them.
 
+**Documentation:** [0funct0ry.github.io/flint](https://0funct0ry.github.io/flint/)
+
 ---
 
 ## Repository Structure

@@ -1,7 +1,22 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { TreeNodeItem, HeadingItem, ContentHitGroup } from '../types';
 import { api } from '../services/ipc';
+import { slugify } from '../services/markdown';
+import {
+  buildOutlineTree,
+  OutlineNode,
+  parseHeadingsFromContent,
+  reorderSiblingsChange,
+  removeSectionChange,
+  sectionText,
+  siblingGroup,
+  swapWithAdjacentSibling,
+} from '../services/outline';
 import { ContextMenu, ContextMenuItem } from './ContextMenu';
+import { DeleteConfirmModal } from './DeleteConfirmModal';
+import { applyOutlineEdit } from './CenterPane';
+
+const CONFIRM_MOVE_TO_NEW_NOTE_KEY = 'outline.confirmMoveToNewNote';
 
 export type LeftTab = 'tree' | 'search' | 'outline';
 
@@ -18,7 +33,6 @@ export interface LeftSidebarProps {
   treeData: TreeNodeItem[];
   currentNotePath: string;
   onSelectNote: (path: string, targetLine?: number) => void;
-  headings: HeadingItem[];
   isEmpty?: boolean;
   error?: string | null;
   selectedFolderPath?: string;
@@ -37,6 +51,12 @@ export interface LeftSidebarProps {
   activeHeadingAnchor?: string;
   onSelectHeading?: (heading: HeadingItem) => void;
   onClose?: () => void;
+  /** Raw Markdown of the currently open note, used for outline copy/reorder/extract/delete (M10.09). */
+  noteContent?: string;
+  /** Fired after "Move to new note" successfully creates the new note, so the host can toast/refresh. */
+  onSectionMovedToNewNote?: (newNotePath: string) => void;
+  /** Fired if "Move to new note" fails (e.g. destination already exists). */
+  onSectionMoveFailed?: (message: string) => void;
 }
 
 export const LeftSidebar: React.FC<LeftSidebarProps> = ({
@@ -45,7 +65,6 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   treeData,
   currentNotePath,
   onSelectNote,
-  headings,
   isEmpty = false,
   error = null,
   selectedFolderPath = '',
@@ -64,6 +83,9 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   activeHeadingAnchor,
   onSelectHeading,
   onClose,
+  noteContent = '',
+  onSectionMovedToNewNote,
+  onSectionMoveFailed,
 }) => {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set(['projects', 'projects/payments', 'archive', 'reading', 'guides'])
@@ -85,6 +107,16 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   const [validationError, setValidationError] = useState<string | null>(null);
   const inlineInputRef = useRef<HTMLInputElement>(null);
   const treeContainerRef = useRef<HTMLDivElement>(null);
+
+  // Outline tab state (M10.09)
+  const [collapsedOutlineNodes, setCollapsedOutlineNodes] = useState<Set<string>>(new Set());
+  const [outlineContextMenu, setOutlineContextMenu] = useState<{ x: number; y: number; index: number } | null>(null);
+  const [draggedOutlineIndex, setDraggedOutlineIndex] = useState<number | null>(null);
+  const [outlineDropTarget, setOutlineDropTarget] = useState<{ groupIndices: number[]; beforePos: number } | null>(null);
+  const [deleteSectionIndex, setDeleteSectionIndex] = useState<number | null>(null);
+  const [extractState, setExtractState] = useState<{ index: number; value: string; error: string | null } | null>(null);
+  const [confirmExtractState, setConfirmExtractState] = useState<{ index: number; destPath: string } | null>(null);
+  const extractInputRef = useRef<HTMLInputElement>(null);
 
   // Keyboard tree navigation (Up/Down move focus between visible rows in document order;
   // Left/Right collapse/expand a focused folder, or hop to its parent when already collapsed).
@@ -443,8 +475,244 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
     setDraggedItem(null);
   };
 
+  // Focus the "Move to new note" destination input as soon as it opens — keyed on whether the
+  // dialog is open, not on `extractState` itself, which gets a new object identity on every
+  // keystroke; re-running this (and re-selecting all text) on every keystroke made it impossible
+  // to type more than one character before the selection swallowed it.
+  const isExtractOpen = extractState !== null;
+  useEffect(() => {
+    if (isExtractOpen) {
+      setTimeout(() => {
+        extractInputRef.current?.focus();
+        extractInputRef.current?.select();
+      }, 30);
+    }
+  }, [isExtractOpen]);
 
+  const liveHeadings = React.useMemo(() => parseHeadingsFromContent(noteContent), [noteContent]);
+  const outlineTree = React.useMemo(() => buildOutlineTree(liveHeadings), [liveHeadings]);
 
+  const isOutlineNodeVisible = (ancestors: string[]): boolean =>
+    !ancestors.some((anchor) => collapsedOutlineNodes.has(anchor));
+
+  const toggleOutlineNodeCollapsed = (anchor: string) => {
+    setCollapsedOutlineNodes((prev) => {
+      const next = new Set(prev);
+      if (next.has(anchor)) next.delete(anchor);
+      else next.add(anchor);
+      return next;
+    });
+  };
+
+  const allCollapsibleAnchors = (nodes: OutlineNode[]): string[] => {
+    const anchors: string[] = [];
+    for (const n of nodes) {
+      if (n.children.length > 0) {
+        anchors.push(n.heading.anchor);
+        anchors.push(...allCollapsibleAnchors(n.children));
+      }
+    }
+    return anchors;
+  };
+
+  const outlineHasCollapsibleNodes = allCollapsibleAnchors(outlineTree).length > 0;
+  const anyOutlineNodeCollapsed = collapsedOutlineNodes.size > 0;
+
+  const handleToggleCollapseAll = () => {
+    if (anyOutlineNodeCollapsed) {
+      setCollapsedOutlineNodes(new Set());
+    } else {
+      setCollapsedOutlineNodes(new Set(allCollapsibleAnchors(outlineTree)));
+    }
+  };
+
+  // Outline drag-to-reorder (M10.09). Deliberately NOT native HTML5 drag-and-drop (unlike the
+  // file tree above): native DnD's "drop only completes if the last dragover before release
+  // called preventDefault on exactly the released-over element" contract proved unreliable in
+  // practice (confirmed interactively — dragstart/dragover fired but drop silently never did),
+  // and is a well-known source of flakiness in embedded webviews. This is a self-contained
+  // mousedown/mousemove/mouseup implementation instead: full control over exactly when a drop is
+  // considered valid, no dependency on native drag semantics at all.
+  const commitOutlineReorder = (groupIndices: number[], beforePos: number, draggedIndex: number) => {
+    const fromPos = groupIndices.indexOf(draggedIndex);
+    if (fromPos === -1) return;
+    const withoutDragged = groupIndices.filter((_, i) => i !== fromPos);
+    const insertAt = fromPos < beforePos ? beforePos - 1 : beforePos;
+    const newOrder = [...withoutDragged.slice(0, insertAt), draggedIndex, ...withoutDragged.slice(insertAt)];
+    if (JSON.stringify(newOrder) !== JSON.stringify(groupIndices)) {
+      const change = reorderSiblingsChange(liveHeadings, noteContent, groupIndices, newOrder);
+      if (change) applyOutlineEdit([change]);
+    }
+  };
+
+  const outlineRowRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const pointerDragRef = useRef<{
+    index: number;
+    startX: number;
+    startY: number;
+    active: boolean;
+  } | null>(null);
+
+  const computeOutlineDropTarget = (index: number, clientY: number) => {
+    const group = siblingGroup(liveHeadings, index);
+    let beforePos = group.length;
+    for (let pos = 0; pos < group.length; pos++) {
+      const rowEl = outlineRowRefs.current.get(group[pos]);
+      if (!rowEl) continue;
+      const rect = rowEl.getBoundingClientRect();
+      if (clientY < rect.top + rect.height / 2) {
+        beforePos = pos;
+        break;
+      }
+    }
+    return { groupIndices: group, beforePos };
+  };
+
+  const handleOutlinePointerMove = (e: MouseEvent) => {
+    const drag = pointerDragRef.current;
+    if (!drag) return;
+    if (!drag.active) {
+      if (Math.abs(e.clientY - drag.startY) < 4 && Math.abs(e.clientX - drag.startX) < 4) return;
+      drag.active = true;
+      setDraggedOutlineIndex(drag.index);
+    }
+    setOutlineDropTarget(computeOutlineDropTarget(drag.index, e.clientY));
+  };
+
+  const endOutlinePointerDrag = (commit: boolean) => {
+    const drag = pointerDragRef.current;
+    pointerDragRef.current = null;
+    window.removeEventListener('mousemove', handleOutlinePointerMove);
+    window.removeEventListener('mouseup', handleOutlinePointerUp);
+    window.removeEventListener('keydown', handleOutlinePointerKeyDown);
+    if (commit && drag?.active) {
+      setOutlineDropTarget((target) => {
+        if (target) commitOutlineReorder(target.groupIndices, target.beforePos, drag.index);
+        return null;
+      });
+    } else {
+      setOutlineDropTarget(null);
+    }
+    setDraggedOutlineIndex(null);
+  };
+
+  function handleOutlinePointerUp() {
+    endOutlinePointerDrag(true);
+  }
+
+  function handleOutlinePointerKeyDown(e: KeyboardEvent) {
+    if (e.key === 'Escape') endOutlinePointerDrag(false);
+  }
+
+  const handleOutlineMouseDown = (e: React.MouseEvent, index: number) => {
+    if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest('button')) return; // don't hijack the collapse toggle
+    pointerDragRef.current = { index, startX: e.clientX, startY: e.clientY, active: false };
+    window.addEventListener('mousemove', handleOutlinePointerMove);
+    window.addEventListener('mouseup', handleOutlinePointerUp);
+    window.addEventListener('keydown', handleOutlinePointerKeyDown);
+  };
+
+  useEffect(() => {
+    return () => {
+      window.removeEventListener('mousemove', handleOutlinePointerMove);
+      window.removeEventListener('mouseup', handleOutlinePointerUp);
+      window.removeEventListener('keydown', handleOutlinePointerKeyDown);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleOutlineKeyDown = (e: React.KeyboardEvent, index: number) => {
+    if (e.altKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+      e.preventDefault();
+      const change = swapWithAdjacentSibling(liveHeadings, noteContent, index, e.key === 'ArrowUp' ? 'up' : 'down');
+      if (change) applyOutlineEdit([change]);
+    } else if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) {
+      e.preventDefault();
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      setOutlineContextMenu({ x: rect.left + 20, y: rect.bottom, index });
+    }
+  };
+
+  // Outline right-click context menu actions
+  const handleOutlineContextMenu = (e: React.MouseEvent, index: number) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setOutlineContextMenu({ x: e.clientX, y: e.clientY, index });
+  };
+
+  const buildOutlineMenuItems = (index: number): ContextMenuItem[] => {
+    const heading = liveHeadings[index];
+    return [
+      {
+        id: 'copy-heading',
+        label: 'Copy heading',
+        onClick: () => {
+          navigator.clipboard.writeText(heading.text);
+        },
+      },
+      {
+        id: 'copy-section',
+        label: 'Copy section',
+        onClick: () => {
+          navigator.clipboard.writeText(sectionText(liveHeadings, index, noteContent));
+        },
+      },
+      {
+        id: 'copy-link',
+        label: 'Copy link to section',
+        onClick: () => {
+          navigator.clipboard.writeText(`[${heading.text}](${currentNotePath}#${heading.anchor})`);
+        },
+      },
+      { id: 'sep1', label: '', separator: true, onClick: () => {} },
+      {
+        id: 'move-to-new-note',
+        label: 'Move to new note',
+        onClick: () => {
+          setExtractState({ index, value: `${slugify(heading.text) || 'untitled'}.md`, error: null });
+        },
+      },
+      { id: 'sep2', label: '', separator: true, onClick: () => {} },
+      {
+        id: 'delete',
+        label: 'Delete',
+        danger: true,
+        onClick: () => setDeleteSectionIndex(index),
+      },
+    ];
+  };
+
+  const performExtract = async (index: number, destPath: string) => {
+    const body = sectionText(liveHeadings, index, noteContent);
+    try {
+      await api.noteCreate(destPath, body);
+      const link = `[${liveHeadings[index].text}](${destPath})`;
+      applyOutlineEdit([{ ...removeSectionChange(liveHeadings, index, noteContent), insert: `${link}\n` }]);
+      onSectionMovedToNewNote?.(destPath);
+    } catch (err: any) {
+      onSectionMoveFailed?.(err?.message || String(err));
+    }
+  };
+
+  const handleExtractSubmit = async () => {
+    if (!extractState) return;
+    const trimmed = extractState.value.trim();
+    if (!trimmed) {
+      setExtractState({ ...extractState, error: 'Name cannot be empty' });
+      return;
+    }
+    const destPath = trimmed.endsWith('.md') ? trimmed : `${trimmed}.md`;
+    const index = extractState.index;
+    setExtractState(null);
+
+    const confirmFirst = (await api.configGet<boolean>(CONFIRM_MOVE_TO_NEW_NOTE_KEY)) ?? true;
+    if (confirmFirst) {
+      setConfirmExtractState({ index, destPath });
+    } else {
+      await performExtract(index, destPath);
+    }
+  };
   // Render recursive tree rows
   const renderTree = (items: TreeNodeItem[], depth = 0, currentParent = '') => {
     const isCreatingInThisFolder =
@@ -947,34 +1215,112 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
         {/* OUTLINE TAB */}
         {activeTab === 'outline' && (
           <div className="flex flex-col">
-            <div className="px-3 py-1.5 text-[11px] font-medium text-[var(--faint)] truncate">
-              {currentNotePath.split('/').pop()}
+            <div className="flex items-center gap-1.5 px-3 py-1.5">
+              <div className="flex-1 text-[11px] font-medium text-[var(--faint)] truncate">
+                {currentNotePath.split('/').pop()}
+              </div>
+              {outlineHasCollapsibleNodes && (
+                <button
+                  onClick={handleToggleCollapseAll}
+                  aria-pressed={anyOutlineNodeCollapsed}
+                  title={anyOutlineNodeCollapsed ? 'Expand all' : 'Collapse all'}
+                  aria-label={anyOutlineNodeCollapsed ? 'Expand all sections' : 'Collapse all sections'}
+                  className="w-5 h-5 flex items-center justify-center rounded text-[var(--muted)] hover:bg-[var(--panel-2)] hover:text-[var(--text)] transition-colors shrink-0"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    {anyOutlineNodeCollapsed ? (
+                      // Expand all: two chevrons pointing down (unfold)
+                      <>
+                        <polyline points="7 13 12 18 17 13" />
+                        <polyline points="7 6 12 11 17 6" />
+                      </>
+                    ) : (
+                      // Collapse all: two chevrons pointing up (fold)
+                      <>
+                        <polyline points="17 11 12 6 7 11" />
+                        <polyline points="17 18 12 13 7 18" />
+                      </>
+                    )}
+                  </svg>
+                </button>
+              )}
             </div>
-            {headings.length === 0 ? (
+            {liveHeadings.length === 0 ? (
               <div className="p-4 text-center text-xs text-[var(--faint)]">
                 No headings in this note.
               </div>
             ) : (
-              headings.map((h, i) => {
-                const indentClass =
-                  h.level === 1 ? 'pl-2.5' : h.level === 2 ? 'pl-6' : 'pl-9';
-                const isActive = activeHeadingAnchor === h.anchor;
-                return (
-                  <div
-                    key={i}
-                    onClick={() => onSelectHeading && onSelectHeading(h)}
-                    className={`flex items-center gap-1.5 h-6 pr-2 text-[12px] cursor-pointer select-none transition-colors ${indentClass} ${
-                      isActive
-                        ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
-                        : 'text-[var(--text-2)] hover:bg-[var(--panel-2)] hover:text-[var(--text)]'
-                    }`}
-                    title={h.text}
-                  >
-                    <span className={`text-xs ${isActive ? 'text-[var(--accent)]' : 'text-[var(--faint)]'}`}>§</span>
-                    <span className="truncate">{h.text}</span>
-                  </div>
-                );
-              })
+              <div role="tree" aria-label="Note outline">
+                {(function renderNodes(nodes: OutlineNode[], ancestors: string[]): React.ReactNode {
+                  if (!isOutlineNodeVisible(ancestors)) return null;
+                  return nodes.map((node) => {
+                    const { heading: h, index: i } = node;
+                    // Indent by tree depth (ancestors.length), not raw heading level, so a document
+                    // that jumps straight from H1 to H4 (or any other level gap) still nests one
+                    // step per actual tree depth instead of clamping every level ≥3 to the same
+                    // indent.
+                    const indentPx = 10 + ancestors.length * 14;
+                    const isActive = activeHeadingAnchor === h.anchor;
+                    const isCollapsed = collapsedOutlineNodes.has(h.anchor);
+                    const hasChildren = node.children.length > 0;
+                    const isDropBefore =
+                      outlineDropTarget &&
+                      outlineDropTarget.groupIndices[outlineDropTarget.beforePos] === i;
+
+                    return (
+                      <React.Fragment key={h.anchor + i}>
+                        {isDropBefore && (
+                          <div className="h-0.5 mx-2 bg-[var(--accent)] rounded" />
+                        )}
+                        <div
+                          role="treeitem"
+                          aria-selected={isActive}
+                          aria-expanded={hasChildren ? !isCollapsed : undefined}
+                          data-outline-index={i}
+                          ref={(el) => {
+                            if (el) outlineRowRefs.current.set(i, el);
+                            else outlineRowRefs.current.delete(i);
+                          }}
+                          tabIndex={0}
+                          onMouseDown={(e) => handleOutlineMouseDown(e, i)}
+                          onContextMenu={(e) => handleOutlineContextMenu(e, i)}
+                          onKeyDown={(e) => handleOutlineKeyDown(e, i)}
+                          onClick={() => onSelectHeading && onSelectHeading(h)}
+                          title={h.text}
+                          style={{ paddingLeft: `${indentPx}px` }}
+                          className={`flex items-center gap-1 h-6 pr-2 text-[12px] cursor-pointer select-none transition-colors focus:outline-none focus:ring-1 focus:ring-inset focus:ring-[var(--accent)] ${
+                            isActive
+                              ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
+                              : 'text-[var(--text-2)] hover:bg-[var(--panel-2)] hover:text-[var(--text)]'
+                          } ${draggedOutlineIndex === i ? 'opacity-40' : ''}`}
+                        >
+                          {hasChildren ? (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleOutlineNodeCollapsed(h.anchor);
+                              }}
+                              className="w-3 h-3 flex items-center justify-center shrink-0 text-[var(--faint)]"
+                              aria-label={isCollapsed ? 'Expand section' : 'Collapse section'}
+                            >
+                              {isCollapsed ? '▸' : '▾'}
+                            </button>
+                          ) : (
+                            <span className={`text-xs w-3 text-center shrink-0 ${isActive ? 'text-[var(--accent)]' : 'text-[var(--faint)]'}`}>§</span>
+                          )}
+                          <span className="truncate">{h.text}</span>
+                        </div>
+                        {hasChildren && renderNodes(node.children, [...ancestors, h.anchor])}
+                        {outlineDropTarget &&
+                          outlineDropTarget.groupIndices[outlineDropTarget.groupIndices.length - 1] === i &&
+                          outlineDropTarget.beforePos === outlineDropTarget.groupIndices.length && (
+                            <div className="h-0.5 mx-2 bg-[var(--accent)] rounded" />
+                          )}
+                      </React.Fragment>
+                    );
+                  });
+                })(outlineTree, [])}
+              </div>
             )}
           </div>
         )}
@@ -987,6 +1333,89 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
           y={contextMenu.y}
           items={getContextMenuItems()}
           onClose={() => setContextMenu(null)}
+        />
+      )}
+
+      {/* Outline node context menu */}
+      {outlineContextMenu && (
+        <ContextMenu
+          x={outlineContextMenu.x}
+          y={outlineContextMenu.y}
+          items={buildOutlineMenuItems(outlineContextMenu.index)}
+          onClose={() => setOutlineContextMenu(null)}
+        />
+      )}
+
+      {/* "Move to new note" destination prompt */}
+      {extractState && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-[1px]"
+        >
+          <div className="w-[380px] bg-[var(--panel)] border border-[var(--border)] rounded-[8px] shadow-[var(--shadow)] p-4 text-[13px] flex flex-col gap-3">
+            <h2 className="text-[14px] font-semibold text-[var(--text)]">Move section to new note</h2>
+            <input
+              ref={extractInputRef}
+              type="text"
+              value={extractState.value}
+              onChange={(e) => setExtractState({ ...extractState, value: e.target.value, error: null })}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleExtractSubmit();
+                else if (e.key === 'Escape') setExtractState(null);
+              }}
+              className="w-full px-2 py-1.5 text-[13px] text-[var(--text)] bg-[var(--canvas)] border border-[var(--border)] rounded-[5px] focus:outline-none focus:border-[var(--accent)]"
+            />
+            {extractState.error && <div className="text-[11.5px] text-[#e06c75]">{extractState.error}</div>}
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                onClick={() => setExtractState(null)}
+                className="px-3 py-1.5 text-[12.5px] text-[var(--text-2)] hover:text-[var(--text)] hover:bg-[var(--panel-2)] rounded-[5px] transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleExtractSubmit}
+                className="px-3.5 py-1.5 text-[12.5px] font-medium bg-[var(--accent)] text-white hover:opacity-90 rounded-[5px] transition-colors"
+              >
+                Move
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Confirm before extracting (outline.confirmMoveToNewNote, default on) */}
+      {confirmExtractState && (
+        <DeleteConfirmModal
+          isOpen
+          title="Move to new note?"
+          message="This creates a new note with this section's content, removes the section from this note, and inserts a link in its place."
+          itemName={confirmExtractState.destPath}
+          confirmLabel="Move to New Note"
+          confirmDanger={false}
+          onCancel={() => setConfirmExtractState(null)}
+          onConfirm={() => {
+            const { index, destPath } = confirmExtractState;
+            setConfirmExtractState(null);
+            void performExtract(index, destPath);
+          }}
+        />
+      )}
+
+      {/* Confirm before deleting a section */}
+      {deleteSectionIndex !== null && (
+        <DeleteConfirmModal
+          isOpen
+          title="Delete section"
+          message="This removes the heading, its body, and all nested sub-headings from this note. This only edits the note's content — it does not delete the note itself."
+          itemName={liveHeadings[deleteSectionIndex].text}
+          onCancel={() => setDeleteSectionIndex(null)}
+          onConfirm={() => {
+            const index = deleteSectionIndex;
+            setDeleteSectionIndex(null);
+            applyOutlineEdit([removeSectionChange(liveHeadings, index, noteContent)]);
+          }}
         />
       )}
     </aside>

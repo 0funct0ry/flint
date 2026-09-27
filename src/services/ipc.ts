@@ -25,6 +25,7 @@ export const isTauriEnvironment = (): boolean => {
 
 // Fallback in-memory storage for browser dev/test
 const browserMockStorage: Record<string, { content: string; hash: string; modified: number }> = {};
+const browserMockConfig: Record<string, unknown> = {};
 const browserMockTree: TreeNodeItem[] = [
   {
     id: "projects",
@@ -540,6 +541,21 @@ export const api = {
       return await invoke<string[]>("recent_workspaces");
     }
     return [];
+  },
+
+  async configGet<T = unknown>(key: string): Promise<T | null> {
+    if (isTauriEnvironment()) {
+      return await invoke<T | null>("config_get", { key });
+    }
+    const raw = browserMockConfig[key];
+    return raw === undefined ? null : (raw as T);
+  },
+
+  async configSet(key: string, value: unknown): Promise<void> {
+    if (isTauriEnvironment()) {
+      return await invoke<void>("config_set", { key, value });
+    }
+    browserMockConfig[key] = value;
   },
 };
 

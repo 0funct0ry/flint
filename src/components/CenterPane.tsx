@@ -183,6 +183,19 @@ function getAllNotePaths(tree: TreeNodeItem[]): Array<{ path: string; title?: st
  */
 let openTableBuilder: ((view: EditorView) => void) | null = null;
 
+/**
+ * Same bridge pattern as `openTableBuilder`, for the M10.09 outline panel: reorder, copy-section,
+ * move-to-new-note, and delete all need to dispatch a single transaction into the currently
+ * mounted `EditorView` from outside this component. Set on mount, cleared on unmount.
+ */
+let applyOutlineEditBridge: ((changes: { from: number; to: number; insert: string }[]) => void) | null = null;
+
+/** Dispatch one or more changes as a single CodeMirror transaction (one undo step) into the
+ *  currently mounted editor, if any. Used by the outline panel (M10.09) via `LeftSidebar`. */
+export function applyOutlineEdit(changes: { from: number; to: number; insert: string }[]): void {
+  applyOutlineEditBridge?.(changes);
+}
+
 interface EditorCommandDef {
   id: string;
   title: string;
@@ -431,6 +444,20 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     };
     return () => {
       openTableBuilder = null;
+    };
+  }, []);
+
+  // Bridge outline-panel edits (M10.09) into this instance's live EditorView — see
+  // `applyOutlineEdit`'s doc comment.
+  useEffect(() => {
+    applyOutlineEditBridge = (changes) => {
+      const view = editorViewRef.current;
+      if (!view || changes.length === 0) return;
+      view.focus();
+      view.dispatch({ changes });
+    };
+    return () => {
+      applyOutlineEditBridge = null;
     };
   }, []);
 

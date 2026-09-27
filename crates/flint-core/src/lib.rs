@@ -2,8 +2,10 @@
 //!
 //! This crate has zero Tauri or GUI dependencies and can be tested in complete isolation.
 
+pub mod config;
 pub mod md_extensions;
 pub mod render;
+pub use config::{config_get, config_set};
 pub use render::{render_note_markdown, RenderResult};
 
 use serde::{Deserialize, Serialize};

@@ -6,6 +6,10 @@ export interface DeleteConfirmModalProps {
   message: string;
   itemName: string;
   isFolder?: boolean;
+  /** Label for the confirm button; defaults to the destructive-delete wording this modal was built for. */
+  confirmLabel?: string;
+  /** Whether the confirm button uses the danger (red) styling; defaults to true. */
+  confirmDanger?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -16,6 +20,8 @@ export const DeleteConfirmModal: React.FC<DeleteConfirmModalProps> = ({
   message,
   itemName,
   isFolder = false,
+  confirmLabel = 'Delete Permanently',
+  confirmDanger = true,
   onConfirm,
   onCancel,
 }) => {
@@ -75,9 +81,11 @@ export const DeleteConfirmModal: React.FC<DeleteConfirmModalProps> = ({
           <button
             ref={confirmBtnRef}
             onClick={onConfirm}
-            className="px-3.5 py-1.5 text-[12.5px] font-medium bg-[#e06c75] text-white hover:bg-[#d05c65] rounded-[5px] transition-colors shadow-sm"
+            className={`px-3.5 py-1.5 text-[12.5px] font-medium text-white rounded-[5px] transition-colors shadow-sm ${
+              confirmDanger ? 'bg-[#e06c75] hover:bg-[#d05c65]' : 'bg-[var(--accent)] hover:opacity-90'
+            }`}
           >
-            Delete Permanently
+            {confirmLabel}
           </button>
         </div>
       </div>

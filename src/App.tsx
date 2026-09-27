@@ -1342,7 +1342,6 @@ export const App: React.FC = () => {
             treeData={treeData}
             currentNotePath={currentNotePath}
             onSelectNote={handleSelectNote}
-            headings={currentNote.headings}
             isEmpty={treeData.length === 0}
             error={treeError}
             selectedFolderPath={selectedFolderPath}
@@ -1371,6 +1370,15 @@ export const App: React.FC = () => {
               }
             }}
             onClose={() => setLeftSidebarVisible(false)}
+            noteContent={currentNote.content}
+            onSectionMovedToNewNote={(newNotePath) => {
+              showToast(`Moved section to new note "${newNotePath}"`);
+              void refreshTree();
+              void refreshStats();
+            }}
+            onSectionMoveFailed={(message) => {
+              showToast(`Could not move section: ${message}`);
+            }}
           />
         )}
 

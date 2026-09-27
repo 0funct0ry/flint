@@ -936,6 +936,20 @@ fn workspace_doctor(state: State<AppState>) -> Result<flint_core::DoctorReport, 
     flint_core::check_workspace_health(&root)
 }
 
+/// Read a single per-workspace config key (SPEC §11, M10.09). Returns `null` if unset.
+#[tauri::command]
+fn config_get(key: String, state: State<AppState>) -> Result<Option<serde_json::Value>, String> {
+    let root = get_workspace_root(&state)?;
+    flint_core::config_get(&root, &key).map_err(|e| e.to_string())
+}
+
+/// Write a single per-workspace config key to `.flint/config.json` (SPEC §11, M10.09).
+#[tauri::command]
+fn config_set(key: String, value: serde_json::Value, state: State<AppState>) -> Result<(), String> {
+    let root = get_workspace_root(&state)?;
+    flint_core::config_set(&root, &key, value).map_err(|e| e.to_string())
+}
+
 /// Open an external URL in the default system browser (SPEC §6.3, §11, M6).
 #[tauri::command]
 fn open_external(url: String) -> Result<(), String> {
@@ -1015,7 +1029,9 @@ pub fn build_app(
             links_outgoing,
             open_external,
             choose_folder,
-            recent_workspaces
+            recent_workspaces,
+            config_get,
+            config_set
         ])
 }
 

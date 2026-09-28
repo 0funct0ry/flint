@@ -31,6 +31,11 @@ const DEFAULT_CONFIG: FlintConfig = {
     rightSidebarVisible: true,
     showNonNoteFiles: false,
   },
+  mcp: {
+    enabled: false,
+    port: null,
+    requireAuth: false,
+  },
   ignore: [],
   layout: {},
 };

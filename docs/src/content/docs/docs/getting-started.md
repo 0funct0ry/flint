@@ -38,7 +38,7 @@ a setup script:
 
 ```
 $ flint init ~/notes
-created ~/notes/.flint/config.json
+created ~/notes/.flint.db
 created ~/notes/index.md
 ```
 
@@ -63,17 +63,16 @@ a script), then opens with one starter note and the file tree focused.
 
 ## Opening your first workspace
 
-The first time a directory is opened, Flint adds one folder inside it:
+The first time a directory is opened, Flint adds one file inside it:
 
 ```
 ~/notes/
-├── .flint/
-│   └── config.json      Flint's settings for this workspace
+├── .flint.db             Flint's settings for this workspace (an embedded database, not a note)
 └── index.md
 ```
 
-Nothing else is added, moved, or rewritten. Delete `.flint/` and you lose only Flint's settings for
-that workspace — the rest of your files are untouched.
+Nothing else is added, moved, or rewritten. Delete `.flint.db` and you lose only Flint's settings
+for that workspace — the rest of your files are untouched.
 
 From here, see [Concepts](/flint/docs/concepts/) for the vocabulary Flint uses everywhere, or the
 [CLI Reference](/flint/docs/cli-reference/) for every subcommand and flag.

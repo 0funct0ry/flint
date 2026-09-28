@@ -18,6 +18,7 @@ import {
   WorkspaceStats,
   ConfigGetResult,
   FlintConfig,
+  McpStatus,
 } from "../types";
 import { FIXTURE_NOTES } from "../fixtures/workspace";
 import { renderMarkdownToHtml, slugify, dedupSlug } from "./markdown";
@@ -60,6 +61,11 @@ const DEFAULT_CONFIG: FlintConfig = {
     leftSidebar: "tree",
     rightSidebarVisible: true,
     showNonNoteFiles: false,
+  },
+  mcp: {
+    enabled: false,
+    port: null,
+    requireAuth: false,
   },
   ignore: ["node_modules/**", ".obsidian/**"],
   layout: {},
@@ -722,6 +728,35 @@ export const api = {
       }
       return null;
     });
+  },
+
+  /** Query the local MCP server's lifecycle state (M10.21). Off outside Tauri (browser dev). */
+  async mcpStatus(): Promise<McpStatus> {
+    if (isTauriEnvironment()) {
+      return await invoke<McpStatus>("mcp_status");
+    }
+    return { state: "off", requiresAuth: false, hasToken: false };
+  },
+
+  /**
+   * Generate (or, if one already exists, rotate) the MCP server's bearer token without
+   * restarting Flint (M10.21) — the only way a token is ever created; persisted so it survives
+   * restarts.
+   */
+  async mcpRotateToken(): Promise<string> {
+    if (isTauriEnvironment()) {
+      return await invoke<string>("mcp_rotate_token");
+    }
+    throw new Error("MCP server is not available outside the desktop app");
+  },
+
+  /** Read the currently-generated MCP token (if any) without rotating it, so Settings can
+   * redisplay it (e.g. after reopening the panel) without invalidating a client's config. */
+  async mcpGetToken(): Promise<string | null> {
+    if (isTauriEnvironment()) {
+      return await invoke<string | null>("mcp_get_token");
+    }
+    return null;
   },
 };
 

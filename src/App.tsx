@@ -24,6 +24,7 @@ import {
   FrontMatterField,
   IndexProgressEvent,
   LinkItem,
+  McpStatus,
   NoteContent,
   NoteFixture,
   NoteMeta,
@@ -74,6 +75,11 @@ export const App: React.FC = () => {
   });
   const [indexingProgress, setIndexingProgress] = useState<IndexProgressEvent | null>(null);
   const [isWatcherDegraded, setIsWatcherDegraded] = useState(false);
+  const [mcpStatus, setMcpStatus] = useState<McpStatus>({
+    state: 'off',
+    requiresAuth: false,
+    hasToken: false,
+  });
   const [indexedNotes, setIndexedNotes] = useState<NoteMeta[]>([]);
   const [unresolvedLinks, setUnresolvedLinks] = useState<LinkItem[]>([]);
   const [unresolvedModalOpen, setUnresolvedModalOpen] = useState(false);
@@ -416,6 +422,7 @@ export const App: React.FC = () => {
     let unlistenRemoved: (() => void) | undefined;
     let unlistenRenamed: (() => void) | undefined;
     let unlistenDegraded: (() => void) | undefined;
+    let unlistenMcpStatus: (() => void) | undefined;
 
     if (isTauriEnvironment()) {
       listen<IndexProgressEvent>('index:progress', (event) => {
@@ -505,6 +512,19 @@ export const App: React.FC = () => {
       }).then((unsub) => {
         unlistenDegraded = unsub;
       });
+
+      listen<McpStatus>('mcp:status', (event) => {
+        if (mounted) {
+          setMcpStatus(event.payload);
+        }
+      }).then((unsub) => {
+        unlistenMcpStatus = unsub;
+      });
+      api.mcpStatus().then((status) => {
+        if (mounted) {
+          setMcpStatus(status);
+        }
+      });
     }
 
     return () => {
@@ -516,6 +536,7 @@ export const App: React.FC = () => {
       if (unlistenRemoved) unlistenRemoved();
       if (unlistenRenamed) unlistenRenamed();
       if (unlistenDegraded) unlistenDegraded();
+      if (unlistenMcpStatus) unlistenMcpStatus();
     };
     // Mount-only: must run exactly once regardless of later identity changes to its callbacks,
     // including handleSelectNote (used only for M10.06's initial_note focus on first load).
@@ -742,6 +763,16 @@ export const App: React.FC = () => {
     },
     [handleSelectNote, refreshStats, refreshTree, showToast]
   );
+
+  // Rotate the local MCP server's bearer token without restarting Flint (M10.21)
+  const handleRotateMcpToken = useCallback(async () => {
+    try {
+      await api.mcpRotateToken();
+      showToast('MCP token rotated. Update any connected client with the new token.');
+    } catch (err: any) {
+      showToast(`Failed to rotate MCP token: ${err?.message || String(err)}`);
+    }
+  }, [showToast]);
 
   // Open external URL in system browser (SPEC §6.3, M6)
   const handleOpenExternal = useCallback(
@@ -1502,6 +1533,8 @@ export const App: React.FC = () => {
         lineEnding={textStats.lineEnding}
         indexingProgress={indexingProgress}
         isWatcherDegraded={isWatcherDegraded}
+        mcpStatus={mcpStatus}
+        onRotateMcpToken={handleRotateMcpToken}
         onClickUnresolved={() => setUnresolvedModalOpen(true)}
         cursorLine={
           currentNotePath && viewMode !== 'read' && cursorPosition ? cursorPosition.line : undefined

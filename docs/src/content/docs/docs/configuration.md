@@ -1,10 +1,14 @@
 ---
 title: Configuration
-description: Every field in .flint/config.json, its default, and what it does.
+description: Every workspace config field, its default, and what it does.
 ---
 
-Configuration lives at `<workspace>/.flint/config.json`. Unknown keys are preserved; an invalid
-config falls back to defaults with a dismissible notice, and never blocks startup.
+Configuration is workspace-scoped, persisted in `<workspace-root>/.flint.db` — a small embedded
+database (via `redb`, a pure-Rust engine; not SQLite), one row per dotted key below. Before
+M10.21 this lived at `<workspace>/.flint/config.json` as a single JSON file; the shape below is
+still the accurate mental model of the full resolved config, it just isn't a literal file
+anymore. Unknown keys are preserved; an invalid config falls back to defaults with a dismissible
+notice, and never blocks startup.
 
 ```json
 {
@@ -35,6 +39,11 @@ config falls back to defaults with a dismissible notice, and never blocks startu
     "leftSidebar": "tree",
     "rightSidebarVisible": true,
     "showNonNoteFiles": false
+  },
+  "mcp": {
+    "enabled": false,
+    "port": null,
+    "requireAuth": false
   },
   "ignore": ["node_modules/**", ".obsidian/**"]
 }
@@ -86,5 +95,17 @@ config falls back to defaults with a dismissible notice, and never blocks startu
 | `rightSidebarVisible` | `true` | Whether the backlinks/outline sidebar starts open |
 | `showNonNoteFiles` | `false` | Show non-Markdown files in the workspace tree |
 
-See the in-app Settings screen for a friendlier editor over the same fields — it writes to this
-same file.
+## `mcp`
+
+| Field | Default | Effect |
+| --- | --- | --- |
+| `enabled` | `false` | Start the local MCP server (M10.21) on next launch. Also settable per-launch with `--mcp`, which overrides this for that run only |
+| `port` | `null` | Preferred port for the MCP server. `null` uses the default (`4870`); either way, an already-taken port falls back to an OS-assigned ephemeral one |
+| `requireAuth` | `false` | Require a bearer token on every MCP request. Also settable per-launch with `--mcp-auth`. The token itself is never a config field — it's generated/rotated from Settings → MCP Server and persisted separately in `.flint.db` |
+
+See [MCP Server — Claude Code](/flint/docs/mcp-server-claude/) or
+[MCP Server — Antigravity](/flint/docs/mcp-server-antigravity/) for how to connect a coding agent
+to it.
+
+See the in-app Settings screen for a friendlier editor over the same fields — it writes to the
+same `.flint.db`.

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useSettings } from '../context/SettingsContext';
 import { api } from '../services/ipc';
+import { McpStatus } from '../types';
 
 export interface SettingsPanelProps {
   onClose: () => void;
@@ -74,6 +75,46 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
   const [ignoreText, setIgnoreText] = useState(config.ignore.join('\n'));
   const [ignoreErrors, setIgnoreErrors] = useState<Record<number, string>>({});
   const validateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [mcpStatus, setMcpStatus] = useState<McpStatus>({
+    state: 'off',
+    requiresAuth: false,
+    hasToken: false,
+  });
+  const [mcpToken, setMcpToken] = useState<string | null>(null);
+  const [mcpRotating, setMcpRotating] = useState(false);
+  const [mcpTokenCopied, setMcpTokenCopied] = useState(false);
+
+  useEffect(() => {
+    api.mcpStatus().then(setMcpStatus);
+  }, []);
+
+  useEffect(() => {
+    if (mcpStatus.requiresAuth && mcpStatus.hasToken) {
+      api.mcpGetToken().then(setMcpToken);
+    } else {
+      setMcpToken(null);
+    }
+  }, [mcpStatus.requiresAuth, mcpStatus.hasToken]);
+
+  const handleGenerateOrRotateToken = () => {
+    setMcpRotating(true);
+    api
+      .mcpRotateToken()
+      .then((token) => {
+        setMcpToken(token);
+        return api.mcpStatus();
+      })
+      .then(setMcpStatus)
+      .finally(() => setMcpRotating(false));
+  };
+
+  const handleCopyToken = () => {
+    if (!mcpToken) return;
+    navigator.clipboard?.writeText(mcpToken).then(() => {
+      setMcpTokenCopied(true);
+      setTimeout(() => setMcpTokenCopied(false), 1500);
+    });
+  };
 
   // Reflect external config changes (e.g. reset, or a fresh load) into the textarea.
   useEffect(() => {
@@ -330,6 +371,93 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
             aria-label="Show non-note files"
           />
         </FieldRow>
+
+        <SectionHeader title="MCP Server" />
+        <FieldRow
+          label="Enabled"
+          path="mcp.enabled"
+          origins={origins}
+          onReset={resetField}
+          hint="Takes effect on next launch. Loopback-only, bearer-token gated — see Docs > MCP Server."
+        >
+          <input
+            type="checkbox"
+            className={checkboxClass}
+            checked={config.mcp.enabled}
+            onChange={(e) => setField('mcp.enabled', e.target.checked)}
+            aria-label="MCP server enabled"
+          />
+        </FieldRow>
+        <FieldRow
+          label="Port"
+          path="mcp.port"
+          origins={origins}
+          onReset={resetField}
+          hint="Falls back to an ephemeral port if taken. Blank uses the default (4870)."
+        >
+          <input
+            type="number"
+            className={inputClass}
+            value={config.mcp.port ?? ''}
+            onChange={(e) => setField('mcp.port', e.target.value === '' ? null : Number(e.target.value))}
+            aria-label="MCP server port"
+          />
+        </FieldRow>
+        <FieldRow
+          label="Require bearer token"
+          path="mcp.requireAuth"
+          origins={origins}
+          onReset={resetField}
+          hint="Off by default: any local process/user can connect. Takes effect on next launch."
+        >
+          <input
+            type="checkbox"
+            className={checkboxClass}
+            checked={config.mcp.requireAuth}
+            onChange={(e) => setField('mcp.requireAuth', e.target.checked)}
+            aria-label="Require bearer token for MCP server"
+          />
+        </FieldRow>
+        <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)] text-[12.5px] text-[var(--text)]">
+          <span className="flex-1 min-w-0">
+            Status:{' '}
+            {mcpStatus.state === 'listening' && (
+              <span className="text-[var(--accent)] break-all">listening on {mcpStatus.url}</span>
+            )}
+            {mcpStatus.state === 'starting' && <span className="text-[var(--muted)]">starting</span>}
+            {mcpStatus.state === 'error' && (
+              <span className="text-[var(--spark)]">error: {mcpStatus.message}</span>
+            )}
+            {mcpStatus.state === 'off' && <span className="text-[var(--faint)]">off</span>}
+          </span>
+          {mcpStatus.state === 'listening' && mcpStatus.requiresAuth && (
+            <button
+              onClick={handleGenerateOrRotateToken}
+              disabled={mcpRotating}
+              className="text-[11px] px-1.5 py-[2px] rounded-[4px] text-[var(--muted)] hover:bg-[var(--panel-2)] hover:text-[var(--text)] transition-colors disabled:opacity-30"
+            >
+              {mcpRotating ? 'working…' : mcpStatus.hasToken ? 'rotate token' : 'generate token'}
+            </button>
+          )}
+        </div>
+        {mcpStatus.state === 'listening' && mcpStatus.requiresAuth && mcpToken && (
+          <div className="flex items-center gap-2 px-3 py-2 border-b border-[var(--border)] text-[12px]">
+            <code className="flex-1 min-w-0 truncate font-mono text-[var(--text)] bg-[var(--panel-2)] rounded-[4px] px-1.5 py-[3px]">
+              {mcpToken}
+            </code>
+            <button
+              onClick={handleCopyToken}
+              className="text-[11px] px-1.5 py-[2px] rounded-[4px] text-[var(--muted)] hover:bg-[var(--panel-2)] hover:text-[var(--text)] transition-colors"
+            >
+              {mcpTokenCopied ? 'copied' : 'copy'}
+            </button>
+          </div>
+        )}
+        {mcpStatus.state === 'listening' && mcpStatus.requiresAuth && !mcpStatus.hasToken && (
+          <div className="px-3 pb-2 text-[11px] text-[var(--faint)]">
+            Every MCP request is rejected until a token is generated.
+          </div>
+        )}
 
         <SectionHeader title="Ignore" />
         <div className="px-3 pb-3">

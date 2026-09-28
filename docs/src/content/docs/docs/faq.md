@@ -14,10 +14,12 @@ through your package manager or by downloading a new release; Flint never checks
 
 Exactly where you put them. A workspace is a directory you chose, and every note is a plain
 `.md`/`.markdown` file inside it, at the workspace-relative path you gave it. Flint's own state is
-limited to `<workspace>/.flint/config.json` (per-workspace settings) and a small OS config
-directory for app-wide defaults. The in-memory index of notes, titles, and links is rebuilt on
-every startup and is never persisted — there is no SQLite database and nothing else touches your
-files without you asking.
+limited to `<workspace-root>/.flint.db` — a small embedded database (via `redb`, a pure-Rust
+engine; not SQLite) holding Flint's own per-workspace settings and, if you've turned on the local
+MCP server's optional authentication, its access token — and a small OS config directory for
+app-wide defaults. The in-memory index of notes, titles, and links is rebuilt on every startup and
+is never persisted to a database either — nothing in `.flint.db` is a copy of your notes'
+content, and nothing else touches your files without you asking.
 
 ### What happens if a note changes on disk while I have it open?
 

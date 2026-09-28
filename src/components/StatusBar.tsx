@@ -1,4 +1,5 @@
 import React from 'react';
+import type { McpStatus } from '../types';
 
 export interface StatusBarProps {
   workspaceName: string;
@@ -13,7 +14,9 @@ export interface StatusBarProps {
   lineEnding?: 'LF' | 'CRLF';
   indexingProgress?: { indexed: number; total: number } | null;
   isWatcherDegraded?: boolean;
+  mcpStatus?: McpStatus;
   onClickUnresolved?: () => void;
+  onRotateMcpToken?: () => void;
 }
 
 export const StatusBar: React.FC<StatusBarProps> = ({
@@ -29,7 +32,9 @@ export const StatusBar: React.FC<StatusBarProps> = ({
   lineEnding = 'LF',
   indexingProgress = null,
   isWatcherDegraded = false,
+  mcpStatus = { state: 'off', requiresAuth: false, hasToken: false },
   onClickUnresolved,
+  onRotateMcpToken,
 }) => {
   return (
     <footer className="flex items-center gap-3.5 h-6 shrink-0 px-3 border-t border-[var(--border)] bg-[var(--panel-2)] text-[11.5px] text-[var(--muted)] font-mono select-none">
@@ -69,6 +74,35 @@ export const StatusBar: React.FC<StatusBarProps> = ({
         <span>Markdown</span>
         <span>UTF-8</span>
         <span>{lineEnding}</span>
+        {mcpStatus.state === 'listening' && mcpStatus.requiresAuth && (
+          <button
+            onClick={onRotateMcpToken}
+            className="text-[var(--accent)] hover:underline cursor-pointer bg-transparent border-0 p-0 font-mono text-[11.5px]"
+            title={`MCP server listening on ${mcpStatus.url}. Click to ${
+              mcpStatus.hasToken ? 'rotate its token' : 'generate a token'
+            }.`}
+          >
+            mcp: listening
+          </button>
+        )}
+        {mcpStatus.state === 'listening' && !mcpStatus.requiresAuth && (
+          <span
+            className="text-[var(--muted)]"
+            title={`MCP server listening on ${mcpStatus.url}. No authentication — any local process or user can connect.`}
+          >
+            mcp: listening
+          </span>
+        )}
+        {mcpStatus.state === 'starting' && (
+          <span className="text-[var(--muted)]" title="Local MCP server is starting">
+            mcp: starting
+          </span>
+        )}
+        {mcpStatus.state === 'error' && (
+          <span className="text-[var(--spark)]" title={`MCP server error: ${mcpStatus.message}`}>
+            mcp: error
+          </span>
+        )}
         {isWatcherDegraded ? (
           <span
             className="text-[var(--spark)] flex items-center gap-1"

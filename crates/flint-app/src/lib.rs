@@ -1,3 +1,5 @@
+mod mcp;
+
 use flint_core::{
     bootstrap_workspace, build_workspace_tree, create_folder, create_note, delete_folder,
     delete_path, duplicate_note, get_last_workspace, get_recent_workspaces, is_default_ignored,
@@ -7,6 +9,7 @@ use flint_core::{
     Link, NoteContent, NoteMeta, RenderResult, ResolvedWorkspaceTarget, SafePath, TreeNodeItem,
     WorkspaceInfo, WorkspaceStats,
 };
+pub use mcp::{McpHandle, McpStatus};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -35,6 +38,14 @@ pub struct AppState {
     pub index: Arc<RwLock<Index>>,
     pub suppressed_writes: Arc<Mutex<HashMap<String, SuppressedWrite>>>,
     pub watcher_stop: Arc<AtomicBool>,
+    /// The local MCP server (M10.21) — off until `--mcp`/`mcp.enabled` is set at launch.
+    pub mcp: Arc<McpHandle>,
+    /// Set from the CLI's `--mcp` flag; ORed with the workspace's `mcp.enabled` config so
+    /// either can turn the server on for this launch.
+    pub mcp_cli_override: bool,
+    /// Set from the CLI's `--mcp-auth` flag; ORed with the workspace's `mcp.requireAuth` config,
+    /// same pattern as `mcp_cli_override` (M10.21 change: auth is opt-in, off by default).
+    pub mcp_auth_cli_override: bool,
 }
 
 impl Default for AppState {
@@ -45,12 +56,15 @@ impl Default for AppState {
             index: Arc::new(RwLock::new(Index::new())),
             suppressed_writes: Arc::new(Mutex::new(HashMap::new())),
             watcher_stop: Arc::new(AtomicBool::new(false)),
+            mcp: Arc::new(McpHandle::default()),
+            mcp_cli_override: false,
+            mcp_auth_cli_override: false,
         }
     }
 }
 
 /// Record a path being written by Flint to suppress subsequent watcher event.
-fn record_suppressed_write(
+pub(crate) fn record_suppressed_write(
     suppressed_map: &Arc<Mutex<HashMap<String, SuppressedWrite>>>,
     posix_path: &str,
     content_hash: Option<String>,
@@ -92,6 +106,16 @@ fn is_suppressed_write(
         }
     }
     false
+}
+
+/// Read the workspace's effective `mcp` config (workspace override over global default),
+/// falling back to `McpConfig::default()` (off) on any load failure.
+fn read_mcp_config(root: &Path) -> flint_core::config::McpConfig {
+    flint_core::config_get(root, None)
+        .ok()
+        .and_then(|r| serde_json::from_value::<flint_core::config::FlintConfig>(r.config).ok())
+        .map(|c| c.mcp)
+        .unwrap_or_default()
 }
 
 /// Helper to obtain the active workspace root or fallback to current dir.
@@ -520,12 +544,27 @@ fn workspace_open(
     // Start new filesystem watcher per SPEC §10.4
     state.watcher_stop.store(false, Ordering::Relaxed);
     spawn_filesystem_watcher(
-        root,
-        app_handle,
+        root.clone(),
+        app_handle.clone(),
         Arc::clone(&state.index),
         Arc::clone(&state.suppressed_writes),
         Arc::clone(&state.watcher_stop),
     );
+
+    // Start (or restart, if switching workspaces) the local MCP server per M10.21.
+    let mcp_cfg = read_mcp_config(&root);
+    if state.mcp_cli_override || mcp_cfg.enabled {
+        state.mcp.start(
+            root,
+            app_handle,
+            Arc::clone(&state.index),
+            Arc::clone(&state.suppressed_writes),
+            mcp_cfg.port,
+            state.mcp_auth_cli_override || mcp_cfg.require_auth,
+        );
+    } else {
+        state.mcp.stop();
+    }
 
     Ok(info)
 }
@@ -1050,10 +1089,50 @@ fn open_external(url: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Query the local MCP server's current lifecycle state (SPEC-adjacent M10.21 status-bar
+/// indicator; also emitted proactively as the `mcp:status` event on every transition).
+#[tauri::command]
+fn mcp_status(state: State<AppState>) -> McpStatus {
+    state.mcp.status()
+}
+
+/// Rotate (or, if none exists yet, generate) the MCP server's bearer token without restarting
+/// Flint — the only way a token is ever created (M10.21: no auto-generated-at-launch token
+/// anymore). This is the practical way to kick out a client. Persisted to `.flint.db`, so it
+/// survives restarts.
+#[tauri::command]
+fn mcp_rotate_token(state: State<AppState>) -> Result<String, String> {
+    state.mcp.rotate_token()
+}
+
+/// Read the local MCP server's currently-generated token, if any, without rotating it — lets
+/// Settings redisplay an already-generated token (e.g. after reopening the panel or restarting
+/// the app) without invalidating whatever client already has it configured.
+#[tauri::command]
+fn mcp_get_token(state: State<AppState>) -> Result<Option<String>, String> {
+    let root = get_workspace_root(&state)?;
+    flint_core::config::get_mcp_token(&root)
+        .map(|record| record.map(|r| r.token))
+        .map_err(|e| e.to_string())
+}
+
 pub fn build_app(
     builder: tauri::Builder<tauri::Wry>,
     initial_path: Option<PathBuf>,
     initial_note: Option<String>,
+) -> tauri::Builder<tauri::Wry> {
+    build_app_with_mcp_flags(builder, initial_path, initial_note, false, false)
+}
+
+/// Same as [`build_app`], but lets the CLI's `--mcp`/`--mcp-auth` flags force the local MCP
+/// server on (and its auth enforcement on) for this launch regardless of the workspace's
+/// `mcp.enabled`/`mcp.requireAuth` config (M10.21).
+pub fn build_app_with_mcp_flags(
+    builder: tauri::Builder<tauri::Wry>,
+    initial_path: Option<PathBuf>,
+    initial_note: Option<String>,
+    mcp_flag: bool,
+    mcp_auth_flag: bool,
 ) -> tauri::Builder<tauri::Wry> {
     let state = AppState {
         active_workspace: Mutex::new(initial_path),
@@ -1061,6 +1140,9 @@ pub fn build_app(
         index: Arc::new(RwLock::new(Index::new())),
         suppressed_writes: Arc::new(Mutex::new(HashMap::new())),
         watcher_stop: Arc::new(AtomicBool::new(false)),
+        mcp: Arc::new(McpHandle::default()),
+        mcp_cli_override: mcp_flag,
+        mcp_auth_cli_override: mcp_auth_flag,
     };
     builder
         .plugin(tauri_plugin_dialog::init())
@@ -1094,7 +1176,10 @@ pub fn build_app(
             config_get,
             config_set,
             config_reset,
-            config_validate_ignore
+            config_validate_ignore,
+            mcp_status,
+            mcp_rotate_token,
+            mcp_get_token
         ])
 }
 
@@ -1103,9 +1188,26 @@ pub fn run_with_context(
     initial_path: Option<PathBuf>,
     initial_note: Option<String>,
 ) {
-    build_app(tauri::Builder::default(), initial_path, initial_note)
-        .run(context)
-        .expect("error while running tauri application");
+    run_with_context_and_mcp_flags(context, initial_path, initial_note, false, false)
+}
+
+/// Same as [`run_with_context`], but forwards the CLI's `--mcp`/`--mcp-auth` flags (M10.21).
+pub fn run_with_context_and_mcp_flags(
+    context: tauri::Context<tauri::Wry>,
+    initial_path: Option<PathBuf>,
+    initial_note: Option<String>,
+    mcp_flag: bool,
+    mcp_auth_flag: bool,
+) {
+    build_app_with_mcp_flags(
+        tauri::Builder::default(),
+        initial_path,
+        initial_note,
+        mcp_flag,
+        mcp_auth_flag,
+    )
+    .run(context)
+    .expect("error while running tauri application");
 }
 
 #[cfg(test)]

@@ -56,6 +56,17 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub foreground: bool,
 
+    /// Start the local MCP server for external coding-agent access (M10.21), off by default.
+    /// Overrides the workspace's `mcp.enabled` config for this launch only.
+    #[arg(long, global = true)]
+    pub mcp: bool,
+
+    /// Require a bearer token on every MCP request (M10.21), off by default — with `--mcp` and
+    /// no auth, any local process/user can call every tool. Overrides `mcp.requireAuth` for this
+    /// launch only. The token itself is generated/rotated from Settings → MCP Server, never here.
+    #[arg(long, global = true)]
+    pub mcp_auth: bool,
+
     /// Internal plumbing: run GUI child process directly
     #[arg(long, hide = true, global = true)]
     pub gui_child: bool,
@@ -70,7 +81,7 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Create .flint/ and a starter note, do not open the GUI
+    /// Create .flint.db and a starter note, do not open the GUI
     Init {
         #[arg(value_name = "PATH")]
         path: Option<PathBuf>,
@@ -185,7 +196,7 @@ fn run() -> Result<u8, (u8, String)> {
             )
             .map_err(map_ws_error)?;
 
-            let config_path = ws_root.join(".flint/config.json");
+            let config_path = ws_root.join(".flint.db");
             let tree = build_workspace_tree(&ws_root, false, &[]).map_err(map_ws_error)?;
 
             let mut note_count = 0;
@@ -414,7 +425,7 @@ fn run() -> Result<u8, (u8, String)> {
                 if let Some(ws_root) = &cli.path {
                     let _ = bootstrap_workspace(ws_root);
                 }
-                launch_gui(cli.path, cli.initial_note);
+                launch_gui_with_mcp_flags(cli.path, cli.initial_note, cli.mcp, cli.mcp_auth);
                 return Ok(exit_codes::SUCCESS);
             }
 
@@ -493,7 +504,7 @@ fn run() -> Result<u8, (u8, String)> {
                 } else {
                     println!("Opening workspace at: {}", ws_display);
                 }
-                launch_gui(ws_root_opt, initial_note_opt);
+                launch_gui_with_mcp_flags(ws_root_opt, initial_note_opt, cli.mcp, cli.mcp_auth);
             } else {
                 let ws_display = ws_root_opt
                     .as_ref()
@@ -503,6 +514,8 @@ fn run() -> Result<u8, (u8, String)> {
                     ws_root_opt.as_deref(),
                     initial_note_opt.as_deref(),
                     &cli.log,
+                    cli.mcp,
+                    cli.mcp_auth,
                 )?;
                 if cli.json {
                     println!(
@@ -522,8 +535,19 @@ fn run() -> Result<u8, (u8, String)> {
     }
 }
 
-fn launch_gui(ws_root: Option<PathBuf>, initial_note: Option<String>) {
-    flint_app_lib::run_with_context(tauri::generate_context!(), ws_root, initial_note);
+fn launch_gui_with_mcp_flags(
+    ws_root: Option<PathBuf>,
+    initial_note: Option<String>,
+    mcp: bool,
+    mcp_auth: bool,
+) {
+    flint_app_lib::run_with_context_and_mcp_flags(
+        tauri::generate_context!(),
+        ws_root,
+        initial_note,
+        mcp,
+        mcp_auth,
+    );
 }
 
 /// Attempt to find Flint.app in common macOS locations.
@@ -562,6 +586,8 @@ fn spawn_detached_gui(
     ws_root: Option<&Path>,
     initial_note: Option<&str>,
     log_level: &str,
+    mcp: bool,
+    mcp_auth: bool,
 ) -> Result<(), (u8, String)> {
     // ── macOS: always prefer LaunchServices via `open -a` ──────────────────────
     // A raw setsid()/exec detach never registers the process with LaunchServices,
@@ -592,6 +618,12 @@ fn spawn_detached_gui(
             open_cmd.arg("--gui-child").arg("--log").arg(log_level);
             if let Some(note) = initial_note {
                 open_cmd.arg("--initial-note").arg(note);
+            }
+            if mcp {
+                open_cmd.arg("--mcp");
+            }
+            if mcp_auth {
+                open_cmd.arg("--mcp-auth");
             }
 
             open_cmd.spawn().map_err(|e| {
@@ -627,6 +659,12 @@ fn spawn_detached_gui(
         cmd.arg("--gui-child").arg("--log").arg(log_level);
         if let Some(note) = initial_note {
             cmd.arg("--initial-note").arg(note);
+        }
+        if mcp {
+            cmd.arg("--mcp");
+        }
+        if mcp_auth {
+            cmd.arg("--mcp-auth");
         }
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())

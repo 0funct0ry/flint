@@ -11,7 +11,7 @@ without opening anything.
 | Command | Description |
 | --- | --- |
 | `flint [PATH]` | Open `PATH` as a workspace (default: `.`) |
-| `flint init [PATH]` | Create `.flint/` and a starter note, do not open the GUI |
+| `flint init [PATH]` | Create `.flint.db` and a starter note, do not open the GUI |
 | `flint new <NOTE> [--open]` | Create a note (relative to the workspace), optionally open it |
 | `flint search <QUERY>` | Print matching notes to stdout (`path:line:match`), no GUI |
 | `flint list [--folder DIR]` | Print note paths, one per line |
@@ -29,6 +29,8 @@ without opening anything.
 | `--json` | Emit machine-readable JSON instead of human-readable text |
 | `--log <level>` | Set log verbosity (`error`, `warn`, `info`, `debug`, `trace`) |
 | `--foreground` | Block the terminal / run the GUI in-process instead of detaching |
+| `--mcp` | Start the local MCP server for this launch (see [MCP Server — Claude Code](/flint/docs/mcp-server-claude/) / [Antigravity](/flint/docs/mcp-server-antigravity/)), overriding `mcp.enabled` |
+| `--mcp-auth` | Require a bearer token on every MCP request for this launch, overriding `mcp.requireAuth`. Off by default — see [MCP Server — Claude Code](/flint/docs/mcp-server-claude/) / [Antigravity](/flint/docs/mcp-server-antigravity/) |
 
 ## How Flint decides which directory to open
 
@@ -42,8 +44,8 @@ Flint checks these in order and uses the first one it finds:
 | 4 | The current directory | `flint` |
 
 The resolved path is canonicalized. If it does not exist, Flint asks before creating it, unless
-`--yes` is passed to skip the prompt in a script. If a directory exists but has no `.flint/`, Flint
-initializes it silently on open.
+`--yes` is passed to skip the prompt in a script. If a directory exists but has no `.flint.db`,
+Flint initializes it silently on open.
 
 ## Exit codes
 
@@ -76,5 +78,5 @@ $ flint info
 workspace: /Users/you/notes
 notes: 412
 links: 1203
-config: /Users/you/notes/.flint/config.json
+config: /Users/you/notes/.flint.db
 ```

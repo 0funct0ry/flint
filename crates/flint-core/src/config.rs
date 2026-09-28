@@ -1,20 +1,31 @@
-//! Flint configuration: global defaults + per-workspace overrides (SPEC §11/§12, M10.1).
+//! Flint configuration: global defaults + per-workspace overrides (SPEC §11/§12, M10.1; storage
+//! moved to an embedded database in M10.21).
 //!
-//! There are two JSON files: a global one (OS config dir, `lastWorkspace`/`recentWorkspaces` plus
-//! any global §12 defaults a user sets) and a per-workspace one at `<workspace>/.flint/config.json`
-//! (written with the full §12 shape by `bootstrap_workspace`). Reading a "merged" config means:
-//! parse both files (falling back to `FlintConfig::default()` per-file if a file is missing,
-//! malformed, or mistyped — a bad file never blocks startup), then deep-merge the workspace
-//! `Value` over the global `Value` field-by-field, recording which dotted paths came from the
-//! workspace file in an `origins` map (a path absent from `origins` is implicitly a global
-//! default) so the UI can show "workspace override" vs "global default" badges.
+//! The global side is still a plain JSON file (OS config dir, `lastWorkspace`/`recentWorkspaces`
+//! plus any global §12 defaults a user sets) — M10.21 didn't touch it, since it was never inside
+//! a workspace's `.flint/` folder or workspace root. The *workspace* side used to be a single
+//! `<workspace>/.flint/config.json` file; as of M10.21 it's `<workspace-root>/.flint.db`, an
+//! embedded database (via `redb`, a pure-Rust engine — this is not SQLite, despite the
+//! extension), one row per dotted config key in a `config` table (plus a separate `mcp_auth`
+//! table for the local MCP server's optional bearer-token state, since a generated secret isn't
+//! really a user-edited "config" field the same way `theme` or `editor.fontSize` are).
+//!
+//! Reading a "merged" config means: load both sides (falling back to `FlintConfig::default()` per
+//! side if it's missing, malformed, or mistyped — bad data never blocks startup), then deep-merge
+//! the workspace `Value` over the global `Value` field-by-field, recording which dotted paths came
+//! from the workspace side in an `origins` map (a path absent from `origins` is implicitly a
+//! global default) so the UI can show "workspace override" vs "global default" badges.
+//! `config_get`/`config_set`/`config_reset`'s public contract is unchanged from before M10.21 —
+//! only the workspace side's on-disk representation moved.
 
 use crate::NoteError;
+use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // ---------------------------------------------------------------------------------------------
 // Typed config shape (SPEC §12)
@@ -134,6 +145,39 @@ impl Default for UiConfig {
     }
 }
 
+/// Local MCP server settings (M10.21). Off by default: this is new, opt-in surface area, not
+/// the "no network requests" outbound invariant (SPEC §10.3.5) — the server only accepts local,
+/// loopback-only inbound connections and never initiates outbound requests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Require a bearer token on every MCP request (M10.21 change: off by default — the token
+    /// itself is never a config field, it's generated/rotated from the app's Settings UI and
+    /// persisted separately in `.flint.db`'s `mcp_auth` table, see [`get_mcp_token`]).
+    #[serde(default)]
+    pub require_auth: bool,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+/// Default fixed port the MCP server tries first before falling back to an ephemeral one.
+pub const DEFAULT_MCP_PORT: u16 = 4870;
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: None,
+            require_auth: false,
+            extra: serde_json::Map::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlintConfig {
@@ -149,6 +193,8 @@ pub struct FlintConfig {
     pub behaviour: BehaviourConfig,
     #[serde(default)]
     pub ui: UiConfig,
+    #[serde(default)]
+    pub mcp: McpConfig,
     #[serde(default)]
     pub ignore: Vec<String>,
     #[serde(flatten)]
@@ -167,6 +213,7 @@ impl Default for FlintConfig {
             markdown: MarkdownConfig::default(),
             behaviour: BehaviourConfig::default(),
             ui: UiConfig::default(),
+            mcp: McpConfig::default(),
             ignore: vec!["node_modules/**".to_string(), ".obsidian/**".to_string()],
             extra: serde_json::Map::new(),
         }
@@ -325,11 +372,13 @@ pub fn merged_config(
     (merged, origins)
 }
 
-/// Load `path` into a raw `Value` for merge purposes, preserving only the keys actually present
-/// in the file (unlike `load_typed_or_default`, which fills in every §12 default). Falls back to
-/// an empty object (i.e. "this file contributes nothing") with a notice on any read/parse/version/
-/// type failure — the whole file is discarded rather than partially trusted, since we can't tell
-/// which of its fields are the ones that are wrong once merged.
+/// Load `path` (the *global* config file — the workspace side uses
+/// [`read_workspace_config_value`] instead, since M10.21) into a raw `Value` for merge purposes,
+/// preserving only the keys actually present in the file (unlike `load_typed_or_default`, which
+/// fills in every §12 default). Falls back to an empty object (i.e. "this file contributes
+/// nothing") with a notice on any read/parse/version/type failure — the whole file is discarded
+/// rather than partially trusted, since we can't tell which of its fields are the ones that are
+/// wrong once merged.
 fn load_raw_or_default_value(path: &Path) -> (Value, Option<ConfigNotice>) {
     let empty = || Value::Object(serde_json::Map::new());
     if !path.exists() {
@@ -525,54 +574,41 @@ pub fn get_recent_workspaces() -> Vec<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Per-workspace file I/O (atomic write, unchanged mechanism)
+// Per-workspace storage: `.flint.db`, an embedded database via `redb` (M10.21)
 // ---------------------------------------------------------------------------------------------
 
-fn config_path(root: &Path) -> PathBuf {
-    root.join(".flint").join("config.json")
+/// The `config` table: one row per dotted config key (`theme`, `editor.fontSize`, `mcp.enabled`,
+/// ...), value is that key's JSON-serialized `Value`.
+const CONFIG_TABLE: TableDefinition<&str, &str> = TableDefinition::new("config");
+
+/// The `mcp_auth` table: a single row (key `"token"`) holding the local MCP server's optional
+/// bearer-token record, JSON-serialized. Kept separate from `config` because a generated secret
+/// isn't a user-edited setting the same way the rest of `FlintConfig` is.
+const MCP_AUTH_TABLE: TableDefinition<&str, &str> = TableDefinition::new("mcp_auth");
+const MCP_AUTH_TOKEN_KEY: &str = "token";
+
+/// The local MCP server's persisted bearer-token state (M10.21). Generated/rotated only from the
+/// app's Settings UI — never automatically at launch — so it survives restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpTokenRecord {
+    pub token: String,
+    pub created_at_ms: u64,
+    pub rotated_at_ms: u64,
 }
 
-fn read_config_value(path: &Path) -> Result<Value, NoteError> {
-    if !path.exists() {
-        return Ok(Value::Object(serde_json::Map::new()));
-    }
-    let bytes = fs::read(path).map_err(|e| NoteError::Io(e.to_string()))?;
-    if bytes.is_empty() {
-        return Ok(Value::Object(serde_json::Map::new()));
-    }
-    serde_json::from_slice(&bytes).map_err(|e| NoteError::Io(e.to_string()))
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
-fn write_config_value(path: &Path, value: &Value) -> Result<(), NoteError> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| NoteError::Io("no parent dir".to_string()))?;
-    if !dir.exists() {
-        fs::create_dir_all(dir).map_err(|e| NoteError::Io(e.to_string()))?;
-    }
+fn db_path(root: &Path) -> PathBuf {
+    root.join(".flint.db")
+}
 
-    let temp_path = dir.join("config.json.flint-tmp");
-    let serialized = serde_json::to_vec_pretty(value).map_err(|e| NoteError::Io(e.to_string()))?;
-
-    {
-        use std::io::Write;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&temp_path)
-            .map_err(|e| NoteError::Io(e.to_string()))?;
-        file.write_all(&serialized)
-            .map_err(|e| NoteError::Io(e.to_string()))?;
-        file.sync_all().map_err(|e| NoteError::Io(e.to_string()))?;
-    }
-
-    fs::rename(&temp_path, path).map_err(|e| {
-        let _ = fs::remove_file(&temp_path);
-        NoteError::Io(e.to_string())
-    })?;
-
-    Ok(())
+fn open_db(root: &Path) -> Result<Database, NoteError> {
+    Database::create(db_path(root)).map_err(|e| NoteError::Io(e.to_string()))
 }
 
 fn set_dotted_path(root_value: &mut Value, key: &str, value: Value) {
@@ -601,22 +637,235 @@ fn get_dotted_path<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
     Some(current)
 }
 
-fn remove_dotted_path(root_value: &mut Value, key: &str) {
-    let parts: Vec<&str> = key.split('.').collect();
-    let mut current = root_value;
-    for (i, part) in parts.iter().enumerate() {
-        let Some(obj) = current.as_object_mut() else {
-            return;
+/// Read every row of the workspace `config` table and rebuild the nested `Value` tree
+/// `deep_merge` expects — the same shape the old `.flint/config.json` file used to produce:
+/// only keys actually present as rows, nothing filled in from defaults. A missing db or a db with
+/// no `config` table yet (a fresh workspace) is "no rows", not an error.
+///
+/// A row whose stored text isn't valid JSON is skipped (with a notice) rather than discarding
+/// everything — corruption in one key no longer has to take down the whole config the way a
+/// malformed *file* used to. The reconstructed tree is still validated as a whole afterward (a
+/// `version` mismatch, or any field with the wrong type once merged, discards the *entire* tree
+/// back to defaults with a notice) — that whole-tree gate is unchanged from before M10.21.
+fn read_workspace_config_value(root: &Path) -> (Value, Option<ConfigNotice>) {
+    let empty = || Value::Object(serde_json::Map::new());
+    let path_str = db_path(root).display().to_string();
+    let notice_at = |field: &str, message: String| {
+        Some(ConfigLoadError {
+            path: path_str.clone(),
+            field: field.to_string(),
+            message,
+        })
+    };
+
+    let db = match open_db(root) {
+        Ok(db) => db,
+        Err(e) => return (empty(), notice_at("<open>", e.to_string())),
+    };
+    let read_txn = match db.begin_read() {
+        Ok(txn) => txn,
+        Err(e) => return (empty(), notice_at("<read>", e.to_string())),
+    };
+    let table = match read_txn.open_table(CONFIG_TABLE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return (empty(), None),
+        Err(e) => return (empty(), notice_at("<open-table>", e.to_string())),
+    };
+
+    let mut root_value = empty();
+    let mut notice = None;
+    let iter = match table.iter() {
+        Ok(iter) => iter,
+        Err(e) => return (empty(), notice_at("<iter>", e.to_string())),
+    };
+    for entry in iter {
+        let (key_guard, value_guard) = match entry {
+            Ok(pair) => pair,
+            Err(e) => {
+                notice = notice_at("<row>", e.to_string());
+                continue;
+            }
         };
-        if i == parts.len() - 1 {
-            obj.remove(*part);
-            return;
+        let key = key_guard.value().to_string();
+        match serde_json::from_str::<Value>(value_guard.value()) {
+            Ok(value) => set_dotted_path(&mut root_value, &key, value),
+            Err(e) => notice = notice_at(&key, e.to_string()),
         }
-        let Some(next) = obj.get_mut(*part) else {
-            return;
-        };
-        current = next;
     }
+
+    if let Some(version) = root_value.get("version") {
+        if version.as_u64() != Some(CURRENT_CONFIG_VERSION as u64) {
+            return (
+                empty(),
+                notice_at(
+                    "version",
+                    format!("unsupported config version: {}", version),
+                ),
+            );
+        }
+    }
+
+    if let Err(e) = serde_json::from_value::<FlintConfig>(root_value.clone()) {
+        return (
+            empty(),
+            notice_at(
+                e.to_string().split('`').nth(1).unwrap_or("<value>"),
+                e.to_string(),
+            ),
+        );
+    }
+
+    (root_value, notice)
+}
+
+/// Ensure `<workspace-root>/.flint.db` exists and its `config` table has at least the full set
+/// of top-level default fields (matching the fidelity of the old `bootstrap_workspace`, which
+/// eagerly wrote every §12 default into a fresh `.flint/config.json`) — a no-op if the table
+/// already has rows. Called once per workspace open (M10.21).
+pub fn bootstrap_workspace_db(root: &Path) -> Result<PathBuf, NoteError> {
+    let path = db_path(root);
+    let db = open_db(root)?;
+
+    let has_rows = {
+        let read_txn = db.begin_read().map_err(|e| NoteError::Io(e.to_string()))?;
+        match read_txn.open_table(CONFIG_TABLE) {
+            Ok(table) => table
+                .iter()
+                .map_err(|e| NoteError::Io(e.to_string()))?
+                .next()
+                .is_some(),
+            Err(redb::TableError::TableDoesNotExist(_)) => false,
+            Err(e) => return Err(NoteError::Io(e.to_string())),
+        }
+    };
+
+    if !has_rows {
+        let default_value = serde_json::to_value(FlintConfig::default())
+            .map_err(|e| NoteError::Io(e.to_string()))?;
+        if let Some(obj) = default_value.as_object() {
+            let write_txn = db.begin_write().map_err(|e| NoteError::Io(e.to_string()))?;
+            {
+                let mut table = write_txn
+                    .open_table(CONFIG_TABLE)
+                    .map_err(|e| NoteError::Io(e.to_string()))?;
+                for (key, value) in obj {
+                    let raw =
+                        serde_json::to_string(value).map_err(|e| NoteError::Io(e.to_string()))?;
+                    table
+                        .insert(key.as_str(), raw.as_str())
+                        .map_err(|e| NoteError::Io(e.to_string()))?;
+                }
+            }
+            write_txn
+                .commit()
+                .map_err(|e| NoteError::Io(e.to_string()))?;
+        }
+    }
+
+    Ok(path)
+}
+
+/// Write a single dotted-path config key as one row. Simpler than the old file-based
+/// read-modify-write-whole-file dance: each key is an independent row, so setting one never
+/// touches any other.
+pub fn config_set(root: &Path, key: &str, value: Value) -> Result<(), NoteError> {
+    let db = open_db(root)?;
+    let raw = serde_json::to_string(&value).map_err(|e| NoteError::Io(e.to_string()))?;
+    let write_txn = db.begin_write().map_err(|e| NoteError::Io(e.to_string()))?;
+    {
+        let mut table = write_txn
+            .open_table(CONFIG_TABLE)
+            .map_err(|e| NoteError::Io(e.to_string()))?;
+        table
+            .insert(key, raw.as_str())
+            .map_err(|e| NoteError::Io(e.to_string()))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| NoteError::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Delete a dotted-path key's row, plus any row nested under it (resetting `"editor"` also
+/// removes `"editor.fontSize"` etc.), falling back to the global default. A no-op if nothing
+/// matched.
+pub fn config_reset(root: &Path, key: &str) -> Result<(), NoteError> {
+    let db = open_db(root)?;
+    let write_txn = db.begin_write().map_err(|e| NoteError::Io(e.to_string()))?;
+    {
+        let mut table = write_txn
+            .open_table(CONFIG_TABLE)
+            .map_err(|e| NoteError::Io(e.to_string()))?;
+        let prefix = format!("{key}.");
+        let mut to_remove = Vec::new();
+        for entry in table.iter().map_err(|e| NoteError::Io(e.to_string()))? {
+            let (k, _) = entry.map_err(|e| NoteError::Io(e.to_string()))?;
+            let k = k.value().to_string();
+            if k == key || k.starts_with(&prefix) {
+                to_remove.push(k);
+            }
+        }
+        for k in to_remove {
+            table
+                .remove(k.as_str())
+                .map_err(|e| NoteError::Io(e.to_string()))?;
+        }
+    }
+    write_txn
+        .commit()
+        .map_err(|e| NoteError::Io(e.to_string()))?;
+    Ok(())
+}
+
+/// Read the local MCP server's persisted bearer-token record, if one has ever been generated.
+/// `None` means auth (when required) is currently fail-closed — every request gets rejected until
+/// [`set_mcp_token`] is called from the app's Settings UI.
+pub fn get_mcp_token(root: &Path) -> Result<Option<McpTokenRecord>, NoteError> {
+    let db = open_db(root)?;
+    let read_txn = db.begin_read().map_err(|e| NoteError::Io(e.to_string()))?;
+    let table = match read_txn.open_table(MCP_AUTH_TABLE) {
+        Ok(table) => table,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(NoteError::Io(e.to_string())),
+    };
+    let Some(raw) = table
+        .get(MCP_AUTH_TOKEN_KEY)
+        .map_err(|e| NoteError::Io(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_str(raw.value())
+        .map(Some)
+        .map_err(|e| NoteError::Io(e.to_string()))
+}
+
+/// Generate (or rotate — same operation) the local MCP server's bearer token, persisting a fresh
+/// timestamped record and returning it. This is the only way a token is ever created; there is no
+/// auto-generated-at-launch token anymore (M10.21 change).
+pub fn set_mcp_token(root: &Path, token: &str) -> Result<McpTokenRecord, NoteError> {
+    let existing = get_mcp_token(root)?;
+    let now = now_ms();
+    let record = McpTokenRecord {
+        token: token.to_string(),
+        created_at_ms: existing.map(|r| r.created_at_ms).unwrap_or(now),
+        rotated_at_ms: now,
+    };
+    let raw = serde_json::to_string(&record).map_err(|e| NoteError::Io(e.to_string()))?;
+
+    let db = open_db(root)?;
+    let write_txn = db.begin_write().map_err(|e| NoteError::Io(e.to_string()))?;
+    {
+        let mut table = write_txn
+            .open_table(MCP_AUTH_TABLE)
+            .map_err(|e| NoteError::Io(e.to_string()))?;
+        table
+            .insert(MCP_AUTH_TOKEN_KEY, raw.as_str())
+            .map_err(|e| NoteError::Io(e.to_string()))?;
+    }
+    write_txn
+        .commit()
+        .map_err(|e| NoteError::Io(e.to_string()))?;
+    Ok(record)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -664,8 +913,7 @@ pub fn config_get_with_global_override(
     global_path_override: Option<&Path>,
 ) -> Result<ConfigGetResult, NoteError> {
     let (global_raw, global_notice) = load_global_raw(global_path_override);
-    let ws_path = config_path(root);
-    let (workspace_raw, workspace_notice) = load_raw_or_default_value(&ws_path);
+    let (workspace_raw, workspace_notice) = read_workspace_config_value(root);
     let notice = workspace_notice.or(global_notice);
 
     // Layer: compiled defaults < global file < workspace file. Only the workspace layer's keys
@@ -703,27 +951,6 @@ pub fn config_get_with_global_override(
     }
 }
 
-/// Write a single dotted-path config key into the workspace file only (creates
-/// `.flint/config.json` if it doesn't exist yet). Unknown keys/paths survive untouched.
-pub fn config_set(root: &Path, key: &str, value: Value) -> Result<(), NoteError> {
-    let path = config_path(root);
-    let mut root_value = read_config_value(&path)?;
-    set_dotted_path(&mut root_value, key, value);
-    write_config_value(&path, &root_value)
-}
-
-/// Delete a dotted-path key's override from the workspace file only, so the merge falls back
-/// to the global default. A no-op (not an error) if the key wasn't overridden.
-pub fn config_reset(root: &Path, key: &str) -> Result<(), NoteError> {
-    let path = config_path(root);
-    if !path.exists() {
-        return Ok(());
-    }
-    let mut root_value = read_config_value(&path)?;
-    remove_dotted_path(&mut root_value, key);
-    write_config_value(&path, &root_value)
-}
-
 /// Validate a set of ignore-glob lines, one result per input line: `None` if valid (or
 /// blank/whitespace-only, which is skipped), `Some(message)` if `globset::Glob::new` rejects it.
 pub fn validate_ignore_patterns(lines: &[String]) -> Vec<Option<String>> {
@@ -749,6 +976,19 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, serde_json::to_string_pretty(value).unwrap()).unwrap();
+    }
+
+    /// Insert one row directly into `.flint.db`'s `config` table, bypassing `config_set`'s
+    /// JSON-encoding — used to simulate a corrupted/malformed row for the "falls back to
+    /// defaults with a notice" tests below.
+    fn insert_raw_config_row(root: &Path, key: &str, raw: &str) {
+        let db = open_db(root).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(CONFIG_TABLE).unwrap();
+            table.insert(key, raw).unwrap();
+        }
+        write_txn.commit().unwrap();
     }
 
     #[test]
@@ -787,15 +1027,11 @@ mod tests {
     }
 
     #[test]
-    fn write_is_atomic_no_leftover_temp_file() {
+    fn write_persists_to_flint_db_and_creates_no_flint_dir() {
         let dir = tempdir().unwrap();
         config_set(dir.path(), "theme", Value::from("dark")).unwrap();
-        assert!(!dir
-            .path()
-            .join(".flint")
-            .join("config.json.flint-tmp")
-            .exists());
-        assert!(dir.path().join(".flint").join("config.json").exists());
+        assert!(dir.path().join(".flint.db").exists());
+        assert!(!dir.path().join(".flint").exists());
     }
 
     #[test]
@@ -826,7 +1062,7 @@ mod tests {
         let result =
             config_get_with_global_override(dir.path(), None, Some(global_path.as_path())).unwrap();
         assert_eq!(result.config["theme"], Value::from("light"));
-        assert!(result.origins.get("theme").is_none());
+        assert!(!result.origins.contains_key("theme"));
         assert_eq!(
             result.origins.get("editor.tabSize"),
             Some(&ConfigOrigin::Workspace)
@@ -836,11 +1072,8 @@ mod tests {
     #[test]
     fn unknown_top_level_and_nested_key_roundtrip() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join(".flint").join("config.json");
-        let mut base = serde_json::to_value(FlintConfig::default()).unwrap();
-        base["customTopLevel"] = Value::from("hello");
-        base["editor"]["customNested"] = Value::from(42);
-        write_json(&path, &base);
+        config_set(dir.path(), "customTopLevel", Value::from("hello")).unwrap();
+        config_set(dir.path(), "editor.customNested", Value::from(42)).unwrap();
 
         // Unrelated config_set call.
         config_set(dir.path(), "theme", Value::from("dark")).unwrap();
@@ -852,24 +1085,26 @@ mod tests {
     }
 
     #[test]
-    fn invalid_json_falls_back_to_defaults_with_notice() {
+    fn invalid_json_row_is_skipped_with_notice_others_still_apply() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join(".flint").join("config.json");
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "{ not valid json").unwrap();
+        config_set(dir.path(), "editor.tabSize", Value::from(4)).unwrap();
+        insert_raw_config_row(dir.path(), "theme", "{ not valid json");
 
         let result = config_get_with_global_override(dir.path(), None, None).unwrap();
         assert!(result.notice.is_some());
+        // The corrupt "theme" row is skipped (falls back to its default), but the other,
+        // validly-stored row is unaffected — per-row resilience, not a whole-tree discard.
         assert_eq!(result.config["theme"], Value::from("system"));
+        assert_eq!(result.config["editor"]["tabSize"], Value::from(4));
     }
 
     #[test]
     fn invalid_field_type_falls_back_to_defaults_with_notice() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join(".flint").join("config.json");
-        let mut base = serde_json::to_value(FlintConfig::default()).unwrap();
-        base["editor"]["fontSize"] = Value::from("big");
-        write_json(&path, &base);
+        // A JSON string ("big") where `editor.fontSize` needs a number — parses fine as JSON,
+        // but fails the whole-tree `FlintConfig` type-validation pass, so the entire
+        // reconstructed tree (not just this row) is discarded.
+        insert_raw_config_row(dir.path(), "editor.fontSize", "\"big\"");
 
         let result = config_get_with_global_override(dir.path(), None, None).unwrap();
         assert!(result.notice.is_some());
@@ -879,14 +1114,30 @@ mod tests {
     #[test]
     fn unknown_version_falls_back_to_defaults_with_notice() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join(".flint").join("config.json");
-        let mut base = serde_json::to_value(FlintConfig::default()).unwrap();
-        base["version"] = Value::from(99);
-        write_json(&path, &base);
+        insert_raw_config_row(dir.path(), "version", "99");
 
         let result = config_get_with_global_override(dir.path(), None, None).unwrap();
         assert!(result.notice.is_some());
         assert_eq!(result.config["version"], Value::from(1));
+    }
+
+    #[test]
+    fn mcp_token_round_trips_and_rotation_updates_timestamps() {
+        let dir = tempdir().unwrap();
+        assert_eq!(get_mcp_token(dir.path()).unwrap(), None);
+
+        let first = set_mcp_token(dir.path(), "token-one").unwrap();
+        assert_eq!(first.token, "token-one");
+        assert_eq!(first.created_at_ms, first.rotated_at_ms);
+        assert_eq!(get_mcp_token(dir.path()).unwrap(), Some(first.clone()));
+
+        let second = set_mcp_token(dir.path(), "token-two").unwrap();
+        assert_eq!(second.token, "token-two");
+        assert_eq!(
+            second.created_at_ms, first.created_at_ms,
+            "rotating keeps the original creation timestamp"
+        );
+        assert_eq!(get_mcp_token(dir.path()).unwrap(), Some(second));
     }
 
     #[test]
@@ -932,7 +1183,7 @@ mod tests {
         let result =
             config_get_with_global_override(dir.path(), None, Some(global_path.as_path())).unwrap();
         assert_eq!(result.config["theme"], Value::from("light"));
-        assert!(result.origins.get("theme").is_none());
+        assert!(!result.origins.contains_key("theme"));
     }
 
     #[test]

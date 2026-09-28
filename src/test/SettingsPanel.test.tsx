@@ -12,6 +12,7 @@ const baseConfig: FlintConfig = {
   markdown: { math: true, tables: true, footnotes: true, smartPunctuation: true },
   behaviour: { autosaveMs: 400, rewriteLinksOnRename: true, deleteToTrash: true, newNoteFolder: '', defaultMode: 'edit' },
   ui: { leftSidebar: 'tree', rightSidebarVisible: true, showNonNoteFiles: false },
+  mcp: { enabled: false, port: null, requireAuth: false },
   ignore: ['node_modules/**'],
 };
 
@@ -98,5 +99,96 @@ describe('SettingsPanel', () => {
     vi.useRealTimers();
 
     expect(await screen.findByText(/Line 2: Unbalanced/)).toBeInTheDocument();
+  });
+
+  it('shows MCP server status with no token/rotate controls when auth is off (M10.21)', async () => {
+    mockUseSettings();
+    vi.spyOn(api, 'mcpStatus').mockResolvedValue({
+      state: 'listening',
+      url: 'http://127.0.0.1:4870/mcp',
+      requiresAuth: false,
+      hasToken: false,
+    });
+
+    render(<SettingsPanel onClose={vi.fn()} />);
+
+    expect(await screen.findByText(/listening on http:\/\/127\.0\.0\.1:4870\/mcp/)).toBeInTheDocument();
+    expect(screen.queryByText('rotate token')).not.toBeInTheDocument();
+    expect(screen.queryByText('generate token')).not.toBeInTheDocument();
+  });
+
+  it('shows "generate token" when auth is required and none exists yet (M10.21)', async () => {
+    mockUseSettings();
+    vi.spyOn(api, 'mcpStatus').mockResolvedValue({
+      state: 'listening',
+      url: 'http://127.0.0.1:4870/mcp',
+      requiresAuth: true,
+      hasToken: false,
+    });
+    const rotateSpy = vi.spyOn(api, 'mcpRotateToken').mockResolvedValue('new-token');
+
+    render(<SettingsPanel onClose={vi.fn()} />);
+
+    const generateButton = await screen.findByText('generate token');
+    expect(screen.getByText(/rejected until a token is generated/)).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(generateButton);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(rotateSpy).toHaveBeenCalled();
+  });
+
+  it('shows the token with a rotate button once one exists (M10.21)', async () => {
+    mockUseSettings();
+    vi.spyOn(api, 'mcpStatus').mockResolvedValue({
+      state: 'listening',
+      url: 'http://127.0.0.1:4870/mcp',
+      requiresAuth: true,
+      hasToken: true,
+    });
+    vi.spyOn(api, 'mcpGetToken').mockResolvedValue('existing-token');
+    const rotateSpy = vi.spyOn(api, 'mcpRotateToken').mockResolvedValue('rotated-token');
+
+    render(<SettingsPanel onClose={vi.fn()} />);
+
+    expect(await screen.findByText('existing-token')).toBeInTheDocument();
+    const rotateButton = screen.getByText('rotate token');
+
+    await act(async () => {
+      fireEvent.click(rotateButton);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(rotateSpy).toHaveBeenCalled();
+  });
+
+  it('toggles mcp.enabled through setField', () => {
+    const { setField } = mockUseSettings();
+    vi.spyOn(api, 'mcpStatus').mockResolvedValue({
+      state: 'off',
+      requiresAuth: false,
+      hasToken: false,
+    });
+    render(<SettingsPanel onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByLabelText('MCP server enabled'));
+    expect(setField).toHaveBeenCalledWith('mcp.enabled', true);
+  });
+
+  it('toggles mcp.requireAuth through setField', () => {
+    const { setField } = mockUseSettings();
+    vi.spyOn(api, 'mcpStatus').mockResolvedValue({
+      state: 'off',
+      requiresAuth: false,
+      hasToken: false,
+    });
+    render(<SettingsPanel onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByLabelText('Require bearer token for MCP server'));
+    expect(setField).toHaveBeenCalledWith('mcp.requireAuth', true);
   });
 });

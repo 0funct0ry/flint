@@ -40,6 +40,8 @@ export default defineConfig({
             { label: 'CLI Reference', slug: 'docs/cli-reference' },
             { label: 'Keyboard Shortcuts', slug: 'docs/keyboard-shortcuts' },
             { label: 'Configuration', slug: 'docs/configuration' },
+            { label: 'MCP Server — Claude Code', slug: 'docs/mcp-server-claude' },
+            { label: 'MCP Server — Antigravity', slug: 'docs/mcp-server-antigravity' },
           ],
         },
         {

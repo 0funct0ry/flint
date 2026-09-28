@@ -20,6 +20,6 @@ data and makes no network requests, ever.
 - **[CLI Reference](/flint/docs/cli-reference/)** — every subcommand and flag.
 - **[Keyboard Shortcuts](/flint/docs/keyboard-shortcuts/)** — generated from the app's own command
   registry, so it never drifts from the real bindings.
-- **[Configuration](/flint/docs/configuration/)** — every `.flint/config.json` field.
+- **[Configuration](/flint/docs/configuration/)** — every workspace config field (`.flint.db`).
 - **[FAQ](/flint/docs/faq/)** — the no-network guarantee, where files are stored, and how conflicts
   are handled.

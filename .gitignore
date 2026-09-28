@@ -45,3 +45,4 @@ SAMPLE.md
 .flint/
 .claude/
 bin/
+.mcp.json

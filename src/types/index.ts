@@ -115,6 +115,22 @@ export interface WatcherDegradedPayload {
   reason: string;
 }
 
+// --- Local MCP server (M10.21) --------------------------------------------
+
+export type McpPhase =
+  | { state: "off" }
+  | { state: "starting" }
+  | { state: "listening"; url: string }
+  | { state: "error"; message: string };
+
+/** `McpPhase` plus whether bearer-token auth is required and whether a token has been
+ * generated yet — auth is opt-in and off by default; the token itself is managed only from
+ * Settings, never auto-generated at launch. */
+export type McpStatus = McpPhase & {
+  requiresAuth: boolean;
+  hasToken: boolean;
+};
+
 export interface NoteEventPayload {
   path?: string;
   from?: string;
@@ -206,6 +222,12 @@ export interface UiConfig {
   showNonNoteFiles: boolean;
 }
 
+export interface McpConfig {
+  enabled: boolean;
+  port?: number | null;
+  requireAuth: boolean;
+}
+
 export interface LayoutConfig {
   splitOrientation?: 'horizontal' | 'vertical';
   splitRatio?: number;
@@ -225,6 +247,7 @@ export interface FlintConfig {
   markdown: MarkdownConfig;
   behaviour: BehaviourConfig;
   ui: UiConfig;
+  mcp: McpConfig;
   ignore: string[];
   layout?: LayoutConfig;
   [key: string]: unknown;

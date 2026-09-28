@@ -1142,23 +1142,16 @@ pub use crate::config::{
     save_last_workspace,
 };
 
-/// Ensure `<workspace>/.flint/config.json` exists idempotently (SPEC §3.1, §12).
+/// Ensure `<workspace-root>/.flint.db` exists idempotently (SPEC §3.1, §12, §17; M10.21 — this
+/// used to create `.flint/config.json`, but no `.flint/` directory is created anymore since
+/// nothing left in scope still writes there).
 pub fn bootstrap_workspace(root: &Path) -> Result<PathBuf, std::io::Error> {
-    let flint_dir = root.join(".flint");
-    if !flint_dir.exists() {
-        fs::create_dir_all(&flint_dir)?;
-    }
-    let config_path = flint_dir.join("config.json");
-    if !config_path.exists() {
-        let default_config = crate::config::FlintConfig::default();
-        fs::write(&config_path, serde_json::to_string_pretty(&default_config)?)?;
-    }
-    Ok(config_path)
+    crate::config::bootstrap_workspace_db(root).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Check if a path component is ignored by Flint's standard ignore rules (SPEC §5.2).
 pub fn is_default_ignored(name: &str) -> bool {
-    name == ".flint"
+    name == ".flint.db"
         || name == ".git"
         || name == ".obsidian"
         || name == "node_modules"
@@ -1600,6 +1593,233 @@ pub fn relativize_path(from_note_rel: &str, to_target_rel: &str) -> String {
     } else {
         joined
     }
+}
+
+/// Locate a section by its heading path (root heading text first, then each nested
+/// sub-heading's text in order), matching the same nesting rules the outline panel
+/// (`src/services/outline.ts`, M10.09) uses to build its tree. Returns the matched heading
+/// plus the source line where its section ends (the line of the next heading at the same or
+/// shallower level, or `None` if the section runs to end of file).
+fn find_section(
+    headings: &[HeadingItem],
+    heading_path: &[String],
+) -> Result<(HeadingItem, Option<usize>), NoteError> {
+    if heading_path.is_empty() {
+        return Err(NoteError::NotFound("empty heading path".to_string()));
+    }
+
+    let mut window_start = 0usize;
+    let mut window_end = headings.len();
+    let mut matched_idx = None;
+
+    for name in heading_path {
+        let found = (window_start..window_end).find(|&i| &headings[i].text == name);
+        let idx = found.ok_or_else(|| {
+            NoteError::NotFound(format!(
+                "heading not found: {} (path: {:?})",
+                name, heading_path
+            ))
+        })?;
+        matched_idx = Some(idx);
+        let level = headings[idx].level;
+        let end = headings[(idx + 1)..]
+            .iter()
+            .position(|h| h.level <= level)
+            .map(|offset| idx + 1 + offset)
+            .unwrap_or(headings.len());
+        window_start = idx + 1;
+        window_end = end;
+    }
+
+    let idx = matched_idx.expect("heading_path is non-empty, so a match was always attempted");
+    let level = headings[idx].level;
+    let mut boundary_line = None;
+    for h in &headings[(idx + 1)..] {
+        if h.level <= level {
+            boundary_line = Some(h.line);
+            break;
+        }
+    }
+
+    Ok((headings[idx].clone(), boundary_line))
+}
+
+/// Replace one section's body Markdown (everything under a heading, up to but not including
+/// its next same-or-shallower-level sibling) without touching the heading line itself, any
+/// other section, or the fingerprint-conflict path `note_write` already enforces
+/// (M10.21 — MCP `note_patch_section` tool).
+///
+/// `heading_path` names the target section from the top: `["Intro", "Details"]` means the
+/// `Details` sub-heading nested under `Intro`. Returns the new fingerprint and full content.
+pub fn patch_section(
+    root: &Path,
+    safe_path: &SafePath,
+    heading_path: &[String],
+    new_body: &str,
+    expected_fingerprint: Option<&Fingerprint>,
+) -> Result<(Fingerprint, String), NoteError> {
+    let current = read_note(root, safe_path)?;
+    if let Some(expected) = expected_fingerprint {
+        if expected.content_hash != current.fingerprint.content_hash {
+            return Err(NoteError::Conflict {
+                expected: Some(Box::new(expected.clone())),
+                actual: Some(Box::new(current.fingerprint.clone())),
+            });
+        }
+    }
+
+    let headings = extract_headings(&current.content);
+    let (target, boundary_line) = find_section(&headings, heading_path)?;
+
+    let lines: Vec<&str> = current.content.lines().collect();
+    let body_start_line = (target.line + 1).min(lines.len());
+    let body_end_line = boundary_line.unwrap_or(lines.len()).max(body_start_line);
+
+    let mut out = String::new();
+    for line in &lines[..body_start_line] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+    let trimmed_body = new_body.trim_end_matches('\n');
+    if !trimmed_body.is_empty() {
+        out.push_str(trimmed_body);
+        out.push('\n');
+    }
+    if boundary_line.is_some() {
+        out.push('\n');
+    }
+    for line in &lines[body_end_line..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !current.content.ends_with('\n') && out.ends_with('\n') {
+        out.pop();
+    }
+
+    let fp = write_note_atomic(root, safe_path, &out, Some(&current.fingerprint))?;
+    Ok((fp, out))
+}
+
+/// Where an inserted cross-link lands (M10.21 — MCP `note_insert_link` tool).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum LinkLocation {
+    /// Append to the note's "Related" section, creating one (a trailing `## Related` heading
+    /// with a bullet list) if the note doesn't already have one.
+    Related,
+    /// Insert immediately after the given 0-based source line.
+    AfterLine { line: usize },
+}
+
+/// Insert a Markdown inline link to `target_note_rel` into `safe_path`'s note, resolving the
+/// relative path the same way the editor's link-autocomplete does (`relativize_path`), so
+/// agent-authored links use the same convention as human-authored ones (M10.21 — MCP
+/// `note_insert_link` tool). `link_text` defaults to the target note's title (falling back to
+/// its file stem if the target can't be read). Returns the new fingerprint and full content.
+pub fn insert_link(
+    root: &Path,
+    safe_path: &SafePath,
+    target_note_rel: &str,
+    link_text: Option<&str>,
+    location: LinkLocation,
+    expected_fingerprint: Option<&Fingerprint>,
+) -> Result<(Fingerprint, String), NoteError> {
+    let current = read_note(root, safe_path)?;
+    if let Some(expected) = expected_fingerprint {
+        if expected.content_hash != current.fingerprint.content_hash {
+            return Err(NoteError::Conflict {
+                expected: Some(Box::new(expected.clone())),
+                actual: Some(Box::new(current.fingerprint.clone())),
+            });
+        }
+    }
+
+    let source_rel = safe_path.to_posix_string();
+    let target_safe = SafePath::resolve(root, target_note_rel)?;
+    let rel_link = relativize_path(&source_rel, &target_safe.to_posix_string());
+
+    let owned_title;
+    let text = match link_text {
+        Some(t) => t,
+        None => {
+            owned_title = read_note(root, &target_safe)
+                .map(|c| c.meta.title)
+                .unwrap_or_else(|_| {
+                    Path::new(target_note_rel)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(target_note_rel)
+                        .to_string()
+                });
+            &owned_title
+        }
+    };
+    let md_link = format!("[{}]({})", text, rel_link);
+
+    let new_content = match location {
+        LinkLocation::AfterLine { line } => {
+            let lines: Vec<&str> = current.content.lines().collect();
+            let insert_at = (line + 1).min(lines.len());
+            let mut out = String::new();
+            for l in &lines[..insert_at] {
+                out.push_str(l);
+                out.push('\n');
+            }
+            out.push_str(&md_link);
+            out.push('\n');
+            for l in &lines[insert_at..] {
+                out.push_str(l);
+                out.push('\n');
+            }
+            out
+        }
+        LinkLocation::Related => {
+            let headings = extract_headings(&current.content);
+            let related_idx = headings
+                .iter()
+                .position(|h| h.text.eq_ignore_ascii_case("related"));
+            let lines: Vec<&str> = current.content.lines().collect();
+            match related_idx {
+                Some(i) => {
+                    let level = headings[i].level;
+                    let mut boundary = lines.len();
+                    for h in &headings[(i + 1)..] {
+                        if h.level <= level {
+                            boundary = h.line;
+                            break;
+                        }
+                    }
+                    let mut out = String::new();
+                    for l in &lines[..boundary] {
+                        out.push_str(l);
+                        out.push('\n');
+                    }
+                    out.push_str(&format!("- {}\n", md_link));
+                    for l in &lines[boundary..] {
+                        out.push_str(l);
+                        out.push('\n');
+                    }
+                    out
+                }
+                None => {
+                    let mut out = current.content.clone();
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    if !out.ends_with("\n\n") {
+                        out.push('\n');
+                    }
+                    out.push_str("## Related\n\n");
+                    out.push_str(&format!("- {}\n", md_link));
+                    out
+                }
+            }
+        }
+    };
+
+    let fp = write_note_atomic(root, safe_path, &new_content, Some(&current.fingerprint))?;
+    Ok((fp, new_content))
 }
 
 /// Parse and rewrite Markdown inline link destinations pointing to moved notes.
@@ -2529,6 +2749,143 @@ pub fn check_workspace_health(root: &Path) -> Result<DoctorReport, String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn patch_section_replaces_only_matched_body() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("note.md"),
+            "# Title\n\nIntro text.\n\n## Details\n\nold body.\n\n## Other\n\nuntouched.\n",
+        )
+        .unwrap();
+        let safe = SafePath::resolve(root, "note.md").unwrap();
+
+        let (_, new_content) =
+            patch_section(root, &safe, &["Details".to_string()], "new body.", None).unwrap();
+
+        assert!(new_content.contains("## Details\n\nnew body.\n"));
+        assert!(new_content.contains("## Other\n\nuntouched.\n"));
+        assert!(!new_content.contains("old body."));
+    }
+
+    #[test]
+    fn patch_section_supports_nested_heading_path() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("note.md"),
+            "# Intro\n\nintro body.\n\n## Sub\n\nold sub body.\n\n# Next\n\nnext body.\n",
+        )
+        .unwrap();
+        let safe = SafePath::resolve(root, "note.md").unwrap();
+
+        let (_, new_content) = patch_section(
+            root,
+            &safe,
+            &["Intro".to_string(), "Sub".to_string()],
+            "new sub body.",
+            None,
+        )
+        .unwrap();
+
+        assert!(new_content.contains("## Sub\n\nnew sub body.\n"));
+        assert!(new_content.contains("# Next\n\nnext body.\n"));
+    }
+
+    #[test]
+    fn patch_section_missing_heading_errors() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("note.md"), "# Title\n\nbody.\n").unwrap();
+        let safe = SafePath::resolve(root, "note.md").unwrap();
+
+        let err = patch_section(root, &safe, &["Nope".to_string()], "x", None).unwrap_err();
+        assert!(matches!(err, NoteError::NotFound(_)));
+    }
+
+    #[test]
+    fn patch_section_detects_conflict() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("note.md"), "## Details\n\nbody.\n").unwrap();
+        let safe = SafePath::resolve(root, "note.md").unwrap();
+        let stale = Fingerprint {
+            path: "note.md".to_string(),
+            size_bytes: 0,
+            modified_ms: 0,
+            content_hash: "stale".to_string(),
+        };
+
+        let err =
+            patch_section(root, &safe, &["Details".to_string()], "new", Some(&stale)).unwrap_err();
+        assert!(matches!(err, NoteError::Conflict { .. }));
+    }
+
+    #[test]
+    fn insert_link_appends_to_existing_related_section() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(
+            root.join("notes/source.md"),
+            "# Source\n\nbody.\n\n## Related\n\n- [old](./old.md)\n\n## After\n\nmore.\n",
+        )
+        .unwrap();
+        fs::write(root.join("notes/target.md"), "# Target Note\n").unwrap();
+        let safe = SafePath::resolve(root, "notes/source.md").unwrap();
+
+        let (_, new_content) = insert_link(
+            root,
+            &safe,
+            "notes/target.md",
+            None,
+            LinkLocation::Related,
+            None,
+        )
+        .unwrap();
+
+        assert!(new_content.contains("- [Target Note](./target.md)"));
+        assert!(new_content.contains("- [old](./old.md)"));
+        assert!(new_content.contains("## After\n\nmore.\n"));
+    }
+
+    #[test]
+    fn insert_link_creates_related_section_when_absent() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("source.md"), "# Source\n\nbody.\n").unwrap();
+        fs::write(root.join("target.md"), "# Target Note\n").unwrap();
+        let safe = SafePath::resolve(root, "source.md").unwrap();
+
+        let (_, new_content) =
+            insert_link(root, &safe, "target.md", None, LinkLocation::Related, None).unwrap();
+
+        assert!(new_content.contains("## Related\n\n- [Target Note](./target.md)"));
+    }
+
+    #[test]
+    fn insert_link_after_line_uses_relative_path() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/source.md"), "line0\nline1\nline2\n").unwrap();
+        fs::write(root.join("a/target.md"), "# Target Note\n").unwrap();
+        let safe = SafePath::resolve(root, "a/b/source.md").unwrap();
+
+        let (_, new_content) = insert_link(
+            root,
+            &safe,
+            "a/target.md",
+            Some("see target"),
+            LinkLocation::AfterLine { line: 0 },
+            None,
+        )
+        .unwrap();
+
+        let lines: Vec<&str> = new_content.lines().collect();
+        assert_eq!(lines[1], "[see target](../target.md)");
+    }
 
     #[test]
     fn test_resolve_in_workspace_rejects_absolute() {

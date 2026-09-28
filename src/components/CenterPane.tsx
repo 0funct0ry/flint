@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import katex from 'katex';
+import mermaid from 'mermaid';
 import { Compartment, EditorSelection, EditorState, Prec } from '@codemirror/state';
 import { EditorView, keymap, highlightActiveLine, drawSelection, lineNumbers, Decoration, DecorationSet, ViewPlugin, ViewUpdate } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
@@ -23,6 +24,7 @@ import { useSettings } from '../context/SettingsContext';
 export interface CenterPaneProps {
   note: NoteFixture;
   viewMode: ViewMode;
+  theme?: 'light' | 'dark';
   isDirty: boolean;
   onContentChange: (newContent: string) => void;
   onSaveNow?: () => void;
@@ -319,6 +321,7 @@ const markdownHighlightStyle = HighlightStyle.define([
 export const CenterPane: React.FC<CenterPaneProps> = ({
   note,
   viewMode,
+  theme = 'dark',
   isDirty,
   onContentChange,
   onSaveNow,
@@ -554,6 +557,74 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     const frame = requestAnimationFrame(renderMath);
     return () => cancelAnimationFrame(frame);
   }, [note.renderedHtml, viewMode]);
+
+  // Render Mermaid diagrams whenever note.renderedHtml, viewMode, or the active theme changes
+  // (M10.24). Diagrams render only in reader/preview, never in the raw editor buffer, matching
+  // the KaTeX effect's guard.
+  useEffect(() => {
+    if (!readerContainerRef.current) return;
+    if (viewMode === 'edit') return;
+
+    const rootStyles = getComputedStyle(document.documentElement);
+    // Falls back to sane defaults when a token isn't defined yet (e.g. jsdom in tests, which
+    // doesn't load index.css) — Mermaid's theme engine throws on an empty color string.
+    const cssVar = (name: string, fallback: string) =>
+      rootStyles.getPropertyValue(name).trim() || fallback;
+
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'base',
+      themeVariables: {
+        background: cssVar('--canvas', theme === 'dark' ? '#15171B' : '#F6F7F8'),
+        primaryColor: cssVar('--panel', theme === 'dark' ? '#1B1E23' : '#FFFFFF'),
+        primaryTextColor: cssVar('--text', theme === 'dark' ? '#E3E6EA' : '#171A1F'),
+        primaryBorderColor: cssVar('--border', theme === 'dark' ? '#2A2E35' : '#E2E5E9'),
+        lineColor: cssVar('--border', theme === 'dark' ? '#2A2E35' : '#E2E5E9'),
+        textColor: cssVar('--text', theme === 'dark' ? '#E3E6EA' : '#171A1F'),
+        secondaryColor: cssVar('--panel-2', theme === 'dark' ? '#1B1E23' : '#FFFFFF'),
+        tertiaryColor: cssVar('--panel', theme === 'dark' ? '#1B1E23' : '#FFFFFF'),
+        fontFamily: 'IBM Plex Sans, sans-serif',
+      },
+    });
+
+    const renderMermaid = () => {
+      if (!readerContainerRef.current) return;
+
+      const nodes = readerContainerRef.current.querySelectorAll(
+        'pre.mermaid:not([data-rendered="true"])'
+      );
+      nodes.forEach((node, index) => {
+        const source = node.textContent ?? '';
+        const id = `flint-mermaid-${Date.now()}-${index}`;
+        mermaid
+          .render(id, source)
+          .then(({ svg }) => {
+            node.innerHTML = svg;
+            node.setAttribute('data-rendered', 'true');
+          })
+          .catch((err) => {
+            // Unlike KaTeX's silent `throwOnError: false`, a Mermaid parse error must be
+            // user-visible: a blank diagram is indistinguishable from an empty one.
+            const message = err instanceof Error ? err.message : String(err);
+            const errorBlock = document.createElement('div');
+            errorBlock.className = 'flint-mermaid-error';
+            const messageEl = document.createElement('p');
+            messageEl.textContent = `Mermaid diagram error: ${message}`;
+            const sourceEl = document.createElement('pre');
+            const codeEl = document.createElement('code');
+            codeEl.textContent = source;
+            sourceEl.appendChild(codeEl);
+            errorBlock.appendChild(messageEl);
+            errorBlock.appendChild(sourceEl);
+            node.replaceWith(errorBlock);
+          });
+      });
+    };
+
+    renderMermaid();
+    const frame = requestAnimationFrame(renderMermaid);
+    return () => cancelAnimationFrame(frame);
+  }, [note.renderedHtml, viewMode, theme]);
 
   // Scroll to anchor when requested from outline
   useEffect(() => {

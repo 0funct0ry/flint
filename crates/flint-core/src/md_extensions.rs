@@ -283,6 +283,34 @@ pub fn decode_wikilink_dest(dest_url: &str) -> Option<(String, Option<String>)> 
     }
 }
 
+/// URL scheme prefix used to mark a rewritten `![[target]]` embed span's `dest_url` distinctly
+/// from a plain `[[target]]` wikilink (M10.24). `rewrite_wikilinks` emits embed spans as
+/// CommonMark *image* syntax (`![label](<dest>)`) carrying this scheme so the render pipeline's
+/// image event handler can tell "this is a transclusion" apart from a real image or a plain
+/// internal link without re-parsing the source.
+pub const WIKILINK_EMBED_DEST_SCHEME: &str = "flint-embed://";
+
+/// Encode an embed span's `target`/`heading` into the placeholder `dest_url` used by
+/// [`rewrite_wikilinks`]'s embed output. Mirrors [`encode_wikilink_dest`].
+pub fn encode_wikilink_embed_dest(target: &str, heading: Option<&str>) -> String {
+    match heading {
+        Some(h) if !h.is_empty() => format!("{WIKILINK_EMBED_DEST_SCHEME}{target}#{h}"),
+        _ => format!("{WIKILINK_EMBED_DEST_SCHEME}{target}"),
+    }
+}
+
+/// Decode a `dest_url` produced by [`encode_wikilink_embed_dest`] back into `(target, heading)`.
+/// Returns `None` if `dest_url` doesn't carry the embed scheme prefix. Mirrors
+/// [`decode_wikilink_dest`].
+pub fn decode_wikilink_embed_dest(dest_url: &str) -> Option<(String, Option<String>)> {
+    let rest = dest_url.strip_prefix(WIKILINK_EMBED_DEST_SCHEME)?;
+    let rest = rest.replace("%3C", "<").replace("%3E", ">");
+    match rest.split_once('#') {
+        Some((target, heading)) => Some((target.to_string(), Some(heading.to_string()))),
+        None => Some((rest.to_string(), None)),
+    }
+}
+
 /// Preprocessing pass: rewrite every recognized `[[...]]`/`![[...]]` span in `body` into an
 /// equivalent CommonMark inline link (`![alt](dest)` for an embed, `[label](dest)` otherwise), so
 /// the rest of the render pipeline (syntect highlighting, `ammonia` sanitize) needs zero changes.
@@ -308,19 +336,22 @@ pub fn rewrite_wikilinks(body: &str, enabled: bool) -> String {
     for span in &spans {
         out.push_str(&body[cursor..span.start]);
         let label = span.alias.clone().unwrap_or_else(|| span.target.clone());
-        let dest = encode_wikilink_dest(&span.target, span.heading.as_deref());
         // CommonMark's `(dest)` form forbids unescaped spaces/parens; note names routinely
         // contain spaces, so use the `<dest>` angle-bracket form instead, which permits them
         // (only `<` and `>` need escaping there).
-        let escaped_dest = dest.replace('<', "%3C").replace('>', "%3E");
         let escaped_label = label.replace('\\', "\\\\").replace(']', "\\]");
-        // `![[target]]` (embed) is parsed/resolved/indexed like any other wikilink this
-        // milestone, but renders as a *plain link*, not a transclusion — rendering the embedded
-        // note's content inline is M10.24's job. So both forms rewrite to the same `[label](dest)`
-        // CommonMark link shape here; only the extracted `Link.is_embed`-equivalent metadata
-        // (tracked via the span scanner, not this rewrite) distinguishes them for M10.24 to
-        // upgrade later.
-        out.push_str(&format!("[{escaped_label}](<{escaped_dest}>)"));
+        if span.is_embed {
+            // `![[target]]` is emitted as CommonMark *image* syntax carrying the distinct embed
+            // scheme, so `render.rs`'s image event handler can recognize it as a transclusion
+            // (M10.24) rather than a real image or a plain internal link.
+            let dest = encode_wikilink_embed_dest(&span.target, span.heading.as_deref());
+            let escaped_dest = dest.replace('<', "%3C").replace('>', "%3E");
+            out.push_str(&format!("![{escaped_label}](<{escaped_dest}>)"));
+        } else {
+            let dest = encode_wikilink_dest(&span.target, span.heading.as_deref());
+            let escaped_dest = dest.replace('<', "%3C").replace('>', "%3E");
+            out.push_str(&format!("[{escaped_label}](<{escaped_dest}>)"));
+        }
         cursor = span.end;
     }
     out.push_str(&body[cursor..]);
@@ -477,11 +508,24 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_wikilinks_embed_renders_as_plain_link_this_milestone() {
-        // M10.23: `![[target]]` is parsed/resolved/indexed like a wikilink but renders as a
-        // plain link, not a transclusion (that's M10.24). Same output shape as `[[target]]`.
+    fn rewrite_wikilinks_embed_uses_image_syntax_and_embed_scheme() {
+        // M10.24: `![[target]]` rewrites to CommonMark image syntax carrying the distinct embed
+        // scheme, so render.rs's image handler can recognize it as a transclusion.
         let out = rewrite_wikilinks("![[Target]]", true);
-        assert_eq!(out, format!("[Target](<{WIKILINK_DEST_SCHEME}Target>)"));
+        assert_eq!(
+            out,
+            format!("![Target](<{WIKILINK_EMBED_DEST_SCHEME}Target>)")
+        );
+    }
+
+    #[test]
+    fn decode_wikilink_embed_dest_round_trips() {
+        let dest = encode_wikilink_embed_dest("Target", Some("Heading"));
+        assert_eq!(
+            decode_wikilink_embed_dest(&dest),
+            Some(("Target".to_string(), Some("Heading".to_string())))
+        );
+        assert_eq!(decode_wikilink_embed_dest("flint-wikilink://Target"), None);
     }
 
     #[test]

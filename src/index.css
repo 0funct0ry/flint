@@ -317,6 +317,63 @@ button {
 .reader-content .callout-danger {
   border-left-color: #e06c75;
 }
+/* Mermaid diagrams (M10.24). Rendered SVG is centered; an unrendered/error state stays visible
+   rather than collapsing to nothing. */
+.reader-content pre.mermaid {
+  background: transparent;
+  border: none;
+  padding: 8px 0;
+  margin: 0 0 13px;
+  text-align: center;
+  overflow-x: auto;
+}
+.reader-content pre.mermaid svg {
+  max-width: 100%;
+}
+.reader-content .flint-mermaid-error {
+  border-left: 3px solid var(--spark);
+  background: var(--panel-2);
+  padding: 8px 13px;
+  margin: 0 0 13px;
+  border-radius: 4px;
+}
+.reader-content .flint-mermaid-error p {
+  margin: 0 0 8px;
+  color: var(--spark);
+  font-size: 13px;
+}
+.reader-content .flint-mermaid-error pre {
+  margin: 0;
+}
+/* Note embeds (`![[target]]` transclusion, M10.24). Flat surface, 1px border, no shadow —
+   SPEC §9.2 — with a small non-interactive path label marking where the content came from. */
+.reader-content .flint-embed {
+  border: 1px solid var(--border);
+  padding: 12px 13px 2px;
+  margin: 0 0 13px;
+  border-radius: 4px;
+  background: var(--panel);
+}
+.reader-content .flint-embed-source {
+  font-size: 11px;
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace;
+  margin: 0 0 8px;
+  user-select: none;
+}
+.reader-content .flint-embed > *:last-child {
+  margin-bottom: 13px;
+}
+.reader-content .flint-embed-cycle,
+.reader-content .flint-embed-depth-limit {
+  border-left: 3px solid var(--spark);
+  background: var(--panel-2);
+  padding: 8px 13px;
+  margin: 0 0 13px;
+  border-radius: 4px;
+  color: var(--spark);
+  font-size: 13px;
+}
 .reader-content hr {
   border: none;
   border-top: 1px solid var(--border);

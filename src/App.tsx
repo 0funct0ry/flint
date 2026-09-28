@@ -1473,6 +1473,7 @@ export const App: React.FC = () => {
         <CenterPane
           note={currentNote}
           viewMode={viewMode}
+          theme={theme}
           isDirty={isDirty}
           onContentChange={handleContentChange}
           onSaveNow={() => saveNote(false)}

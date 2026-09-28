@@ -24,10 +24,18 @@ use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
 use syntect::parsing::SyntaxSet;
 
 use crate::md_extensions::{
-    decode_wikilink_dest, parse_callout, rewrite_wikilinks, strip_comments, CALLOUT_TYPES,
+    decode_wikilink_dest, decode_wikilink_embed_dest, parse_callout, rewrite_wikilinks,
+    strip_comments, CALLOUT_TYPES,
 };
 use crate::{dedup_slug, extract_headings, parse_front_matter, slugify, HeadingItem, NotePath};
 use std::collections::HashMap;
+use std::fs;
+
+/// Maximum embed recursion depth (M10.24): a chain of `![[...]]` embeds nested deeper than this
+/// stops recursing and renders a `flint-embed-depth-limit` placeholder instead, so a pathological
+/// (non-cyclic) embed chain can't cause runaway work. Chosen so ordinary legitimate nesting still
+/// renders in full.
+const EMBED_MAX_DEPTH: usize = 5;
 
 /// Result returned from markdown rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,6 +387,120 @@ fn resolve_image_src(
     (src.to_string(), false)
 }
 
+/// Build the same `flint-ambiguous-link` anchor markup the plain-link handler emits, reused by
+/// the embed handler (M10.24) so an ambiguous embed target gets identical UI to an ambiguous
+/// plain wikilink rather than a separate error path.
+fn ambiguous_link_html(candidates: &[NotePath], label: &str) -> String {
+    let candidates_attr = candidates.join(",");
+    format!(
+        "<a href=\"#/ambiguous\" class=\"flint-ambiguous-link\" data-candidates=\"{}\">{}</a>",
+        html_escape::encode_double_quoted_attribute(&candidates_attr),
+        html_escape::encode_text(label)
+    )
+}
+
+/// Build the same `flint-broken-link` anchor markup the plain-link handler emits, reused by the
+/// embed handler (M10.24) so an unresolved embed target gets identical UI to an unresolved plain
+/// wikilink rather than a separate error path.
+fn broken_link_html(raw_path: &str, anchor: Option<&str>, label: &str) -> String {
+    let anchor_part = anchor.map(|a| format!("#{}", a)).unwrap_or_default();
+    let href = format!("#/create-note/{}{}", raw_path, anchor_part);
+    let title_val = format!("Broken link — click to create {}", raw_path);
+    format!(
+        "<a href=\"{}\" class=\"flint-broken-link\" data-target=\"{}\" title=\"{}\">{}</a>",
+        html_escape::encode_double_quoted_attribute(&href),
+        html_escape::encode_double_quoted_attribute(raw_path),
+        html_escape::encode_double_quoted_attribute(&title_val),
+        html_escape::encode_text(label)
+    )
+}
+
+/// Resolve and render an `![[target]]` embed (M10.24): unresolved/ambiguous targets reuse the
+/// plain-link broken/ambiguous UI; a resolved target is read from disk and recursively rendered
+/// (so its own relative links/images resolve against *its* folder), wrapped in a bordered
+/// `.flint-embed` boundary; a cycle or over-depth chain renders a named, non-blank placeholder
+/// instead of recursing.
+#[allow(clippy::too_many_arguments)]
+fn render_embed(
+    target: &str,
+    heading: Option<&str>,
+    theme: &str,
+    workspace_root: Option<&Path>,
+    note_relative_path: Option<&str>,
+    wikilinks_enabled: bool,
+    filename_stems: &HashMap<String, Vec<NotePath>>,
+    visited: &mut Vec<NotePath>,
+    depth: usize,
+) -> String {
+    let (Some(root), Some(source_rel)) = (workspace_root, note_relative_path) else {
+        // No workspace context to resolve against — render the raw target as a broken link,
+        // matching the plain-link handler's fallback for the same situation.
+        return broken_link_html(target, heading, target);
+    };
+
+    let resolution =
+        crate::resolve_wikilink_target(root, source_rel, filename_stems, target, heading);
+
+    match resolution {
+        crate::ResolvedTarget::Ambiguous(candidates) => ambiguous_link_html(&candidates, target),
+        crate::ResolvedTarget::Unresolved { raw_path, anchor } => {
+            broken_link_html(&raw_path, anchor.as_deref(), target)
+        }
+        crate::ResolvedTarget::External(url) => {
+            // A bare wikilink target never resolves to `External` (no `://` in a bare name), but
+            // handle it defensively rather than panicking.
+            format!(
+                "<a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" class=\"flint-external-link\">{}</a>",
+                html_escape::encode_double_quoted_attribute(&url),
+                html_escape::encode_text(target)
+            )
+        }
+        crate::ResolvedTarget::Internal { path, .. } => {
+            if visited.contains(&path) {
+                let mut chain: Vec<&str> = visited.iter().map(|p| p.as_str()).collect();
+                chain.push(&path);
+                return format!(
+                    "<div class=\"flint-embed-cycle\">Embed cycle: {}</div>",
+                    html_escape::encode_text(&chain.join(" \u{2192} "))
+                );
+            }
+            if depth >= EMBED_MAX_DEPTH {
+                return format!(
+                    "<div class=\"flint-embed-depth-limit\">Embed depth limit ({}) reached — not rendering <code>{}</code></div>",
+                    EMBED_MAX_DEPTH,
+                    html_escape::encode_text(&path)
+                );
+            }
+
+            let target_abs = root.join(&path);
+            let target_content = match fs::read_to_string(&target_abs) {
+                Ok(c) => c,
+                Err(_) => return broken_link_html(&path, None, target),
+            };
+
+            visited.push(path.clone());
+            let inner = render_note_markdown_recursive(
+                &target_content,
+                theme,
+                Some(root),
+                Some(&path),
+                wikilinks_enabled,
+                Some(filename_stems),
+                visited,
+                depth + 1,
+            );
+            visited.pop();
+
+            format!(
+                "<div class=\"flint-embed\" data-embed-source=\"{}\"><div class=\"flint-embed-source\">{}</div>{}</div>",
+                html_escape::encode_double_quoted_attribute(&path),
+                html_escape::encode_text(&path),
+                inner.html
+            )
+        }
+    }
+}
+
 /// Render Markdown note content to sanitized HTML and extract outline. Wikilinks are off
 /// (see [`render_note_markdown_with_config`] to enable them) — this wrapper exists so the many
 /// call sites that don't care about M10.23 don't need to thread a filename-stem index through.
@@ -409,6 +531,39 @@ pub fn render_note_markdown_with_config(
     note_relative_path: Option<&str>,
     wikilinks_enabled: bool,
     filename_stems: Option<&HashMap<String, Vec<NotePath>>>,
+) -> RenderResult {
+    // Seed the cycle-detection set with the top-level note's own path so a note that (directly or
+    // indirectly) embeds itself is caught rather than recursing forever (M10.24).
+    let mut visited: Vec<NotePath> = Vec::new();
+    if let Some(rel) = note_relative_path {
+        visited.push(rel.to_string());
+    }
+    render_note_markdown_recursive(
+        raw_content,
+        theme,
+        workspace_root,
+        note_relative_path,
+        wikilinks_enabled,
+        filename_stems,
+        &mut visited,
+        0,
+    )
+}
+
+/// Implementation behind [`render_note_markdown_with_config`], with the embed-recursion state
+/// (`visited` path chain for cycle detection, `depth` for the [`EMBED_MAX_DEPTH`] cap) threaded
+/// through so a resolved `![[target]]` embed can recursively call back into this same function
+/// (see the `Event::Start(Tag::Image)` handling below) while sharing `workspace_root`/`theme`.
+#[allow(clippy::too_many_arguments)]
+fn render_note_markdown_recursive(
+    raw_content: &str,
+    theme: &str,
+    workspace_root: Option<&Path>,
+    note_relative_path: Option<&str>,
+    wikilinks_enabled: bool,
+    filename_stems: Option<&HashMap<String, Vec<NotePath>>>,
+    visited: &mut Vec<NotePath>,
+    depth: usize,
 ) -> RenderResult {
     let (_fm_raw, body, _, _) = parse_front_matter(raw_content);
     let headings = extract_headings(raw_content);
@@ -468,6 +623,12 @@ pub fn render_note_markdown_with_config(
     let mut image_title = String::new();
     let mut image_dest_url = String::new();
 
+    // Embed state (M10.24): an `![[target]]` embed also arrives as a `Tag::Image` event (see
+    // `rewrite_wikilinks`), but its HTML is computed entirely at `Start(Image)` time (no
+    // dependency on the label text between Start/End), so this just suppresses the normal
+    // image-handling and text-forwarding paths until `End(Image)`.
+    let mut in_embed = false;
+
     let mut blockquote_depth: i32 = 0;
     let mut blockquote_buffer: Vec<Event> = Vec::new();
 
@@ -511,8 +672,17 @@ pub fn render_note_markdown_with_config(
             }
             Event::End(TagEnd::CodeBlock) => {
                 in_code_block = false;
-                let highlighted = highlight_code(&code_block_buf, &code_block_lang, is_dark);
-                custom_events.push(Event::Html(CowStr::Boxed(highlighted.into_boxed_str())));
+                let rendered = if code_block_lang.eq_ignore_ascii_case("mermaid") {
+                    // Mermaid needs its raw diagram-definition text (HTML-escaped, not
+                    // syntax-colorized) handed to the client-side library verbatim (M10.24).
+                    format!(
+                        "<pre class=\"mermaid\">{}</pre>",
+                        html_escape::encode_text(&code_block_buf)
+                    )
+                } else {
+                    highlight_code(&code_block_buf, &code_block_lang, is_dark)
+                };
+                custom_events.push(Event::Html(CowStr::Boxed(rendered.into_boxed_str())));
             }
             Event::Text(text) if in_code_block => {
                 code_block_buf.push_str(&text);
@@ -670,6 +840,23 @@ pub fn render_note_markdown_with_config(
                 title,
                 id: _,
             }) => {
+                if let Some((target, heading)) = decode_wikilink_embed_dest(&dest_url) {
+                    in_embed = true;
+                    let embed_html = render_embed(
+                        &target,
+                        heading.as_deref(),
+                        theme,
+                        workspace_root,
+                        note_relative_path,
+                        wikilinks_enabled,
+                        filename_stems,
+                        visited,
+                        depth,
+                    );
+                    custom_events.push(Event::Html(CowStr::Boxed(embed_html.into_boxed_str())));
+                    continue;
+                }
+
                 let (resolved_url, exists) =
                     resolve_image_src(&dest_url, note_folder_abs.as_deref(), workspace_root);
                 in_image = true;
@@ -680,6 +867,10 @@ pub fn render_note_markdown_with_config(
                 image_dest_url = dest_url.to_string();
             }
             Event::End(TagEnd::Image) => {
+                if in_embed {
+                    in_embed = false;
+                    continue;
+                }
                 in_image = false;
                 if image_exists {
                     let title_attr = if !image_title.is_empty() {
@@ -746,7 +937,7 @@ pub fn render_note_markdown_with_config(
                 custom_events.push(Event::Html(CowStr::Boxed(input_html.into_boxed_str())));
             }
             other => {
-                if current_heading_level.is_none() && !in_image {
+                if current_heading_level.is_none() && !in_image && !in_embed {
                     custom_events.push(other);
                 }
             }
@@ -837,6 +1028,7 @@ pub fn render_note_markdown_with_config(
     generic_attrs.insert("data-math");
     generic_attrs.insert("data-target");
     generic_attrs.insert("data-callout-type");
+    generic_attrs.insert("data-embed-source");
     tag_attributes.insert("div", generic_attrs.clone());
     tag_attributes.insert("span", generic_attrs.clone());
     tag_attributes.insert("h1", generic_attrs.clone());
@@ -1055,6 +1247,33 @@ fn main() {
 
         let res_light = render_note_markdown(md, "light", None, None);
         assert!(res_light.html.contains("syntect-code"));
+    }
+
+    #[test]
+    fn test_render_mermaid_fence_skips_syntax_highlighting() {
+        let md = "```mermaid\ngraph TD;\n  A-->B;\n```";
+        let res = render_note_markdown(md, "dark", None, None);
+        assert!(res.html.contains("<pre class=\"mermaid\">"));
+        // Raw diagram source, HTML-escaped but not syntect-colorized (no `<span style=` runs,
+        // no `syntect-code` class, no `data-lang` attribute — the class alone is the signal).
+        assert!(!res.html.contains("syntect-code"));
+        assert!(!res.html.contains("data-lang"));
+        assert!(res.html.contains("A--&gt;B"));
+    }
+
+    #[test]
+    fn test_render_mermaid_case_insensitive_and_trimmed_lang() {
+        let md = "``` Mermaid \ngraph TD;\n```";
+        let res = render_note_markdown(md, "dark", None, None);
+        assert!(res.html.contains("<pre class=\"mermaid\">"));
+    }
+
+    #[test]
+    fn test_render_non_mermaid_fence_still_highlighted() {
+        let md = "```python\nprint('hi')\n```";
+        let res = render_note_markdown(md, "dark", None, None);
+        assert!(res.html.contains("syntect-code"));
+        assert!(!res.html.contains("class=\"mermaid\""));
     }
 
     #[test]

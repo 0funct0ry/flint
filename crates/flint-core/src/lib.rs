@@ -4139,6 +4139,196 @@ Also see [Broken link](./missing-note) and external [Google](https://google.com)
     }
 
     #[test]
+    fn render_embed_resolved_target_wraps_content_with_boundary() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("target.md"), "# Target\n\nBody text.").unwrap();
+        let mut index = Index::new();
+        index.insert_or_update_note(
+            root,
+            &SafePath::resolve(root, "target.md").unwrap(),
+            "# Target\n\nBody text.",
+        );
+        let stems = stems_from(&index);
+
+        let html = crate::render::render_note_markdown_with_config(
+            "![[target]]",
+            "dark",
+            Some(root),
+            Some("source.md"),
+            true,
+            Some(&stems),
+        )
+        .html;
+        assert!(html.contains("flint-embed"));
+        assert!(html.contains("data-embed-source=\"target.md\""));
+        assert!(html.contains("Body text."));
+    }
+
+    #[test]
+    fn render_embed_relative_links_resolve_against_embedded_notes_own_folder() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("sub/target.md"), "![local](./pic.png)").unwrap();
+        fs::write(root.join("sub/pic.png"), b"fake png bytes").unwrap();
+        let mut index = Index::new();
+        index.insert_or_update_note(
+            root,
+            &SafePath::resolve(root, "sub/target.md").unwrap(),
+            "![local](./pic.png)",
+        );
+        let stems = stems_from(&index);
+
+        let html = crate::render::render_note_markdown_with_config(
+            "![[target]]",
+            "dark",
+            Some(root),
+            Some("source.md"),
+            true,
+            Some(&stems),
+        )
+        .html;
+        // The embedded note's own relative image resolves against `sub/`, not the workspace
+        // root the embedding note (`source.md`) lives in.
+        assert!(!html.contains("flint-missing-image"));
+        assert!(html.contains("<img"));
+    }
+
+    #[test]
+    fn render_embed_unresolved_target_reuses_broken_link_ui() {
+        let html = crate::render::render_note_markdown_with_config(
+            "![[missing]]",
+            "dark",
+            Some(Path::new("/tmp")),
+            Some("source.md"),
+            true,
+            None,
+        )
+        .html;
+        assert!(html.contains("flint-broken-link"));
+        assert!(!html.contains("flint-embed\""));
+    }
+
+    #[test]
+    fn render_embed_ambiguous_target_reuses_ambiguous_link_ui() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut index = Index::new();
+        index.insert_or_update_note(root, &SafePath::resolve(root, "a/dup.md").unwrap(), "# A");
+        index.insert_or_update_note(root, &SafePath::resolve(root, "b/dup.md").unwrap(), "# B");
+        let stems = stems_from(&index);
+
+        let html = crate::render::render_note_markdown_with_config(
+            "![[dup]]",
+            "dark",
+            Some(root),
+            Some("source.md"),
+            true,
+            Some(&stems),
+        )
+        .html;
+        assert!(html.contains("flint-ambiguous-link"));
+    }
+
+    #[test]
+    fn render_embed_direct_cycle_renders_named_error_not_infinite_recursion() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.md"), "![[a]]").unwrap();
+        let mut index = Index::new();
+        index.insert_or_update_note(root, &SafePath::resolve(root, "a.md").unwrap(), "![[a]]");
+        let stems = stems_from(&index);
+
+        let html = crate::render::render_note_markdown_with_config(
+            "![[a]]",
+            "dark",
+            Some(root),
+            Some("a.md"),
+            true,
+            Some(&stems),
+        )
+        .html;
+        assert!(html.contains("flint-embed-cycle"));
+        assert!(html.contains("a.md"));
+    }
+
+    #[test]
+    fn render_embed_indirect_cycle_renders_named_error_not_infinite_recursion() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.md"), "![[b]]").unwrap();
+        fs::write(root.join("b.md"), "![[a]]").unwrap();
+        let mut index = Index::new();
+        index.insert_or_update_note(root, &SafePath::resolve(root, "a.md").unwrap(), "![[b]]");
+        index.insert_or_update_note(root, &SafePath::resolve(root, "b.md").unwrap(), "![[a]]");
+        let stems = stems_from(&index);
+
+        let html = crate::render::render_note_markdown_with_config(
+            "![[b]]",
+            "dark",
+            Some(root),
+            Some("a.md"),
+            true,
+            Some(&stems),
+        )
+        .html;
+        assert!(html.contains("flint-embed-cycle"));
+    }
+
+    #[test]
+    fn render_embed_over_depth_chain_renders_depth_limit_block_not_crash() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // note_0 embeds note_1, note_1 embeds note_2, ... note_6 has no further embed. That's 6
+        // embed hops from the top-level note, past EMBED_MAX_DEPTH (5).
+        let mut index = Index::new();
+        for i in 0..7 {
+            let content = if i < 6 {
+                format!("![[note_{}]]", i + 1)
+            } else {
+                "# Leaf".to_string()
+            };
+            let path = format!("note_{i}.md");
+            fs::write(root.join(&path), &content).unwrap();
+            index.insert_or_update_note(root, &SafePath::resolve(root, &path).unwrap(), &content);
+        }
+        let stems = stems_from(&index);
+
+        let html = crate::render::render_note_markdown_with_config(
+            "![[note_0]]",
+            "dark",
+            Some(root),
+            Some("top.md"),
+            true,
+            Some(&stems),
+        )
+        .html;
+        assert!(html.contains("flint-embed-depth-limit"));
+    }
+
+    #[test]
+    fn render_embed_does_not_affect_embedding_notes_own_extracted_links_or_search() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("target.md"), "# Target\n\n[[other]]\n").unwrap();
+        let mut index = Index::new();
+        index.insert_or_update_note(
+            root,
+            &SafePath::resolve(root, "target.md").unwrap(),
+            "# Target\n\n[[other]]\n",
+        );
+        let stems = stems_from(&index);
+
+        // The embedding note's own raw content has no links of its own beyond the embed marker
+        // itself; `extract_wikilinks` on the embedding note's raw text must not see `[[other]]`,
+        // which only exists inside the *embedded* note's content.
+        let embedding_source = "![[target]]";
+        let links = extract_wikilinks(root, "source.md", embedding_source, &stems);
+        assert!(!links.iter().any(|l| l.raw_target.contains("other")));
+    }
+
+    #[test]
     fn rewrite_wikilinks_for_rename_preserves_alias_and_heading() {
         let dir = tempdir().unwrap();
         let root = dir.path();

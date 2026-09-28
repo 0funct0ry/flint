@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useSettings } from '../context/SettingsContext';
 import { api } from '../services/ipc';
-import { McpStatus } from '../types';
+import { McpStatus, TemplateMeta } from '../types';
 
 export interface SettingsPanelProps {
   onClose: () => void;
@@ -83,9 +83,14 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
   const [mcpToken, setMcpToken] = useState<string | null>(null);
   const [mcpRotating, setMcpRotating] = useState(false);
   const [mcpTokenCopied, setMcpTokenCopied] = useState(false);
+  const [templates, setTemplates] = useState<TemplateMeta[]>([]);
 
   useEffect(() => {
     api.mcpStatus().then(setMcpStatus);
+  }, []);
+
+  useEffect(() => {
+    api.templatesList().then(setTemplates);
   }, []);
 
   useEffect(() => {
@@ -492,6 +497,138 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
             Every MCP request is rejected until a token is generated.
           </div>
         )}
+
+        <SectionHeader title="Templates" />
+        <FieldRow
+          label="Default template"
+          path="templates.defaultTemplate"
+          origins={origins}
+          onReset={resetField}
+          hint={
+            templates.length === 0
+              ? 'No templates yet — add one in .flint/templates/'
+              : 'Pre-selected option in the new-note template picker.'
+          }
+        >
+          <select
+            className={selectClass}
+            value={config.templates.defaultTemplate ?? ''}
+            onChange={(e) => setField('templates.defaultTemplate', e.target.value || null)}
+            aria-label="Default template"
+            disabled={templates.length === 0}
+          >
+            <option value="">Blank</option>
+            {templates.map((t) => (
+              <option key={t.path} value={t.path}>
+                {t.name}
+              </option>
+            ))}
+          </select>
+        </FieldRow>
+
+        <SectionHeader title="New notes" />
+        <FieldRow
+          label="Target folder"
+          path="newNote.targetFolder"
+          origins={origins}
+          onReset={resetField}
+          hint="Workspace-relative folder new notes land in. Blank uses the currently open folder."
+        >
+          <input
+            type="text"
+            className={inputClass}
+            style={{ width: '9rem' }}
+            value={config.newNote.targetFolder ?? ''}
+            onChange={(e) => setField('newNote.targetFolder', e.target.value || null)}
+            aria-label="New note target folder"
+          />
+        </FieldRow>
+        <FieldRow
+          label="Filename pattern"
+          path="newNote.filenamePattern"
+          origins={origins}
+          onReset={resetField}
+          hint="Supports {{title}}, {{date}}, {{date:FORMAT}}, and {{time}}."
+        >
+          <input
+            type="text"
+            className={inputClass}
+            style={{ width: '9rem' }}
+            value={config.newNote.filenamePattern}
+            onChange={(e) => setField('newNote.filenamePattern', e.target.value)}
+            aria-label="New note filename pattern"
+          />
+        </FieldRow>
+        <FieldRow
+          label="Insert heading"
+          path="newNote.insertHeading"
+          origins={origins}
+          onReset={resetField}
+          hint="Insert a # <title> heading when a new note has no template and would otherwise be empty."
+        >
+          <input
+            type="checkbox"
+            className={checkboxClass}
+            checked={config.newNote.insertHeading}
+            onChange={(e) => setField('newNote.insertHeading', e.target.checked)}
+            aria-label="Insert heading in new notes"
+          />
+        </FieldRow>
+
+        <SectionHeader title="Daily notes" />
+        <FieldRow
+          label="Enabled"
+          path="dailyNotes.enabled"
+          origins={origins}
+          onReset={resetField}
+          hint="Adds Today/Yesterday/Tomorrow/Pick a date… to the command palette. Never creates a note automatically."
+        >
+          <input
+            type="checkbox"
+            className={checkboxClass}
+            checked={config.dailyNotes.enabled}
+            onChange={(e) => setField('dailyNotes.enabled', e.target.checked)}
+            aria-label="Daily notes enabled"
+          />
+        </FieldRow>
+        <FieldRow
+          label="Path pattern"
+          path="dailyNotes.pathPattern"
+          origins={origins}
+          onReset={resetField}
+          hint="e.g. daily/{{date:YYYY-MM-DD}}.md"
+        >
+          <input
+            type="text"
+            className={inputClass}
+            style={{ width: '11rem' }}
+            value={config.dailyNotes.pathPattern}
+            onChange={(e) => setField('dailyNotes.pathPattern', e.target.value)}
+            aria-label="Daily note path pattern"
+          />
+        </FieldRow>
+        <FieldRow
+          label="Template"
+          path="dailyNotes.template"
+          origins={origins}
+          onReset={resetField}
+          hint={templates.length === 0 ? 'No templates yet — add one in .flint/templates/' : undefined}
+        >
+          <select
+            className={selectClass}
+            value={config.dailyNotes.template ?? ''}
+            onChange={(e) => setField('dailyNotes.template', e.target.value || null)}
+            aria-label="Daily note template"
+            disabled={templates.length === 0}
+          >
+            <option value="">Blank</option>
+            {templates.map((t) => (
+              <option key={t.path} value={t.path}>
+                {t.name}
+              </option>
+            ))}
+          </select>
+        </FieldRow>
 
         <SectionHeader title="Ignore" />
         <div className="px-3 pb-3">

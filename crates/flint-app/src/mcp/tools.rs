@@ -163,7 +163,7 @@ pub fn list_tools() -> Vec<Value> {
         ),
         tool_def(
             "note_create",
-            "Create a new note at a workspace-relative path.",
+            "Create a new note at a workspace-relative path. `template`, if given, is a path relative to .flint/templates/ whose content is rendered ({{date}}/{{time}}/{{title}}/{{path}}) into the note.",
             json!({
                 "type": "object",
                 "properties": {
@@ -171,6 +171,22 @@ pub fn list_tools() -> Vec<Value> {
                     "template": { "type": "string" }
                 },
                 "required": ["path"]
+            }),
+        ),
+        tool_def(
+            "templates_list",
+            "List templates available under .flint/templates/.",
+            json!({ "type": "object", "properties": {} }),
+        ),
+        tool_def(
+            "daily_note_open",
+            "Open (creating on first use) the daily note for a day, computed from dailyNotes config. offset_days is relative to today; date (YYYY-MM-DD) picks an explicit day and takes precedence.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "offset_days": { "type": "integer" },
+                    "date": { "type": "string" }
+                }
             }),
         ),
         tool_def(
@@ -374,16 +390,85 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
             let args: Args = parse_args(arguments)?;
             let safe = resolve(ctx.root, &args.path)?;
             let posix = safe.to_posix_string();
-            let meta =
-                create_note(ctx.root, &safe, args.template.as_deref()).map_err(map_note_error)?;
-            let content = args.template.as_deref().unwrap_or("");
+            // Same template-file-path semantics as the `note_create` IPC command (M10.26) —
+            // MCP writes must never diverge from what the GUI's "+" flow produces.
+            let title = flint_core::resolve_note_title("", safe.as_relative_path());
+            let content =
+                crate::resolve_new_note_content(ctx.root, &posix, &title, args.template.as_deref())
+                    .map_err(plain_error)?;
+            let meta = create_note(ctx.root, &safe, Some(&content)).map_err(map_note_error)?;
             crate::record_suppressed_write(
                 ctx.suppressed_writes,
                 &posix,
                 Some(flint_core::hash_bytes(content.as_bytes())),
             );
             if let Ok(mut lock) = ctx.index.write() {
-                lock.insert_or_update_note(ctx.root, &safe, content);
+                lock.insert_or_update_note(ctx.root, &safe, &content);
+            }
+            emit_note_event(ctx, "note:created", &posix);
+            Ok(json!(meta))
+        }
+        "templates_list" => Ok(json!(flint_core::list_templates(ctx.root))),
+        "daily_note_open" => {
+            #[derive(Deserialize)]
+            struct Args {
+                offset_days: Option<i64>,
+                date: Option<String>,
+            }
+            let args: Args = parse_args(arguments)?;
+            let cfg = crate::read_daily_notes_config(ctx.root);
+
+            let now_local = chrono::Local::now();
+            let target_date = crate::resolve_daily_note_target_date(
+                now_local.date_naive(),
+                args.offset_days,
+                args.date.as_deref(),
+            )
+            .map_err(plain_error)?;
+            let target_dt = chrono::NaiveDateTime::new(target_date, now_local.time())
+                .and_local_timezone(chrono::Local)
+                .single()
+                .ok_or_else(|| plain_error("Ambiguous local time for that date"))?;
+
+            let path_ctx = flint_core::TemplateContext {
+                title: target_date.format("%Y-%m-%d").to_string(),
+                path: String::new(),
+                now: target_dt,
+            };
+            let rendered_path = flint_core::render_template(&cfg.path_pattern, &path_ctx);
+            let safe = resolve(ctx.root, &rendered_path)?;
+
+            if safe.as_path().exists() {
+                let note = read_note(ctx.root, &safe).map_err(map_note_error)?;
+                return Ok(json!(note.meta));
+            }
+
+            let posix = safe.to_posix_string();
+            let title = flint_core::resolve_note_title("", safe.as_relative_path());
+            let note_ctx = flint_core::TemplateContext {
+                title: title.clone(),
+                path: posix.clone(),
+                now: target_dt,
+            };
+            let content = match cfg.template.as_deref() {
+                Some(name) => {
+                    let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, name);
+                    let tpl_safe = resolve(ctx.root, &template_rel)?;
+                    let raw = std::fs::read_to_string(tpl_safe.as_path())
+                        .map_err(|e| plain_error(e.to_string()))?;
+                    flint_core::render_template(&raw, &note_ctx)
+                }
+                None => String::new(),
+            };
+
+            let meta = create_note(ctx.root, &safe, Some(&content)).map_err(map_note_error)?;
+            crate::record_suppressed_write(
+                ctx.suppressed_writes,
+                &posix,
+                Some(flint_core::hash_bytes(content.as_bytes())),
+            );
+            if let Ok(mut lock) = ctx.index.write() {
+                lock.insert_or_update_note(ctx.root, &safe, &content);
             }
             emit_note_event(ctx, "note:created", &posix);
             Ok(json!(meta))

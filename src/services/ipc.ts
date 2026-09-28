@@ -20,6 +20,7 @@ import {
   ConfigGetResult,
   FlintConfig,
   McpStatus,
+  TemplateMeta,
 } from "../types";
 import { FIXTURE_NOTES } from "../fixtures/workspace";
 import { renderMarkdownToHtml, slugify, dedupSlug } from "./markdown";
@@ -70,9 +71,53 @@ const DEFAULT_CONFIG: FlintConfig = {
     port: null,
     requireAuth: false,
   },
+  templates: {
+    defaultTemplate: null,
+  },
+  newNote: {
+    targetFolder: null,
+    filenamePattern: "{{title}}",
+    insertHeading: false,
+  },
+  dailyNotes: {
+    enabled: false,
+    pathPattern: "daily/{{date:YYYY-MM-DD}}.md",
+    template: null,
+  },
   ignore: ["node_modules/**", ".obsidian/**"],
   layout: {},
 };
+
+// Browser dev/test mock for `.flint/templates/` (M10.26) — mirrors the `flint init` seed so the
+// picker and settings dropdowns have something non-empty to show outside the real Tauri app.
+const browserMockTemplates: Record<string, string> = {
+  "daily.md": "# {{date}}\n\n## Notes\n\n## Tasks\n\n- [ ] \n",
+};
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : `${String(n)}`;
+}
+
+/** Minimal mirror of `flint_core::render_template` for the browser mock path — only the default
+ * `YYYY-MM-DD`/`HH:mm` formats are supported here; the real formatting lives in Rust. */
+function mockRenderTemplate(body: string, ctx: { title: string; path: string; now: Date }): string {
+  const date = `${ctx.now.getFullYear()}-${pad2(ctx.now.getMonth() + 1)}-${pad2(ctx.now.getDate())}`;
+  const time = `${pad2(ctx.now.getHours())}:${pad2(ctx.now.getMinutes())}`;
+  return body.replace(/\{\{\s*([A-Za-z]+)(?::([^}]*))?\s*\}\}/g, (whole, name) => {
+    switch (name) {
+      case "date":
+        return date;
+      case "time":
+        return time;
+      case "title":
+        return ctx.title;
+      case "path":
+        return ctx.path;
+      default:
+        return whole;
+    }
+  });
+}
 
 const browserMockConfig: FlintConfig = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
 
@@ -297,19 +342,31 @@ export const api = {
     };
   },
 
+  /**
+   * `template`, when given, is a path relative to `.flint/templates/` (M10.26) — rendered with
+   * `{{date}}`/`{{time}}`/`{{title}}`/`{{path}}` — not literal content.
+   */
   async noteCreate(path: string, template?: string): Promise<NoteMeta> {
     if (isTauriEnvironment()) {
       return await invoke<NoteMeta>("note_create", { path, template });
     }
 
-    const content = template || "";
+    const title = path.split("/").pop()?.replace(/\.md$/, "") || "Untitled";
+    const ctx = { title, path, now: new Date() };
+    let content: string;
+    if (template) {
+      content = mockRenderTemplate(browserMockTemplates[template] ?? "", ctx);
+    } else if (browserMockConfig.newNote.insertHeading) {
+      content = mockRenderTemplate("# {{title}}\n", ctx);
+    } else {
+      content = "";
+    }
     browserMockStorage[path] = {
       content,
       hash: "mock-hash-" + content.length + "-" + Date.now(),
       modified: Date.now(),
     };
 
-    const title = path.split("/").pop()?.replace(/\.md$/, "") || "Untitled";
     return {
       path,
       title,
@@ -318,6 +375,50 @@ export const api = {
       headings: [],
       tags: [],
     };
+  },
+
+  async templatesList(): Promise<TemplateMeta[]> {
+    if (isTauriEnvironment()) {
+      return await invoke<TemplateMeta[]>("templates_list");
+    }
+    return Object.keys(browserMockTemplates).map((path) => ({
+      name: path.replace(/\.md$/, ""),
+      path,
+    }));
+  },
+
+  /**
+   * Open (creating on first use) the daily note for a day. `offsetDays` is relative to today
+   * (`-1` yesterday, `0`/undefined today, `1` tomorrow); `date` (`YYYY-MM-DD`) picks an explicit
+   * day and wins over `offsetDays`. Never called automatically — only from an explicit command.
+   */
+  async dailyNoteOpen(offsetDays?: number, date?: string): Promise<NoteMeta> {
+    if (isTauriEnvironment()) {
+      return await invoke<NoteMeta>("daily_note_open", { offsetDays, date });
+    }
+
+    const target = date ? new Date(`${date}T00:00:00`) : new Date();
+    if (!date) {
+      target.setDate(target.getDate() + (offsetDays ?? 0));
+    }
+    const pathCtx = { title: "", path: "", now: target };
+    const relPath = mockRenderTemplate(browserMockConfig.dailyNotes.pathPattern, pathCtx);
+
+    const existing = browserMockStorage[relPath];
+    if (existing) {
+      const title = relPath.split("/").pop()?.replace(/\.md$/, "") || "Untitled";
+      return {
+        path: relPath,
+        title,
+        size_bytes: existing.content.length,
+        modified_ms: existing.modified,
+        headings: [],
+        tags: [],
+      };
+    }
+
+    const dailyTemplate = browserMockConfig.dailyNotes.template ?? undefined;
+    return api.noteCreate(relPath, dailyTemplate);
   },
 
   async noteRename(from: string, to: string, rewriteLinks?: boolean): Promise<RenameResult> {

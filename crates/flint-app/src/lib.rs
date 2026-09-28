@@ -138,6 +138,58 @@ fn read_rewrite_tags_on_rename(root: &Path) -> bool {
         .unwrap_or(true)
 }
 
+/// Read `newNote.*` config (M10.26), same fallback-to-default pattern as [`read_wikilinks_enabled`].
+pub(crate) fn read_new_note_config(root: &Path) -> flint_core::config::NewNoteConfig {
+    flint_core::config_get(root, None)
+        .ok()
+        .and_then(|r| serde_json::from_value::<flint_core::config::FlintConfig>(r.config).ok())
+        .map(|c| c.new_note)
+        .unwrap_or_default()
+}
+
+/// Read `dailyNotes.*` config (M10.26), same fallback-to-default pattern as [`read_new_note_config`].
+pub(crate) fn read_daily_notes_config(root: &Path) -> flint_core::config::DailyNotesConfig {
+    flint_core::config_get(root, None)
+        .ok()
+        .and_then(|r| serde_json::from_value::<flint_core::config::FlintConfig>(r.config).ok())
+        .map(|c| c.daily_notes)
+        .unwrap_or_default()
+}
+
+/// Resolve a `template` argument (a path relative to `.flint/templates/`, per M10.26) to its
+/// rendered content, or fall back to `NewNoteConfig.insert_heading` when no template was picked.
+/// `posix_path`/`title` seed the `{{path}}`/`{{title}}` placeholders. Every path here — including
+/// the template file itself — still crosses [`SafePath::resolve`], the same guard every other
+/// filesystem-touching command uses; `.flint/templates/` is not a special case.
+pub(crate) fn resolve_new_note_content(
+    root: &Path,
+    posix_path: &str,
+    title: &str,
+    template: Option<&str>,
+) -> Result<String, String> {
+    let ctx = flint_core::TemplateContext {
+        title: title.to_string(),
+        path: posix_path.to_string(),
+        now: chrono::Local::now(),
+    };
+    match template {
+        Some(name) => {
+            let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, name);
+            let safe = SafePath::resolve(root, &template_rel).map_err(|e| e.to_string())?;
+            let raw = std::fs::read_to_string(safe.as_path()).map_err(|e| e.to_string())?;
+            Ok(flint_core::render_template(&raw, &ctx))
+        }
+        None => {
+            let cfg = read_new_note_config(root);
+            if cfg.insert_heading {
+                Ok(flint_core::render_template("# {{title}}\n", &ctx))
+            } else {
+                Ok(String::new())
+            }
+        }
+    }
+}
+
 /// Helper to obtain the active workspace root or fallback to current dir.
 fn get_workspace_root(state: &State<AppState>) -> Result<PathBuf, String> {
     let lock = state
@@ -724,6 +776,11 @@ fn frontmatter_set(
 }
 
 /// Create a new note at path and update index (SPEC §11, M4).
+///
+/// `template` is a path relative to `.flint/templates/` (M10.26), not literal content: when set,
+/// the named template file is rendered (`{{date}}`/`{{time}}`/`{{title}}`/`{{path}}`) into the
+/// new note's initial body. When `None`, `NewNoteConfig.insert_heading` decides whether a bare
+/// `# <title>` heading is inserted instead of an empty file.
 #[tauri::command]
 fn note_create(
     path: String,
@@ -733,16 +790,107 @@ fn note_create(
     let root = get_workspace_root(&state)?;
     let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
     let posix = safe_path.to_posix_string();
+    let title = flint_core::resolve_note_title("", safe_path.as_relative_path());
 
-    let meta = create_note(&root, &safe_path, template.as_deref()).map_err(|e| e.to_string())?;
+    let content = resolve_new_note_content(&root, &posix, &title, template.as_deref())?;
+    let meta = create_note(&root, &safe_path, Some(&content)).map_err(|e| e.to_string())?;
 
-    let content = template.as_deref().unwrap_or("");
     let hash = flint_core::hash_bytes(content.as_bytes());
     record_suppressed_write(&state.suppressed_writes, &posix, Some(hash));
 
     // Incremental index update per SPEC §6.2
     if let Ok(mut lock) = state.index.write() {
-        lock.insert_or_update_note(&root, &safe_path, content);
+        lock.insert_or_update_note(&root, &safe_path, &content);
+    }
+
+    Ok(meta)
+}
+
+/// List the templates available under `.flint/templates/` (M10.26), for the new-note template
+/// picker and the daily-notes settings dropdown. Never errors: an absent directory is a designed
+/// empty state, not a failure (see [`flint_core::list_templates`]).
+#[tauri::command]
+fn templates_list(state: State<AppState>) -> Result<Vec<flint_core::TemplateMeta>, String> {
+    let root = get_workspace_root(&state)?;
+    Ok(flint_core::list_templates(&root))
+}
+
+/// Pure date arithmetic for `daily_note_open`/the MCP `daily_note_open` tool (M10.26), split out
+/// from the command itself so month/year-boundary behavior is unit-testable without a `State`.
+/// `date` (when given) wins over `offset_days`, matching the command's documented precedence.
+pub(crate) fn resolve_daily_note_target_date(
+    today: chrono::NaiveDate,
+    offset_days: Option<i64>,
+    date: Option<&str>,
+) -> Result<chrono::NaiveDate, String> {
+    match date {
+        Some(d) => chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            .map_err(|_| format!("Invalid date: {}", d)),
+        None => Ok(today + chrono::Duration::days(offset_days.unwrap_or(0))),
+    }
+}
+
+/// Open (creating on first use only) the daily note for a given day (M10.26).
+///
+/// `offset_days` is relative to today (`-1` = yesterday, `0`/`None` = today, `1` = tomorrow);
+/// `date` (`YYYY-MM-DD`) picks an explicit day instead and takes precedence when both are given.
+/// The path is computed by rendering `dailyNotes.pathPattern`; if that note already exists it is
+/// simply opened (its `NoteMeta` returned) rather than recreated. This command is the *only* way
+/// a daily note is ever created — nothing at startup or in the watcher calls it, so
+/// `dailyNotes.enabled` merely gates whether the UI offers these commands, never auto-creation.
+#[tauri::command]
+fn daily_note_open(
+    offset_days: Option<i64>,
+    date: Option<String>,
+    state: State<AppState>,
+) -> Result<NoteMeta, String> {
+    let root = get_workspace_root(&state)?;
+    let cfg = read_daily_notes_config(&root);
+
+    let now_local = chrono::Local::now();
+    let target_date =
+        resolve_daily_note_target_date(now_local.date_naive(), offset_days, date.as_deref())?;
+    let target_dt = chrono::NaiveDateTime::new(target_date, now_local.time())
+        .and_local_timezone(chrono::Local)
+        .single()
+        .ok_or_else(|| "Ambiguous local time for that date".to_string())?;
+
+    let path_ctx = flint_core::TemplateContext {
+        title: target_date.format("%Y-%m-%d").to_string(),
+        path: String::new(),
+        now: target_dt,
+    };
+    let rendered_path = flint_core::render_template(&cfg.path_pattern, &path_ctx);
+    let safe_path = SafePath::resolve(&root, &rendered_path).map_err(|e| e.to_string())?;
+
+    if safe_path.as_path().exists() {
+        return read_note(&root, &safe_path)
+            .map(|note| note.meta)
+            .map_err(|e| e.to_string());
+    }
+
+    let posix = safe_path.to_posix_string();
+    let title = flint_core::resolve_note_title("", safe_path.as_relative_path());
+    let note_ctx = flint_core::TemplateContext {
+        title: title.clone(),
+        path: posix.clone(),
+        now: target_dt,
+    };
+    let content = match cfg.template.as_deref() {
+        Some(name) => {
+            let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, name);
+            let tpl_safe = SafePath::resolve(&root, &template_rel).map_err(|e| e.to_string())?;
+            let raw = std::fs::read_to_string(tpl_safe.as_path()).map_err(|e| e.to_string())?;
+            flint_core::render_template(&raw, &note_ctx)
+        }
+        None => String::new(),
+    };
+
+    let meta = create_note(&root, &safe_path, Some(&content)).map_err(|e| e.to_string())?;
+    let hash = flint_core::hash_bytes(content.as_bytes());
+    record_suppressed_write(&state.suppressed_writes, &posix, Some(hash));
+    if let Ok(mut lock) = state.index.write() {
+        lock.insert_or_update_note(&root, &safe_path, &content);
     }
 
     Ok(meta)
@@ -1261,6 +1409,8 @@ pub fn build_app_with_mcp_flags(
             note_write,
             frontmatter_set,
             note_create,
+            templates_list,
+            daily_note_open,
             note_rename,
             tag_rename,
             note_duplicate,
@@ -1343,5 +1493,89 @@ mod tests {
 
         // If write fails before recording, suppressed map is empty
         assert!(!is_suppressed_write(&suppressed, path, Some("any_hash")));
+    }
+
+    // M10.26: template resolution + daily-note date math.
+
+    #[test]
+    fn new_note_content_renders_named_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".flint/templates")).unwrap();
+        std::fs::write(
+            root.join(".flint/templates/daily.md"),
+            "# {{title}}\nAt {{path}}",
+        )
+        .unwrap();
+
+        let content =
+            resolve_new_note_content(root, "notes/hello.md", "hello", Some("daily.md")).unwrap();
+        assert_eq!(content, "# hello\nAt notes/hello.md");
+    }
+
+    #[test]
+    fn new_note_content_rejects_template_escaping_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_new_note_content(dir.path(), "n.md", "n", Some("../../etc/passwd"))
+            .unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn new_note_content_defaults_to_empty_without_template_or_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = resolve_new_note_content(dir.path(), "n.md", "n", None).unwrap();
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn new_note_content_inserts_heading_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        flint_core::config_set(dir.path(), "newNote.insertHeading", serde_json::json!(true))
+            .unwrap();
+        let content = resolve_new_note_content(dir.path(), "n.md", "My Note", None).unwrap();
+        assert_eq!(content, "# My Note\n");
+    }
+
+    #[test]
+    fn daily_note_date_defaults_to_today() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 28).unwrap();
+        assert_eq!(
+            resolve_daily_note_target_date(today, None, None).unwrap(),
+            today
+        );
+    }
+
+    #[test]
+    fn daily_note_date_offset_crosses_month_boundary() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        assert_eq!(
+            resolve_daily_note_target_date(today, Some(-1), None).unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()
+        );
+    }
+
+    #[test]
+    fn daily_note_date_offset_crosses_year_boundary() {
+        let today = chrono::NaiveDate::from_ymd_opt(2025, 12, 31).unwrap();
+        assert_eq!(
+            resolve_daily_note_target_date(today, Some(1), None).unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn daily_note_explicit_date_wins_over_offset() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        assert_eq!(
+            resolve_daily_note_target_date(today, Some(5), Some("2026-06-15")).unwrap(),
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap()
+        );
+    }
+
+    #[test]
+    fn daily_note_invalid_date_is_rejected() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        assert!(resolve_daily_note_target_date(today, None, Some("not-a-date")).is_err());
     }
 }

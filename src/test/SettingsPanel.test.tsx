@@ -13,6 +13,9 @@ const baseConfig: FlintConfig = {
   behaviour: { autosaveMs: 400, rewriteLinksOnRename: true, deleteToTrash: true, newNoteFolder: '', defaultMode: 'edit' },
   ui: { leftSidebar: 'tree', rightSidebarVisible: true, showNonNoteFiles: false },
   mcp: { enabled: false, port: null, requireAuth: false },
+  templates: { defaultTemplate: null },
+  newNote: { targetFolder: null, filenamePattern: '{{title}}', insertHeading: false },
+  dailyNotes: { enabled: false, pathPattern: 'daily/{{date:YYYY-MM-DD}}.md', template: null },
   ignore: ['node_modules/**'],
 };
 
@@ -219,5 +222,64 @@ describe('SettingsPanel', () => {
     render(<SettingsPanel onClose={vi.fn()} />);
 
     expect(screen.getByLabelText('New link syntax')).toBeDisabled();
+  });
+
+  describe('Templates / New notes / Daily notes (M10.26)', () => {
+    it('renders all three new sections', () => {
+      mockUseSettings();
+      render(<SettingsPanel onClose={vi.fn()} />);
+
+      expect(screen.getByText('Templates')).toBeInTheDocument();
+      expect(screen.getByText('New notes')).toBeInTheDocument();
+      expect(screen.getByText('Daily notes')).toBeInTheDocument();
+    });
+
+    it('shows the empty-templates hint and disables the pickers when there are no templates', async () => {
+      mockUseSettings();
+      vi.spyOn(api, 'templatesList').mockResolvedValue([]);
+      render(<SettingsPanel onClose={vi.fn()} />);
+
+      expect(await screen.findAllByText('No templates yet — add one in .flint/templates/')).toHaveLength(2);
+      expect(screen.getByLabelText('Default template')).toBeDisabled();
+      expect(screen.getByLabelText('Daily note template')).toBeDisabled();
+    });
+
+    it('lists discovered templates in both pickers', async () => {
+      mockUseSettings();
+      vi.spyOn(api, 'templatesList').mockResolvedValue([
+        { name: 'daily', path: 'daily.md' },
+        { name: 'meeting', path: 'meeting.md' },
+      ]);
+      render(<SettingsPanel onClose={vi.fn()} />);
+
+      expect(await screen.findByLabelText('Default template')).not.toBeDisabled();
+      expect(screen.getAllByRole('option', { name: 'meeting' })).toHaveLength(2);
+    });
+
+    it('sets newNote.filenamePattern and newNote.insertHeading through setField', () => {
+      const { setField } = mockUseSettings();
+      render(<SettingsPanel onClose={vi.fn()} />);
+
+      fireEvent.change(screen.getByLabelText('New note filename pattern'), {
+        target: { value: '{{date}}-{{title}}' },
+      });
+      expect(setField).toHaveBeenCalledWith('newNote.filenamePattern', '{{date}}-{{title}}');
+
+      fireEvent.click(screen.getByLabelText('Insert heading in new notes'));
+      expect(setField).toHaveBeenCalledWith('newNote.insertHeading', true);
+    });
+
+    it('toggles dailyNotes.enabled and edits the path pattern through setField', () => {
+      const { setField } = mockUseSettings();
+      render(<SettingsPanel onClose={vi.fn()} />);
+
+      fireEvent.click(screen.getByLabelText('Daily notes enabled'));
+      expect(setField).toHaveBeenCalledWith('dailyNotes.enabled', true);
+
+      fireEvent.change(screen.getByLabelText('Daily note path pattern'), {
+        target: { value: 'journal/{{date:YYYY/MM/DD}}.md' },
+      });
+      expect(setField).toHaveBeenCalledWith('dailyNotes.pathPattern', 'journal/{{date:YYYY/MM/DD}}.md');
+    });
   });
 });

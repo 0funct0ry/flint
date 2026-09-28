@@ -173,6 +173,19 @@ fn run() -> Result<u8, (u8, String)> {
                 let _ = fs::write(&starter_note, starter_content);
             }
 
+            // Seed one example template (M10.26) so the templates feature isn't empty on a
+            // fresh workspace, without forcing its use — `newNote`/`dailyNotes` config still
+            // default to no template picked.
+            let templates_dir = canonical.join(flint_core::TEMPLATES_DIR);
+            let daily_template = templates_dir.join("daily.md");
+            if !daily_template.exists() {
+                let _ = fs::create_dir_all(&templates_dir);
+                let _ = fs::write(
+                    &daily_template,
+                    "# {{date}}\n\n## Notes\n\n## Tasks\n\n- [ ] \n",
+                );
+            }
+
             if cli.json {
                 println!(
                     "{}",

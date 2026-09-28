@@ -38,6 +38,19 @@ const DEFAULT_CONFIG: FlintConfig = {
     port: null,
     requireAuth: false,
   },
+  templates: {
+    defaultTemplate: null,
+  },
+  newNote: {
+    targetFolder: null,
+    filenamePattern: '{{title}}',
+    insertHeading: false,
+  },
+  dailyNotes: {
+    enabled: false,
+    pathPattern: 'daily/{{date:YYYY-MM-DD}}.md',
+    template: null,
+  },
   ignore: [],
   layout: {},
 };

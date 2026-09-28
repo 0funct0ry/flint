@@ -806,10 +806,9 @@ export const App: React.FC = () => {
           targetPath = folder ? `${folder}/${cleanPath}` : cleanPath;
         }
 
-        const stem = targetPath.split('/').pop()?.replace(/\.md$/, '') || 'Untitled';
-        const templateContent = `# ${stem}\n\n`;
-
-        await api.noteCreate(targetPath, templateContent);
+        // `template` is a path under .flint/templates/ (M10.26), not literal content — the
+        // backend renders it (or, with no template, applies `newNote.insertHeading`).
+        await api.noteCreate(targetPath, config.templates.defaultTemplate ?? undefined);
         await refreshTree();
         await refreshStats();
         showToast(`Created note "${targetPath}"`);
@@ -818,8 +817,35 @@ export const App: React.FC = () => {
         showToast(`Failed to create note: ${err?.message || String(err)}`);
       }
     },
-    [handleSelectNote, refreshStats, refreshTree, showToast]
+    [config.templates.defaultTemplate, handleSelectNote, refreshStats, refreshTree, showToast]
   );
+
+  // Open (creating on first use) a daily note (M10.26). Only ever invoked from an explicit
+  // command — never on startup — per the milestone's data-safety note.
+  const handleDailyNoteOpen = useCallback(
+    async (offsetDays?: number, date?: string) => {
+      try {
+        const meta = await api.dailyNoteOpen(offsetDays, date);
+        await refreshTree();
+        await handleSelectNote(meta.path);
+      } catch (err: any) {
+        showToast(`Failed to open daily note: ${err?.message || String(err)}`);
+      }
+    },
+    [handleSelectNote, refreshTree, showToast]
+  );
+
+  // "Daily note: Pick a date…" — a lightweight native prompt rather than a bespoke popover,
+  // validated before it ever reaches the IPC call.
+  const handleDailyNotePickDate = useCallback(() => {
+    const input = window.prompt('Open daily note for date (YYYY-MM-DD):');
+    if (!input) return;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(input.trim())) {
+      showToast('Enter a date as YYYY-MM-DD');
+      return;
+    }
+    handleDailyNoteOpen(undefined, input.trim());
+  }, [handleDailyNoteOpen, showToast]);
 
   // Rotate the local MCP server's bearer token without restarting Flint (M10.21)
   const handleRotateMcpToken = useCallback(async () => {
@@ -986,10 +1012,10 @@ export const App: React.FC = () => {
       if (inlineAction.type === 'create-note') {
         const noteFileName = name.endsWith('.md') || name.endsWith('.markdown') ? name : `${name}.md`;
         const relativePath = inlineAction.targetPath ? `${inlineAction.targetPath}/${noteFileName}` : noteFileName;
-        const stem = noteFileName.replace(/\.md$/, '');
-        const template = `# ${stem}\n\n`;
 
-        await api.noteCreate(relativePath, template);
+        // `template` is a path under .flint/templates/ (M10.26); the configured default (if
+        // any) is what the new-note picker would have pre-selected.
+        await api.noteCreate(relativePath, config.templates.defaultTemplate ?? undefined);
         await refreshTree();
         setInlineAction(null);
         await handleSelectNote(relativePath);
@@ -1036,7 +1062,7 @@ export const App: React.FC = () => {
     } catch (err: any) {
       showToast(`Error: ${err?.message || String(err)}`);
     }
-  }, [currentNotePath, handleSelectNote, inlineAction, loadNote, refreshStats, refreshTree, showToast]);
+  }, [config.templates.defaultTemplate, currentNotePath, handleSelectNote, inlineAction, loadNote, refreshStats, refreshTree, showToast]);
 
   const handleDuplicateNote = useCallback(async (itemPath: string) => {
     try {
@@ -1197,13 +1223,33 @@ export const App: React.FC = () => {
       'view.open_settings': () => setSettingsOpen((prev) => !prev),
     };
 
+    if (config.dailyNotes.enabled) {
+      handlers['daily.today'] = () => handleDailyNoteOpen(0);
+      handlers['daily.yesterday'] = () => handleDailyNoteOpen(-1);
+      handlers['daily.tomorrow'] = () => handleDailyNoteOpen(1);
+      handlers['daily.pick_date'] = () => handleDailyNotePickDate();
+    }
+
     for (const meta of APP_COMMANDS) {
       const handler = handlers[meta.id];
       if (handler) {
         commandRegistry.register({ ...meta, handler });
+      } else if (meta.id.startsWith('daily.')) {
+        // Daily notes turned off: don't leave a stale registration a keyboard/palette lookup
+        // could still find.
+        commandRegistry.unregister(meta.id);
       }
     }
-  }, [cycleViewMode, handleCloseNote, handleStartCreateFolder, handleStartCreateNote, saveNote]);
+  }, [
+    config.dailyNotes.enabled,
+    cycleViewMode,
+    handleCloseNote,
+    handleDailyNoteOpen,
+    handleDailyNotePickDate,
+    handleStartCreateFolder,
+    handleStartCreateNote,
+    saveNote,
+  ]);
 
   // Global keydown listeners
   useEffect(() => {

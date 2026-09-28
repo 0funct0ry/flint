@@ -22,4 +22,9 @@ export const APP_COMMANDS: CommandMetadata[] = [
   { id: 'view.toggle_right_sidebar', title: 'Toggle right sidebar', shortcut: '⌘⌥B', shortcutDisplay: '⌘⌥B' },
   { id: 'theme.toggle', title: 'Toggle light / dark theme' },
   { id: 'view.open_settings', title: 'Settings', shortcut: '⌘,', shortcutDisplay: '⌘,' },
+  // Daily notes (M10.26) — only registered while `dailyNotes.enabled` is on; see App.tsx.
+  { id: 'daily.today', title: 'Daily note: Today' },
+  { id: 'daily.yesterday', title: 'Daily note: Yesterday' },
+  { id: 'daily.tomorrow', title: 'Daily note: Tomorrow' },
+  { id: 'daily.pick_date', title: 'Daily note: Pick a date…' },
 ];

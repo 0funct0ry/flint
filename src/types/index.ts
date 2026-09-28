@@ -254,6 +254,32 @@ export interface McpConfig {
   requireAuth: boolean;
 }
 
+/** M10.26: which `.flint/templates/` file the new-note picker pre-selects. */
+export interface TemplatesConfig {
+  defaultTemplate?: string | null;
+}
+
+/** M10.26: rules applied to a new note created without an explicit template. */
+export interface NewNoteConfig {
+  targetFolder?: string | null;
+  filenamePattern: string;
+  insertHeading: boolean;
+}
+
+/** M10.26: the daily-notes journal workflow. `enabled` only gates the command palette entries —
+ * daily notes are never auto-created on launch. */
+export interface DailyNotesConfig {
+  enabled: boolean;
+  pathPattern: string;
+  template?: string | null;
+}
+
+/** One `.flint/templates/*.md` file, as returned by `templates_list` (M10.26). */
+export interface TemplateMeta {
+  name: string;
+  path: string;
+}
+
 export interface LayoutConfig {
   splitOrientation?: 'horizontal' | 'vertical';
   splitRatio?: number;
@@ -274,6 +300,9 @@ export interface FlintConfig {
   behaviour: BehaviourConfig;
   ui: UiConfig;
   mcp: McpConfig;
+  templates: TemplatesConfig;
+  newNote: NewNoteConfig;
+  dailyNotes: DailyNotesConfig;
   ignore: string[];
   layout?: LayoutConfig;
   [key: string]: unknown;

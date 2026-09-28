@@ -5,8 +5,10 @@
 pub mod config;
 pub mod md_extensions;
 pub mod render;
+pub mod template;
 pub use config::{config_get, config_reset, config_set, validate_ignore_patterns};
 pub use render::{render_note_markdown, RenderResult};
+pub use template::{list_templates, render_template, TemplateContext, TemplateMeta, TEMPLATES_DIR};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

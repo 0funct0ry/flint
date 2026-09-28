@@ -1085,6 +1085,7 @@ dependencies = [
 name = "flint-app"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "flint-core",
  "ignore",
  "libc",
@@ -1124,6 +1125,7 @@ name = "flint-core"
 version = "0.1.0"
 dependencies = [
  "ammonia",
+ "chrono",
  "globset",
  "ignore",
  "proptest",

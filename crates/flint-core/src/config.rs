@@ -219,6 +219,88 @@ impl Default for McpConfig {
     }
 }
 
+/// Which template (if any) `note_create` renders when the caller doesn't pass an explicit
+/// `template` argument itself — e.g. the pre-selected option in the new-note template picker
+/// (M10.26).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplatesConfig {
+    /// Path under `.flint/templates/`, workspace-relative, matching a [`crate::TemplateMeta::path`].
+    #[serde(default)]
+    pub default_template: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl Default for TemplatesConfig {
+    fn default() -> Self {
+        Self {
+            default_template: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+}
+
+/// New-note rules (M10.26): where a brand-new note lands and what its filename/body look like
+/// when no explicit template was picked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewNoteConfig {
+    /// Workspace-relative folder new notes land in; `None` means "the currently open folder".
+    #[serde(default)]
+    pub target_folder: Option<String>,
+    /// Filename pattern for a new note created without an explicit name, e.g. `"{{title}}"` —
+    /// supports the same `{{date}}`/`{{date:FORMAT}}`/`{{time}}` placeholders as templates.
+    #[serde(default)]
+    pub filename_pattern: String,
+    /// Insert a `# <title>` heading when the new note's body would otherwise be empty (no
+    /// template picked, no literal content supplied).
+    #[serde(default)]
+    pub insert_heading: bool,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl Default for NewNoteConfig {
+    fn default() -> Self {
+        Self {
+            target_folder: None,
+            filename_pattern: "{{title}}".to_string(),
+            insert_heading: false,
+            extra: serde_json::Map::new(),
+        }
+    }
+}
+
+/// Daily-notes journal workflow (M10.26). `enabled` only gates the command palette entries —
+/// daily notes are never auto-created on launch or anywhere outside an explicit command
+/// invocation, regardless of this flag (SPEC §10.3 data-safety note).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyNotesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// e.g. `"daily/{{date:YYYY-MM-DD}}.md"` — rendered the same way a template body is.
+    #[serde(default)]
+    pub path_pattern: String,
+    /// Path under `.flint/templates/`, workspace-relative.
+    #[serde(default)]
+    pub template: Option<String>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl Default for DailyNotesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path_pattern: "daily/{{date:YYYY-MM-DD}}.md".to_string(),
+            template: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlintConfig {
@@ -236,6 +318,12 @@ pub struct FlintConfig {
     pub ui: UiConfig,
     #[serde(default)]
     pub mcp: McpConfig,
+    #[serde(default)]
+    pub templates: TemplatesConfig,
+    #[serde(default)]
+    pub new_note: NewNoteConfig,
+    #[serde(default)]
+    pub daily_notes: DailyNotesConfig,
     #[serde(default)]
     pub ignore: Vec<String>,
     #[serde(flatten)]
@@ -255,6 +343,9 @@ impl Default for FlintConfig {
             behaviour: BehaviourConfig::default(),
             ui: UiConfig::default(),
             mcp: McpConfig::default(),
+            templates: TemplatesConfig::default(),
+            new_note: NewNoteConfig::default(),
+            daily_notes: DailyNotesConfig::default(),
             ignore: vec!["node_modules/**".to_string(), ".obsidian/**".to_string()],
             extra: serde_json::Map::new(),
         }

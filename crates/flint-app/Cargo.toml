@@ -22,6 +22,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-clipboard-manager = "2"
 tiny_http.workspace = true
 rand.workspace = true
+chrono.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

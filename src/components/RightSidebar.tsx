@@ -161,7 +161,55 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
               rawTarget.startsWith('http://') ||
               rawTarget.startsWith('https://') ||
               rawTarget.startsWith('mailto:');
-            const isUnresolved = !isExternal && !link.resolved;
+            const ambiguousWith = link.ambiguous_with || link.ambiguousWith || [];
+            const isAmbiguous = !isExternal && ambiguousWith.length > 0;
+            const isUnresolved = !isExternal && !isAmbiguous && !link.resolved;
+
+            if (isAmbiguous) {
+              // M10.23: a bare-name wikilink whose target stem matches more than one note.
+              // Not silently resolved — list every candidate (grouped by folder) so the user
+              // picks; picking one doesn't persist a disambiguation, since it's re-evaluated
+              // per occurrence.
+              const grouped = ambiguousWith.reduce<Record<string, string[]>>((acc, p) => {
+                const folder = p.includes('/') ? p.split('/').slice(0, -1).join('/') : '(root)';
+                (acc[folder] ||= []).push(p);
+                return acc;
+              }, {});
+              return (
+                <details key={idx} className="px-3 py-1 text-[12.5px] group">
+                  <summary
+                    className="flex items-center gap-1.5 cursor-pointer list-none text-[var(--spark)] truncate"
+                    title="Ambiguous wikilink — multiple notes share this name"
+                  >
+                    <span className="text-[var(--faint)] text-xs">⚠</span>
+                    <span className="truncate">{rawTarget} — ambiguous</span>
+                  </summary>
+                  <div className="pl-5 pt-1 flex flex-col gap-0.5">
+                    {Object.entries(grouped).map(([folder, paths]) => (
+                      <div key={folder}>
+                        <div className="text-[10.5px] text-[var(--faint)] uppercase tracking-wide">
+                          {folder}
+                        </div>
+                        {paths.map((p) => (
+                          <a
+                            key={p}
+                            href="#"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              onNavigate(p);
+                            }}
+                            className="block text-[var(--text-2)] hover:bg-[var(--panel-2)] transition-colors truncate py-0.5"
+                            title={`Go to ${p}`}
+                          >
+                            {p.split('/').pop()}
+                          </a>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              );
+            }
 
             return (
               <a

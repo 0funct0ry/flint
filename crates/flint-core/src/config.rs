@@ -64,6 +64,17 @@ impl Default for EditorConfig {
     }
 }
 
+/// Which link syntax the editor's link-insertion commands (command palette, `[` autocomplete,
+/// drag-and-drop note linking) produce. Forced to `Markdown` whenever [`MarkdownConfig::wikilinks`]
+/// is off — see [`MarkdownConfig::effective_new_link_syntax`] (M10.23).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NewLinkSyntax {
+    #[default]
+    Markdown,
+    Wikilink,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarkdownConfig {
@@ -75,8 +86,31 @@ pub struct MarkdownConfig {
     pub footnotes: bool,
     #[serde(default)]
     pub smart_punctuation: bool,
+    /// Second, opt-in link syntax: `[[target]]`, `[[target|alias]]`, `[[target#heading]]`,
+    /// `![[target]]` (M10.23). Off by default — `[[...]]` is inert literal text until enabled.
+    #[serde(default)]
+    pub wikilinks: bool,
+    /// Which syntax new links are inserted as. See [`NewLinkSyntax`] and
+    /// [`MarkdownConfig::effective_new_link_syntax`] — this raw field may still say `Wikilink`
+    /// while `wikilinks` is off; callers must go through the effective accessor.
+    #[serde(default)]
+    pub new_link_syntax: NewLinkSyntax,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
+}
+
+impl MarkdownConfig {
+    /// `new_link_syntax`, forced to `Markdown` when `wikilinks` is off (M10.23) — wikilink
+    /// *insertion* cannot be enabled while wikilink *parsing* is off, since that combination would
+    /// insert dead text. Every consumer of "which syntax should a new link use" must call this
+    /// rather than reading `new_link_syntax` directly.
+    pub fn effective_new_link_syntax(&self) -> NewLinkSyntax {
+        if self.wikilinks {
+            self.new_link_syntax
+        } else {
+            NewLinkSyntax::Markdown
+        }
+    }
 }
 
 impl Default for MarkdownConfig {
@@ -86,6 +120,8 @@ impl Default for MarkdownConfig {
             tables: true,
             footnotes: true,
             smart_punctuation: true,
+            wikilinks: false,
+            new_link_syntax: NewLinkSyntax::Markdown,
             extra: serde_json::Map::new(),
         }
     }

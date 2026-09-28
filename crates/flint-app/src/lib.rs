@@ -3,11 +3,11 @@ mod mcp;
 use flint_core::{
     bootstrap_workspace, build_workspace_tree, create_folder, create_note, delete_folder,
     delete_path, duplicate_note, get_last_workspace, get_recent_workspaces, is_default_ignored,
-    is_note_path, read_note, rename_path, render_note_markdown, resolve_workspace_root,
-    resolve_workspace_target, rewrite_workspace_links_for_rename, save_last_workspace,
-    set_front_matter_fields, to_posix_path, write_note_atomic, BacklinkGroup, Fingerprint, Index,
-    Link, NoteContent, NoteMeta, RenderResult, ResolvedWorkspaceTarget, SafePath, TreeNodeItem,
-    WorkspaceInfo, WorkspaceStats,
+    is_note_path, read_note, rename_path, resolve_workspace_root, resolve_workspace_target,
+    rewrite_workspace_links_for_rename, save_last_workspace, set_front_matter_fields,
+    to_posix_path, write_note_atomic, BacklinkGroup, Fingerprint, Index, Link, NoteContent,
+    NoteMeta, RenderResult, ResolvedWorkspaceTarget, SafePath, TreeNodeItem, WorkspaceInfo,
+    WorkspaceStats,
 };
 pub use mcp::{McpHandle, McpStatus};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -116,6 +116,15 @@ fn read_mcp_config(root: &Path) -> flint_core::config::McpConfig {
         .and_then(|r| serde_json::from_value::<flint_core::config::FlintConfig>(r.config).ok())
         .map(|c| c.mcp)
         .unwrap_or_default()
+}
+
+/// Read `markdown.wikilinks` (M10.23), same fallback-to-default pattern as [`read_mcp_config`].
+fn read_wikilinks_enabled(root: &Path) -> bool {
+    flint_core::config_get(root, None)
+        .ok()
+        .and_then(|r| serde_json::from_value::<flint_core::config::FlintConfig>(r.config).ok())
+        .map(|c| c.markdown.wikilinks)
+        .unwrap_or(false)
 }
 
 /// Helper to obtain the active workspace root or fallback to current dir.
@@ -280,7 +289,8 @@ fn spawn_filesystem_watcher(
                 }
 
                 // Rescan and detect changes
-                if let Ok(new_index) = Index::build_from_workspace(&root, |_, _| {}) {
+                if let Ok(mut new_index) = Index::build_from_workspace(&root, |_, _| {}) {
+                    new_index.set_wikilinks_enabled(read_wikilinks_enabled(&root), &root);
                     let stats = new_index.get_stats();
                     if let Ok(mut lock) = index_arc.write() {
                         *lock = new_index;
@@ -532,7 +542,8 @@ fn workspace_open(
                 handle_for_progress.emit("index:progress", IndexProgressPayload { indexed, total });
         });
 
-        if let Ok(new_index) = build_result {
+        if let Ok(mut new_index) = build_result {
+            new_index.set_wikilinks_enabled(read_wikilinks_enabled(&root_clone), &root_clone);
             let stats = new_index.get_stats();
             if let Ok(mut lock) = index_arc.write() {
                 *lock = new_index;
@@ -783,7 +794,14 @@ fn note_rename(
     let mut links_updated = 0;
 
     if do_rewrite && !moved_notes_map.is_empty() {
-        if let Ok(summary) = rewrite_workspace_links_for_rename(&root, &moved_notes_map) {
+        let filename_stems = state
+            .index
+            .read()
+            .map(|lock| lock.filename_stems.clone())
+            .unwrap_or_default();
+        if let Ok(summary) =
+            rewrite_workspace_links_for_rename(&root, &moved_notes_map, &filename_stems)
+        {
             links_updated = summary.links_updated;
             for (rewritten_path, new_content) in summary.rewritten_notes {
                 let hash = flint_core::hash_bytes(new_content.as_bytes());
@@ -926,7 +944,21 @@ fn note_render(
         }
     };
 
-    let result = render_note_markdown(&raw_content, &theme_str, Some(&root), Some(&path));
+    let wikilinks_enabled = read_wikilinks_enabled(&root);
+    let filename_stems = state
+        .index
+        .read()
+        .map(|lock| lock.filename_stems.clone())
+        .unwrap_or_default();
+
+    let result = flint_core::render::render_note_markdown_with_config(
+        &raw_content,
+        &theme_str,
+        Some(&root),
+        Some(&path),
+        wikilinks_enabled,
+        Some(&filename_stems),
+    );
     Ok(result)
 }
 
@@ -1031,7 +1063,18 @@ fn config_get(
 #[tauri::command]
 fn config_set(key: String, value: serde_json::Value, state: State<AppState>) -> Result<(), String> {
     let root = get_workspace_root(&state)?;
-    flint_core::config_set(&root, &key, value).map_err(|e| e.to_string())
+    flint_core::config_set(&root, &key, value).map_err(|e| e.to_string())?;
+
+    // `markdown.wikilinks` (M10.23) gates whether `[[...]]` is parsed as a link at all — keep the
+    // live in-memory index in sync immediately rather than waiting for the next periodic rescan.
+    if key == "markdown.wikilinks" {
+        let enabled = read_wikilinks_enabled(&root);
+        if let Ok(mut lock) = state.index.write() {
+            lock.set_wikilinks_enabled(enabled, &root);
+        }
+    }
+
+    Ok(())
 }
 
 /// Delete a workspace override for `key`, falling back to the global default (SPEC §11, §12,

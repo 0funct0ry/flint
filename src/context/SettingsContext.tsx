@@ -18,6 +18,8 @@ const DEFAULT_CONFIG: FlintConfig = {
     tables: true,
     footnotes: true,
     smartPunctuation: true,
+    wikilinks: false,
+    newLinkSyntax: 'markdown',
   },
   behaviour: {
     autosaveMs: 400,

@@ -436,9 +436,16 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
             if do_rewrite {
                 let mut moved = HashMap::new();
                 moved.insert(from_safe.to_posix_string(), to_safe.to_posix_string());
-                if let Ok(summary) =
-                    flint_core::rewrite_workspace_links_for_rename(ctx.root, &moved)
-                {
+                let filename_stems = ctx
+                    .index
+                    .read()
+                    .map(|lock| lock.filename_stems.clone())
+                    .unwrap_or_default();
+                if let Ok(summary) = flint_core::rewrite_workspace_links_for_rename(
+                    ctx.root,
+                    &moved,
+                    &filename_stems,
+                ) {
                     links_updated = summary.links_updated;
                 }
             }

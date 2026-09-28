@@ -858,9 +858,12 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       const line = context.state.doc.lineAt(context.pos);
       const lineBefore = line.text.slice(0, context.pos - line.from);
 
-      // Trigger on `[` or `](`
+      // Trigger on `[`, `](`, or (when markdown.wikilinks is on) `[[` (M10.23) — checked before
+      // the plain `[` trigger below since `\[([^\]]*)$` would otherwise also match `[[`'s second
+      // bracket as ordinary typed text.
       const openBracketMatch = /\[([^\]]*)$/.exec(lineBefore);
       const openParenMatch = /\]\(([^)]*)$/.exec(lineBefore);
+      const wikilinkMatch = config.markdown.wikilinks ? /\[\[([^\]]*)$/.exec(lineBefore) : null;
 
       const notes = indexedNotesRef.current && indexedNotesRef.current.length > 0
         ? indexedNotesRef.current.map((n) => ({
@@ -882,6 +885,34 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
               detail: n.title || n.name,
               type: 'file',
               apply: rel,
+            };
+          }),
+        };
+      } else if (wikilinkMatch) {
+        const typed = wikilinkMatch[1];
+        const from = context.pos - typed.length;
+        // Never insert a bare name that immediately resolves as `Ambiguous`: when this note's
+        // filename stem collides with another note's, insert the disambiguating relative path
+        // instead (M10.23).
+        const stemCounts = new Map<string, number>();
+        notes.forEach((n) => {
+          const stem = n.name.replace(/\.md$/i, '').toLowerCase();
+          stemCounts.set(stem, (stemCounts.get(stem) ?? 0) + 1);
+        });
+        return {
+          from,
+          options: notes.map((n) => {
+            const stem = n.name.replace(/\.md$/i, '');
+            const title = n.title || stem;
+            const collides = (stemCounts.get(stem.toLowerCase()) ?? 0) > 1;
+            const target = collides
+              ? computeRelativeLinkPath(note.path, n.path).replace(/\.md$/i, '')
+              : stem;
+            return {
+              label: title,
+              detail: n.path,
+              type: 'file',
+              apply: `${target}]]`,
             };
           }),
         };
@@ -1165,6 +1196,24 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
           e.preventDefault();
           const targetPathWithAnchor = href.replace('#/note/', '');
           onNavigateRelative(targetPathWithAnchor);
+        } else if (href.startsWith('#/ambiguous')) {
+          // M10.23: a bare-name wikilink whose target stem matches more than one note — never
+          // silently resolved. Ask which one, rather than picking for the user.
+          e.preventDefault();
+          const candidates = (target.getAttribute('data-candidates') || '')
+            .split(',')
+            .filter(Boolean);
+          if (candidates.length > 0) {
+            const choice = window.prompt(
+              `Ambiguous link — multiple notes share this name. Enter a number:\n${candidates
+                .map((c, i) => `${i + 1}. ${c}`)
+                .join('\n')}`
+            );
+            const idx = choice ? parseInt(choice, 10) - 1 : -1;
+            if (idx >= 0 && idx < candidates.length) {
+              onNavigateRelative(candidates[idx]);
+            }
+          }
         } else if (href.startsWith('#/create-note/')) {
           e.preventDefault();
           const targetPathWithAnchor = href.replace('#/create-note/', '');

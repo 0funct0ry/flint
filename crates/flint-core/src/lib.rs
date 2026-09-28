@@ -83,6 +83,16 @@ pub enum NoteError {
     Io(String),
 }
 
+/// Which link syntax produced a [`Link`] (M10.23). Markdown inline links and wikilinks are
+/// indexed side by side in the same note — this field lets a consumer (backlinks panel, rename
+/// rewriting) tell them apart without inferring it from the raw text's shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LinkSyntax {
+    Markdown,
+    Wikilink,
+}
+
 /// A link from a source note pointing to a target note or external URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Link {
@@ -92,6 +102,19 @@ pub struct Link {
     pub line: u32,
     pub col: u32,
     pub context: String,
+    /// Which syntax this link was written in (M10.23). Defaults to `Markdown` on deserialize so
+    /// older-shaped `Link` data (persisted state, other callers) still parses.
+    #[serde(default = "default_link_syntax")]
+    pub syntax: LinkSyntax,
+    /// Non-empty only for a bare-name wikilink whose target stem matches more than one note in
+    /// the workspace (M10.23) — the candidate note paths, so the UI can surface the ambiguity
+    /// instead of silently picking one. `resolved` stays `None` while this is non-empty.
+    #[serde(default)]
+    pub ambiguous_with: Vec<NotePath>,
+}
+
+fn default_link_syntax() -> LinkSyntax {
+    LinkSyntax::Markdown
 }
 
 /// A group of backlinks originating from a single source note.
@@ -116,6 +139,17 @@ pub struct Index {
     pub notes: HashMap<NotePath, NoteMeta>,
     pub links_out: HashMap<NotePath, Vec<Link>>,
     pub links_in: HashMap<NotePath, Vec<Link>>,
+    /// Every note's filename stem (lower-cased key, original-case `NotePath` values), for
+    /// wikilink bare-name lookup (M10.23). Kept up to date alongside `notes` on every build,
+    /// insert/update, and removal — cheap to maintain even when wikilinks are off.
+    #[serde(default)]
+    pub filename_stems: HashMap<String, Vec<NotePath>>,
+    /// Whether `markdown.wikilinks` is on for this workspace (M10.23). Set once via
+    /// [`Index::set_wikilinks_enabled`] after a workspace's config is read; while `false`,
+    /// `[[...]]` spans are not parsed as links at all (fully inert), matching the render
+    /// pipeline's own opt-in gating.
+    #[serde(default)]
+    pub wikilinks_enabled: bool,
 }
 
 /// Workspace statistics.
@@ -1292,6 +1326,10 @@ pub enum ResolvedTarget {
         raw_path: String,
         anchor: Option<String>,
     },
+    /// A bare-name wikilink target (M10.23) whose filename stem matches more than one note.
+    /// Not silently resolved to any one of them — the UI surfaces the candidates so the user
+    /// picks. Re-evaluated at every render/index, never remembered as a per-link choice.
+    Ambiguous(Vec<NotePath>),
 }
 
 /// Simple URL percent-decoding helper.
@@ -1502,6 +1540,8 @@ pub fn extract_links(workspace_root: &Path, source_note_rel: &str, content: &str
                 ResolvedTarget::Internal { path, .. } => Some(path),
                 ResolvedTarget::External(_) => None,
                 ResolvedTarget::Unresolved { .. } => None,
+                // resolve_link_target (Markdown-only path resolution) never produces this.
+                ResolvedTarget::Ambiguous(_) => None,
             };
 
             links.push(Link {
@@ -1511,10 +1551,174 @@ pub fn extract_links(workspace_root: &Path, source_note_rel: &str, content: &str
                 line,
                 col,
                 context: context_line,
+                syntax: LinkSyntax::Markdown,
+                ambiguous_with: Vec::new(),
             });
         }
     }
 
+    links
+}
+
+/// Resolve a wikilink `target` (bare-name or path-shaped) against the workspace, per SPEC/M10.23:
+/// - A `target` containing `/` is path-shaped: resolved exactly like a Markdown link target
+///   (delegates to [`resolve_link_target`]), skipping name lookup entirely.
+/// - A bare `target` is looked up case-insensitively by filename stem in `filename_stems`: zero
+///   matches is `Unresolved`, one match is `Internal`, two or more is `Ambiguous` — never silently
+///   resolved to the "shortest" or first match.
+/// - `heading`, when present, is resolved against the matched note's rendered heading-anchor
+///   slugs (the same slugification `extract_headings`/`note_render` already produce). An
+///   unmatched heading still resolves the note; it just drops the anchor.
+pub fn resolve_wikilink_target(
+    workspace_root: &Path,
+    source_note_rel: &str,
+    filename_stems: &HashMap<String, Vec<NotePath>>,
+    target: &str,
+    heading: Option<&str>,
+) -> ResolvedTarget {
+    let trimmed = target.trim();
+
+    if trimmed.contains('/') {
+        return resolve_link_target(
+            workspace_root,
+            source_note_rel,
+            &match heading {
+                Some(h) if !h.is_empty() => format!("{trimmed}#{h}"),
+                _ => trimmed.to_string(),
+            },
+        );
+    }
+
+    let key = trimmed.to_lowercase();
+    let matches = filename_stems.get(&key).cloned().unwrap_or_default();
+
+    let resolved_note = match matches.len() {
+        0 => {
+            return ResolvedTarget::Unresolved {
+                raw_path: trimmed.to_string(),
+                anchor: heading.map(|h| h.to_string()),
+            };
+        }
+        1 => matches[0].clone(),
+        _ => return ResolvedTarget::Ambiguous(matches),
+    };
+
+    let anchor = match heading {
+        Some(h) if !h.is_empty() => {
+            let wanted_slug = slugify(h);
+            let target_abs = workspace_root.join(&resolved_note);
+            let matched = fs::read_to_string(&target_abs)
+                .ok()
+                .map(|content| extract_headings(&content))
+                .and_then(|headings| {
+                    headings
+                        .into_iter()
+                        .find(|hd| hd.anchor == wanted_slug)
+                        .map(|hd| hd.anchor)
+                });
+            matched.or(Some(wanted_slug))
+        }
+        _ => None,
+    };
+    // An unmatched heading still resolves the note; keep the requested (unmatched) slug as the
+    // anchor so a stale/typo'd `#heading` doesn't silently drop to the note's top — matching how
+    // a Markdown link's own `#heading` behaves in `resolve_link_target` today.
+
+    ResolvedTarget::Internal {
+        path: resolved_note,
+        anchor,
+    }
+}
+
+/// Extract wikilink spans from `content` (only when `wikilinks_enabled`) and resolve each via
+/// [`resolve_wikilink_target`], returning one [`Link`] per span. Scans the **original** `content`
+/// directly (not a `pulldown-cmark`-rewritten form), so `line`/`col`/`context` point at the
+/// `[[...]]` text the user actually wrote.
+pub fn extract_wikilinks(
+    workspace_root: &Path,
+    source_note_rel: &str,
+    content: &str,
+    filename_stems: &HashMap<String, Vec<NotePath>>,
+) -> Vec<Link> {
+    let spans = md_extensions::scan_wikilink_spans(content);
+    if spans.is_empty() {
+        return Vec::new();
+    }
+
+    let line_offsets: Vec<usize> = std::iter::once(0)
+        .chain(content.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let offset_to_line_col = |byte_idx: usize| -> (u32, u32) {
+        let line_idx = match line_offsets.binary_search(&byte_idx) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+        let line_start = line_offsets[line_idx];
+        let col = byte_idx.saturating_sub(line_start) + 1;
+        ((line_idx + 1) as u32, col as u32)
+    };
+    let content_lines: Vec<&str> = content.lines().collect();
+
+    spans
+        .into_iter()
+        .map(|span| {
+            let (line, col) = offset_to_line_col(span.start);
+            let context_line = if (line as usize) <= content_lines.len() {
+                content_lines[(line - 1) as usize].trim().to_string()
+            } else {
+                String::new()
+            };
+
+            let resolution = resolve_wikilink_target(
+                workspace_root,
+                source_note_rel,
+                filename_stems,
+                &span.target,
+                span.heading.as_deref(),
+            );
+            let (resolved, ambiguous_with) = match resolution {
+                ResolvedTarget::Internal { path, .. } => (Some(path), Vec::new()),
+                ResolvedTarget::Ambiguous(candidates) => (None, candidates),
+                ResolvedTarget::Unresolved { .. } | ResolvedTarget::External(_) => {
+                    (None, Vec::new())
+                }
+            };
+
+            Link {
+                source: source_note_rel.to_string(),
+                raw_target: span.target.clone(),
+                resolved,
+                line,
+                col,
+                context: context_line,
+                syntax: LinkSyntax::Wikilink,
+                ambiguous_with,
+            }
+        })
+        .collect()
+}
+
+/// Extract every link in a note — Markdown inline links plus, when `wikilinks_enabled`,
+/// wikilinks — merged into one list in document order (M10.23). This is the function `Index`
+/// building/incremental-update calls; `extract_links` alone stays Markdown-only for callers that
+/// don't need wikilink awareness.
+pub fn extract_links_all(
+    workspace_root: &Path,
+    source_note_rel: &str,
+    content: &str,
+    wikilinks_enabled: bool,
+    filename_stems: &HashMap<String, Vec<NotePath>>,
+) -> Vec<Link> {
+    let mut links = extract_links(workspace_root, source_note_rel, content);
+    if wikilinks_enabled {
+        links.extend(extract_wikilinks(
+            workspace_root,
+            source_note_rel,
+            content,
+            filename_stems,
+        ));
+    }
+    links.sort_by_key(|l| (l.line, l.col));
     links
 }
 
@@ -1546,6 +1750,12 @@ pub struct RewriteSummary {
     pub notes_updated: usize,
     #[serde(default)]
     pub rewritten_notes: Vec<(String, String)>,
+    /// Count of bare-name wikilinks whose target resolved `Ambiguous` and were therefore *not*
+    /// rewritten (M10.23) — there is no single note to know the rename applies to. Reported in
+    /// the rename summary toast alongside `links_updated`/`notes_updated` so this isn't a silent
+    /// gap.
+    #[serde(default)]
+    pub wikilinks_skipped_ambiguous: usize,
 }
 
 /// Compute shortest POSIX relative path from the directory of `from_note_rel` to `to_target_rel`.
@@ -1960,10 +2170,120 @@ pub fn rewrite_markdown_links(
     (updated, count)
 }
 
+/// Byte length, within a wikilink span's inner text (`target#heading|alias`), of just the
+/// `target` portion — up to the first *unescaped* `#` or `|`, matching the same escaping rule
+/// [`crate::md_extensions::scan_wikilink_spans`] uses. Used by rename rewriting to replace only
+/// the target text and leave `#heading`/`|alias` untouched.
+fn wikilink_target_byte_len(inner: &str) -> usize {
+    let bytes = inner.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            b'\\' if i + 1 < len => i += 2,
+            b'#' | b'|' => return i,
+            _ => i += 1,
+        }
+    }
+    len
+}
+
+/// Rewrite wikilink `target`s pointing at moved notes (M10.23), preserving `|alias`, `#heading`,
+/// and the `[[`/`![[` form exactly. A bare-name wikilink whose resolution is `Ambiguous` is left
+/// untouched and counted in the returned skip count — there is no single note to know the rename
+/// applies to. Returns `(new_content, rewritten_count, skipped_ambiguous_count)`.
+pub fn rewrite_wikilinks_for_rename(
+    workspace_root: &Path,
+    source_note_rel: &str,
+    content: &str,
+    moved_notes_map: &HashMap<String, String>,
+    filename_stems: &HashMap<String, Vec<NotePath>>,
+) -> (String, usize, usize) {
+    if moved_notes_map.is_empty() {
+        return (content.to_string(), 0, 0);
+    }
+    let spans = md_extensions::scan_wikilink_spans(content);
+    if spans.is_empty() {
+        return (content.to_string(), 0, 0);
+    }
+
+    let mut replacements = Vec::new();
+    let mut skipped_ambiguous = 0;
+
+    for span in &spans {
+        let resolution = resolve_wikilink_target(
+            workspace_root,
+            source_note_rel,
+            filename_stems,
+            &span.target,
+            span.heading.as_deref(),
+        );
+
+        match resolution {
+            ResolvedTarget::Ambiguous(_) => {
+                skipped_ambiguous += 1;
+            }
+            ResolvedTarget::Internal { path, .. } => {
+                if let Some(new_target_path) = moved_notes_map.get(&path) {
+                    if new_target_path == &path && !moved_notes_map.contains_key(source_note_rel) {
+                        continue;
+                    }
+                    let current_source = moved_notes_map
+                        .get(source_note_rel)
+                        .map(|s| s.as_str())
+                        .unwrap_or(source_note_rel);
+
+                    let is_path_shaped = span.target.contains('/');
+                    let new_target_text = if is_path_shaped {
+                        relativize_path(current_source, new_target_path)
+                    } else {
+                        Path::new(new_target_path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| new_target_path.clone())
+                    };
+
+                    if new_target_text != span.target {
+                        let content_start = span.start + if span.is_embed { 3 } else { 2 };
+                        let inner_end = span.end - 2;
+                        if content_start <= inner_end && inner_end <= content.len() {
+                            let inner = &content[content_start..inner_end];
+                            let target_len = wikilink_target_byte_len(inner);
+                            replacements.push((
+                                content_start,
+                                content_start + target_len,
+                                new_target_text,
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if replacements.is_empty() {
+        return (content.to_string(), 0, skipped_ambiguous);
+    }
+
+    replacements.sort_by_key(|r| std::cmp::Reverse(r.0));
+    let mut updated = content.to_string();
+    let count = replacements.len();
+    for (start, end, replacement) in replacements {
+        if start <= end && end <= updated.len() {
+            updated.replace_range(start..end, &replacement);
+        }
+    }
+    (updated, count, skipped_ambiguous)
+}
+
 /// Rewrite all relative links resolving to moved notes across the entire workspace (SPEC §5.4).
+/// `filename_stems` (an `Index`'s stem map) is used for wikilink bare-name rewriting; pass an
+/// empty map to skip wikilink rewriting entirely (equivalent to `markdown.wikilinks` off).
 pub fn rewrite_workspace_links_for_rename(
     root: &Path,
     moved_notes_map: &HashMap<String, String>,
+    filename_stems: &HashMap<String, Vec<NotePath>>,
 ) -> Result<RewriteSummary, NoteError> {
     if moved_notes_map.is_empty() || !root.exists() {
         return Ok(RewriteSummary::default());
@@ -1971,6 +2291,7 @@ pub fn rewrite_workspace_links_for_rename(
 
     let mut total_links = 0;
     let mut total_notes = 0;
+    let mut total_wikilinks_skipped = 0;
     let mut rewritten_notes = Vec::new();
 
     let walker = ignore::WalkBuilder::new(root)
@@ -2005,8 +2326,17 @@ pub fn rewrite_workspace_links_for_rename(
         let posix_rel = to_posix_path(rel);
         if let Ok(safe_path) = SafePath::resolve(root, &posix_rel) {
             if let Ok(content) = fs::read_to_string(safe_path.as_path()) {
-                let (new_content, rewritten_count) =
+                let (after_markdown, markdown_count) =
                     rewrite_markdown_links(root, &posix_rel, &content, moved_notes_map);
+                let (new_content, wikilink_count, skipped_ambiguous) = rewrite_wikilinks_for_rename(
+                    root,
+                    &posix_rel,
+                    &after_markdown,
+                    moved_notes_map,
+                    filename_stems,
+                );
+                let rewritten_count = markdown_count + wikilink_count;
+                total_wikilinks_skipped += skipped_ambiguous;
 
                 if rewritten_count > 0 && new_content != content {
                     write_note_atomic(root, &safe_path, &new_content, None)?;
@@ -2022,7 +2352,16 @@ pub fn rewrite_workspace_links_for_rename(
         links_updated: total_links,
         notes_updated: total_notes,
         rewritten_notes,
+        wikilinks_skipped_ambiguous: total_wikilinks_skipped,
     })
+}
+
+/// The lookup key `filename_stems` uses for a note path: its filename stem, lower-cased (M10.23).
+fn stem_key(note_path: &str) -> String {
+    Path::new(note_path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
 }
 
 impl Index {
@@ -2031,7 +2370,32 @@ impl Index {
             notes: HashMap::new(),
             links_out: HashMap::new(),
             links_in: HashMap::new(),
+            filename_stems: HashMap::new(),
+            wikilinks_enabled: false,
         }
+    }
+
+    /// Turn `markdown.wikilinks` on/off for this in-memory index (M10.23), re-extracting every
+    /// note's links (so previously-inert `[[...]]` spans start/stop being indexed) when the
+    /// value actually changes. Call once after reading a workspace's config, right after
+    /// [`Index::build_from_workspace`] — incremental updates ([`Index::insert_or_update_note`])
+    /// pick up the current setting from `self.wikilinks_enabled` automatically afterward.
+    pub fn set_wikilinks_enabled(&mut self, enabled: bool, root: &Path) {
+        if self.wikilinks_enabled == enabled {
+            return;
+        }
+        self.wikilinks_enabled = enabled;
+
+        let paths: Vec<NotePath> = self.notes.keys().cloned().collect();
+        for rel_posix in paths {
+            let abs_path = root.join(&rel_posix);
+            if let Ok(content) = fs::read_to_string(&abs_path) {
+                let links =
+                    extract_links_all(root, &rel_posix, &content, enabled, &self.filename_stems);
+                self.links_out.insert(rel_posix, links);
+            }
+        }
+        self.rebuild_links_in();
     }
 
     /// Build a full workspace index walking notes per SPEC §6.2.
@@ -2089,6 +2453,10 @@ impl Index {
         let total = note_files.len();
         on_progress(0, total);
 
+        // First pass: notes + `filename_stems` (wikilink bare-name resolution below needs the
+        // full stem map built before any note's links are extracted, so a link to a note later
+        // in iteration order still resolves).
+        let mut contents: HashMap<NotePath, String> = HashMap::new();
         for (i, safe_path) in note_files.iter().enumerate() {
             let rel_posix = safe_path.to_posix_string();
             let abs_path = safe_path.as_path();
@@ -2116,12 +2484,27 @@ impl Index {
                             tags,
                         },
                     );
-
-                    let links = extract_links(root, &rel_posix, &content);
-                    index.links_out.insert(rel_posix, links);
+                    index
+                        .filename_stems
+                        .entry(stem_key(&rel_posix))
+                        .or_default()
+                        .push(rel_posix.clone());
+                    contents.insert(rel_posix, content);
                 }
             }
             on_progress(i + 1, total);
+        }
+
+        // Second pass: extract links now that `filename_stems` is complete.
+        for (rel_posix, content) in &contents {
+            let links = extract_links_all(
+                root,
+                rel_posix,
+                content,
+                index.wikilinks_enabled,
+                &index.filename_stems,
+            );
+            index.links_out.insert(rel_posix.clone(), links);
         }
 
         // Recompute links_in (backlinks graph)
@@ -2182,12 +2565,24 @@ impl Index {
             },
         );
 
+        let stem = stem_key(&rel_posix);
+        let stem_entry = self.filename_stems.entry(stem).or_default();
+        if !stem_entry.contains(&rel_posix) {
+            stem_entry.push(rel_posix.clone());
+        }
+
         // Remove old incoming links for this source note
         for in_links in self.links_in.values_mut() {
             in_links.retain(|l| l.source != rel_posix);
         }
 
-        let links = extract_links(root, &rel_posix, content);
+        let links = extract_links_all(
+            root,
+            &rel_posix,
+            content,
+            self.wikilinks_enabled,
+            &self.filename_stems,
+        );
 
         // Add newly resolved links to links_in
         for link in &links {
@@ -2201,24 +2596,47 @@ impl Index {
 
         self.links_out.insert(rel_posix.clone(), links);
 
-        // Also re-resolve any links across the workspace that were previously unresolved
+        // Also re-resolve any links across the workspace that were previously unresolved (or, for
+        // wikilinks, previously ambiguous — a filename-stem collision can be introduced or
+        // resolved by this note's own creation/edit).
         for (source_path, out_links) in self.links_out.iter_mut() {
             if source_path == &rel_posix {
                 continue;
             }
             for link in out_links.iter_mut() {
-                if link.resolved.is_none() {
-                    let is_external = link.raw_target.starts_with("http://")
-                        || link.raw_target.starts_with("https://")
-                        || link.raw_target.starts_with("mailto:")
-                        || link.raw_target.starts_with("ftp://");
-                    if !is_external {
-                        let res = resolve_link_target(root, source_path, &link.raw_target);
-                        if let ResolvedTarget::Internal { path, .. } = res {
-                            link.resolved = Some(path.clone());
-                            self.links_in.entry(path).or_default().push(link.clone());
-                        }
+                if link.resolved.is_some() && link.ambiguous_with.is_empty() {
+                    continue;
+                }
+                let is_external = link.raw_target.starts_with("http://")
+                    || link.raw_target.starts_with("https://")
+                    || link.raw_target.starts_with("mailto:")
+                    || link.raw_target.starts_with("ftp://");
+                if is_external {
+                    continue;
+                }
+                let res = match link.syntax {
+                    LinkSyntax::Markdown => {
+                        resolve_link_target(root, source_path, &link.raw_target)
                     }
+                    LinkSyntax::Wikilink => resolve_wikilink_target(
+                        root,
+                        source_path,
+                        &self.filename_stems,
+                        &link.raw_target,
+                        None,
+                    ),
+                };
+                match res {
+                    ResolvedTarget::Internal { path, .. } => {
+                        link.resolved = Some(path.clone());
+                        link.ambiguous_with.clear();
+                        self.links_in.entry(path).or_default().push(link.clone());
+                    }
+                    ResolvedTarget::Ambiguous(candidates) => {
+                        link.resolved = None;
+                        link.ambiguous_with = candidates;
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2228,6 +2646,14 @@ impl Index {
     pub fn remove_note(&mut self, _root: Option<&Path>, rel_path: &str) {
         self.notes.remove(rel_path);
         self.links_out.remove(rel_path);
+
+        let stem = stem_key(rel_path);
+        if let Some(entry) = self.filename_stems.get_mut(&stem) {
+            entry.retain(|p| p != rel_path);
+            if entry.is_empty() {
+                self.filename_stems.remove(&stem);
+            }
+        }
 
         // Remove from links_in where this note was target
         self.links_in.remove(rel_path);
@@ -3467,6 +3893,322 @@ Also see [Broken link](./missing-note) and external [Google](https://google.com)
         assert_eq!(links[3].resolved, None);
     }
 
+    // -----------------------------------------------------------------------------------------
+    // Wikilinks (M10.23)
+    // -----------------------------------------------------------------------------------------
+
+    fn stems_from(index: &Index) -> HashMap<String, Vec<NotePath>> {
+        index.filename_stems.clone()
+    }
+
+    #[test]
+    fn wikilink_disabled_is_fully_inert() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("target.md"), "# Target").unwrap();
+        let content = "See [[target]] here.";
+        // extract_links_all with wikilinks_enabled=false should find zero links (no Markdown
+        // link syntax present either).
+        let links = extract_links_all(root, "source.md", content, false, &HashMap::new());
+        assert!(links.is_empty());
+        // The render preprocessing pass must also leave `[[...]]` untouched.
+        assert_eq!(md_extensions::rewrite_wikilinks(content, false), content);
+    }
+
+    #[test]
+    fn wikilink_resolves_unique_bare_name() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes/target.md"), "# Target").unwrap();
+
+        let mut index = Index::new();
+        index.insert_or_update_note(
+            root,
+            &SafePath::resolve(root, "notes/target.md").unwrap(),
+            "# Target",
+        );
+        let stems = stems_from(&index);
+
+        let res = resolve_wikilink_target(root, "source.md", &stems, "target", None);
+        assert_eq!(
+            res,
+            ResolvedTarget::Internal {
+                path: "notes/target.md".into(),
+                anchor: None,
+            }
+        );
+    }
+
+    #[test]
+    fn wikilink_bare_name_case_insensitive() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut index = Index::new();
+        index.insert_or_update_note(
+            root,
+            &SafePath::resolve(root, "notes/Target.md").unwrap(),
+            "# Target",
+        );
+        let stems = stems_from(&index);
+
+        let res = resolve_wikilink_target(root, "source.md", &stems, "TARGET", None);
+        assert_eq!(
+            res,
+            ResolvedTarget::Internal {
+                path: "notes/Target.md".into(),
+                anchor: None,
+            }
+        );
+    }
+
+    #[test]
+    fn wikilink_colliding_bare_name_is_ambiguous() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut index = Index::new();
+        index.insert_or_update_note(
+            root,
+            &SafePath::resolve(root, "a/target.md").unwrap(),
+            "# A",
+        );
+        index.insert_or_update_note(
+            root,
+            &SafePath::resolve(root, "b/target.md").unwrap(),
+            "# B",
+        );
+        let stems = stems_from(&index);
+
+        let res = resolve_wikilink_target(root, "source.md", &stems, "target", None);
+        match res {
+            ResolvedTarget::Ambiguous(mut candidates) => {
+                candidates.sort();
+                assert_eq!(candidates, vec!["a/target.md", "b/target.md"]);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wikilink_unresolved_bare_name() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let res = resolve_wikilink_target(root, "source.md", &HashMap::new(), "nope", None);
+        assert_eq!(
+            res,
+            ResolvedTarget::Unresolved {
+                raw_path: "nope".into(),
+                anchor: None,
+            }
+        );
+    }
+
+    #[test]
+    fn wikilink_path_shaped_target_uses_path_resolution() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("notes")).unwrap();
+        fs::write(root.join("notes/target.md"), "# Target").unwrap();
+
+        let res = resolve_wikilink_target(root, "source.md", &HashMap::new(), "notes/target", None);
+        assert_eq!(
+            res,
+            ResolvedTarget::Internal {
+                path: "notes/target.md".into(),
+                anchor: None,
+            }
+        );
+    }
+
+    #[test]
+    fn wikilink_heading_valid_and_invalid_anchor() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("target.md"),
+            "# Target\n\n## Some Heading\n\nBody.",
+        )
+        .unwrap();
+        let mut stems = HashMap::new();
+        stems.insert("target".to_string(), vec!["target.md".to_string()]);
+
+        let valid =
+            resolve_wikilink_target(root, "source.md", &stems, "target", Some("Some Heading"));
+        assert_eq!(
+            valid,
+            ResolvedTarget::Internal {
+                path: "target.md".into(),
+                anchor: Some("some-heading".into()),
+            }
+        );
+
+        // An unmatched heading still resolves the note; it just drops to the requested slug
+        // rather than making the whole link unresolved.
+        let invalid = resolve_wikilink_target(root, "source.md", &stems, "target", Some("Nope"));
+        assert_eq!(
+            invalid,
+            ResolvedTarget::Internal {
+                path: "target.md".into(),
+                anchor: Some("nope".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn extract_wikilinks_all_five_forms_and_markdown_merge_in_document_order() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut index = Index::new();
+        index.insert_or_update_note(
+            root,
+            &SafePath::resolve(root, "target.md").unwrap(),
+            "# Target\n\n## Heading One",
+        );
+        let stems = stems_from(&index);
+
+        let content = concat!(
+            "[md link](target.md) then\n",
+            "[[target]] then\n",
+            "[[target|Alias]] then\n",
+            "[[target#Heading One]] then\n",
+            "[[target#Heading One|Alias2]] then\n",
+            "![[target]]\n",
+        );
+        let links = extract_links_all(root, "source.md", content, true, &stems);
+        assert_eq!(links.len(), 6);
+        assert_eq!(links[0].syntax, LinkSyntax::Markdown);
+        for link in &links[1..] {
+            assert_eq!(link.syntax, LinkSyntax::Wikilink);
+            assert_eq!(link.resolved.as_deref(), Some("target.md"));
+        }
+        // Document order preserved (sorted by line/col).
+        for pair in links.windows(2) {
+            assert!((pair[0].line, pair[0].col) <= (pair[1].line, pair[1].col));
+        }
+    }
+
+    #[test]
+    fn extract_wikilinks_ambiguous_link_reports_candidates() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut index = Index::new();
+        index.insert_or_update_note(root, &SafePath::resolve(root, "a/dup.md").unwrap(), "# A");
+        index.insert_or_update_note(root, &SafePath::resolve(root, "b/dup.md").unwrap(), "# B");
+        let stems = stems_from(&index);
+
+        let links = extract_links_all(root, "source.md", "[[dup]]", true, &stems);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].resolved, None);
+        let mut candidates = links[0].ambiguous_with.clone();
+        candidates.sort();
+        assert_eq!(candidates, vec!["a/dup.md", "b/dup.md"]);
+    }
+
+    #[test]
+    fn render_wikilinks_alias_and_broken() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut index = Index::new();
+        index.insert_or_update_note(
+            root,
+            &SafePath::resolve(root, "target.md").unwrap(),
+            "# Target",
+        );
+        let stems = stems_from(&index);
+
+        let html = crate::render::render_note_markdown_with_config(
+            "[[target|Friendly Name]] and [[missing]]",
+            "dark",
+            Some(root),
+            Some("source.md"),
+            true,
+            Some(&stems),
+        )
+        .html;
+        assert!(html.contains("Friendly Name"));
+        assert!(html.contains("flint-internal-link"));
+        assert!(html.contains("flint-broken-link"));
+    }
+
+    #[test]
+    fn render_wikilinks_off_is_inert_literal_text() {
+        let html =
+            crate::render::render_note_markdown("literal [[target]] text", "dark", None, None).html;
+        assert!(html.contains("[[target]]"));
+        assert!(!html.contains("flint-internal-link"));
+    }
+
+    #[test]
+    fn rewrite_wikilinks_for_rename_preserves_alias_and_heading() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("old")).unwrap();
+        fs::write(root.join("old/target.md"), "# Target").unwrap();
+
+        let mut stems = HashMap::new();
+        stems.insert("target".to_string(), vec!["old/target.md".to_string()]);
+
+        let mut moved = HashMap::new();
+        moved.insert("old/target.md".to_string(), "new/renamed.md".to_string());
+
+        let content = "[[target#Section|Alias]] and ![[target]]";
+        let (rewritten, count, skipped) =
+            rewrite_wikilinks_for_rename(root, "source.md", content, &moved, &stems);
+        assert_eq!(count, 2);
+        assert_eq!(skipped, 0);
+        assert_eq!(rewritten, "[[renamed#Section|Alias]] and ![[renamed]]");
+    }
+
+    #[test]
+    fn rewrite_wikilinks_for_rename_skips_ambiguous_and_counts_it() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let mut stems = HashMap::new();
+        stems.insert(
+            "dup".to_string(),
+            vec!["a/dup.md".to_string(), "b/dup.md".to_string()],
+        );
+        let mut moved = HashMap::new();
+        moved.insert("a/dup.md".to_string(), "a/renamed.md".to_string());
+
+        let content = "[[dup]]";
+        let (rewritten, count, skipped) =
+            rewrite_wikilinks_for_rename(root, "source.md", content, &moved, &stems);
+        assert_eq!(count, 0);
+        assert_eq!(skipped, 1);
+        assert_eq!(rewritten, content);
+    }
+
+    #[test]
+    fn index_set_wikilinks_enabled_rescans_existing_notes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("target.md"), "# Target").unwrap();
+        fs::write(root.join("source.md"), "See [[target]]").unwrap();
+
+        let mut index = Index::build_from_workspace(root, |_, _| {}).unwrap();
+        // Off by default: the wikilink is not indexed yet.
+        assert!(index
+            .links_out
+            .get("source.md")
+            .map(|l| l.is_empty())
+            .unwrap_or(true));
+
+        index.set_wikilinks_enabled(true, root);
+        let links = index
+            .links_out
+            .get("source.md")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].syntax, LinkSyntax::Wikilink);
+        assert_eq!(links[0].resolved.as_deref(), Some("target.md"));
+        assert!(index
+            .get_backlinks("target.md")
+            .iter()
+            .any(|g| g.source_path == "source.md"));
+    }
+
     #[test]
     fn test_benchmark_10k_notes() {
         use std::time::Instant;
@@ -3678,7 +4420,8 @@ Also [Unrelated link](https://example.com) and [Other Note](../other.md).
             "core/settlement-engine.md".to_string(),
         );
 
-        let summary = rewrite_workspace_links_for_rename(root, &moved_map).unwrap();
+        let summary =
+            rewrite_workspace_links_for_rename(root, &moved_map, &HashMap::new()).unwrap();
         assert_eq!(summary.links_updated, 3);
         assert_eq!(summary.notes_updated, 3);
 

@@ -23,8 +23,11 @@ use syntect::highlighting::ThemeSet;
 use syntect::html::{styled_line_to_highlighted_html, IncludeBackground};
 use syntect::parsing::SyntaxSet;
 
-use crate::md_extensions::{parse_callout, strip_comments, CALLOUT_TYPES};
-use crate::{dedup_slug, extract_headings, parse_front_matter, slugify, HeadingItem};
+use crate::md_extensions::{
+    decode_wikilink_dest, parse_callout, rewrite_wikilinks, strip_comments, CALLOUT_TYPES,
+};
+use crate::{dedup_slug, extract_headings, parse_front_matter, slugify, HeadingItem, NotePath};
+use std::collections::HashMap;
 
 /// Result returned from markdown rendering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -376,16 +379,42 @@ fn resolve_image_src(
     (src.to_string(), false)
 }
 
-/// Render Markdown note content to sanitized HTML and extract outline.
+/// Render Markdown note content to sanitized HTML and extract outline. Wikilinks are off
+/// (see [`render_note_markdown_with_config`] to enable them) — this wrapper exists so the many
+/// call sites that don't care about M10.23 don't need to thread a filename-stem index through.
 pub fn render_note_markdown(
     raw_content: &str,
     theme: &str,
     workspace_root: Option<&Path>,
     note_relative_path: Option<&str>,
 ) -> RenderResult {
+    render_note_markdown_with_config(
+        raw_content,
+        theme,
+        workspace_root,
+        note_relative_path,
+        false,
+        None,
+    )
+}
+
+/// Same as [`render_note_markdown`], with `markdown.wikilinks` support (M10.23): when
+/// `wikilinks_enabled`, `[[...]]`/`![[...]]` spans are rewritten to real links before parsing,
+/// and resolved via bare-name lookup against `filename_stems` (the workspace `Index`'s stem map)
+/// rather than the path-only [`crate::resolve_link_target`].
+pub fn render_note_markdown_with_config(
+    raw_content: &str,
+    theme: &str,
+    workspace_root: Option<&Path>,
+    note_relative_path: Option<&str>,
+    wikilinks_enabled: bool,
+    filename_stems: Option<&HashMap<String, Vec<NotePath>>>,
+) -> RenderResult {
     let (_fm_raw, body, _, _) = parse_front_matter(raw_content);
     let headings = extract_headings(raw_content);
     let is_dark = theme.eq_ignore_ascii_case("dark");
+    let empty_stems: HashMap<String, Vec<NotePath>> = HashMap::new();
+    let filename_stems = filename_stems.unwrap_or(&empty_stems);
 
     let note_folder_abs = if let (Some(root), Some(rel)) = (workspace_root, note_relative_path) {
         let parent = Path::new(rel).parent().unwrap_or_else(|| Path::new(""));
@@ -395,7 +424,8 @@ pub fn render_note_markdown(
     };
 
     let body_without_comments = strip_comments(body);
-    let (protected_body, math_spans) = protect_math(&body_without_comments);
+    let body_with_wikilinks = rewrite_wikilinks(&body_without_comments, wikilinks_enabled);
+    let (protected_body, math_spans) = protect_math(&body_with_wikilinks);
 
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
@@ -561,8 +591,27 @@ pub fn render_note_markdown(
                 };
 
                 if let (Some(root), Some(source_rel)) = (workspace_root, note_relative_path) {
-                    let resolution = crate::resolve_link_target(root, source_rel, &raw_dest);
+                    let resolution = match decode_wikilink_dest(&raw_dest) {
+                        Some((target, heading)) => crate::resolve_wikilink_target(
+                            root,
+                            source_rel,
+                            filename_stems,
+                            &target,
+                            heading.as_deref(),
+                        ),
+                        None => crate::resolve_link_target(root, source_rel, &raw_dest),
+                    };
                     match resolution {
+                        crate::ResolvedTarget::Ambiguous(candidates) => {
+                            let candidates_attr = candidates.join(",");
+                            let link_html = format!(
+                                "<a href=\"#/ambiguous\" class=\"flint-ambiguous-link\" data-candidates=\"{}\"{}>",
+                                html_escape::encode_double_quoted_attribute(&candidates_attr),
+                                title_attr
+                            );
+                            custom_events
+                                .push(Event::Html(CowStr::Boxed(link_html.into_boxed_str())));
+                        }
                         crate::ResolvedTarget::Internal { path, anchor } => {
                             let anchor_part = anchor.map(|a| format!("#{}", a)).unwrap_or_default();
                             let href = format!("#/note/{}{}", path, anchor_part);

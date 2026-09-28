@@ -14,6 +14,14 @@ export interface LinkItem {
   line: number;
   col: number;
   context: string;
+  /** Which link syntax produced this link (M10.23). Absent/older data means Markdown. */
+  syntax?: "markdown" | "wikilink";
+  /**
+   * Non-empty only for a bare-name wikilink whose target stem matches more than one note
+   * (M10.23) — candidate note paths, surfaced in the UI instead of silently picking one.
+   */
+  ambiguous_with?: string[];
+  ambiguousWith?: string[];
 }
 
 export interface BacklinkOccurrence {
@@ -206,6 +214,13 @@ export interface MarkdownConfig {
   tables: boolean;
   footnotes: boolean;
   smartPunctuation: boolean;
+  /** Second, opt-in link syntax: `[[target]]` etc. (M10.23). Off by default. */
+  wikilinks: boolean;
+  /**
+   * Which syntax new links are inserted as. Forced to `"markdown"` whenever `wikilinks` is
+   * off — wikilink insertion cannot be enabled while wikilink parsing is off.
+   */
+  newLinkSyntax: "markdown" | "wikilink";
 }
 
 export interface BehaviourConfig {

@@ -9,7 +9,7 @@ const baseConfig: FlintConfig = {
   version: 1,
   theme: 'system',
   editor: { fontSize: 14, fontFamily: 'IBM Plex Mono', softWrap: true, tabSize: 2, showLineNumbers: false, vimMode: false },
-  markdown: { math: true, tables: true, footnotes: true, smartPunctuation: true },
+  markdown: { math: true, tables: true, footnotes: true, smartPunctuation: true, wikilinks: false, newLinkSyntax: 'markdown' },
   behaviour: { autosaveMs: 400, rewriteLinksOnRename: true, deleteToTrash: true, newNoteFolder: '', defaultMode: 'edit' },
   ui: { leftSidebar: 'tree', rightSidebarVisible: true, showNonNoteFiles: false },
   mcp: { enabled: false, port: null, requireAuth: false },
@@ -190,5 +190,34 @@ describe('SettingsPanel', () => {
 
     fireEvent.click(screen.getByLabelText('Require bearer token for MCP server'));
     expect(setField).toHaveBeenCalledWith('mcp.requireAuth', true);
+  });
+
+  it('toggles markdown.wikilinks through setField', () => {
+    const { setField } = mockUseSettings();
+    render(<SettingsPanel onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByLabelText('Wikilinks'));
+    expect(setField).toHaveBeenCalledWith('markdown.wikilinks', true);
+  });
+
+  it('forces markdown.newLinkSyntax back to markdown when wikilinks is turned off', () => {
+    const { setField } = mockUseSettings({
+      config: {
+        ...baseConfig,
+        markdown: { ...baseConfig.markdown, wikilinks: true, newLinkSyntax: 'wikilink' },
+      },
+    });
+    render(<SettingsPanel onClose={vi.fn()} />);
+
+    fireEvent.click(screen.getByLabelText('Wikilinks'));
+    expect(setField).toHaveBeenCalledWith('markdown.wikilinks', false);
+    expect(setField).toHaveBeenCalledWith('markdown.newLinkSyntax', 'markdown');
+  });
+
+  it('disables the new link syntax selector while wikilinks is off', () => {
+    mockUseSettings();
+    render(<SettingsPanel onClose={vi.fn()} />);
+
+    expect(screen.getByLabelText('New link syntax')).toBeDisabled();
   });
 });

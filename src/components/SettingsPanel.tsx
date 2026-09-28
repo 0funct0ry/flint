@@ -289,6 +289,40 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
             aria-label="Smart punctuation"
           />
         </FieldRow>
+        <FieldRow label="Wikilinks" path="markdown.wikilinks" origins={origins} onReset={resetField}>
+          <input
+            type="checkbox"
+            className={checkboxClass}
+            checked={config.markdown.wikilinks}
+            onChange={(e) => {
+              const enabled = e.target.checked;
+              setField('markdown.wikilinks', enabled);
+              // Wikilink insertion cannot be enabled while wikilink parsing is off — that
+              // combination would insert dead text (M10.23).
+              if (!enabled && config.markdown.newLinkSyntax !== 'markdown') {
+                setField('markdown.newLinkSyntax', 'markdown');
+              }
+            }}
+            aria-label="Wikilinks"
+          />
+        </FieldRow>
+        <FieldRow
+          label="New link syntax"
+          path="markdown.newLinkSyntax"
+          origins={origins}
+          onReset={resetField}
+        >
+          <select
+            className={selectClass}
+            value={config.markdown.newLinkSyntax}
+            disabled={!config.markdown.wikilinks}
+            onChange={(e) => setField('markdown.newLinkSyntax', e.target.value)}
+            aria-label="New link syntax"
+          >
+            <option value="markdown">markdown</option>
+            <option value="wikilink">wikilink</option>
+          </select>
+        </FieldRow>
 
         <SectionHeader title="Behaviour" />
         <FieldRow label="Autosave (ms)" path="behaviour.autosaveMs" origins={origins} onReset={resetField}>

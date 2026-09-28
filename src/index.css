@@ -172,6 +172,18 @@ button {
 .reader-content a.flint-external-link {
   color: var(--accent);
 }
+.reader-content a.flint-ambiguous-link {
+  color: var(--spark);
+  border-bottom: 1.5px dotted var(--spark);
+  cursor: pointer;
+}
+.reader-content a.flint-ambiguous-link:hover {
+  border-bottom-style: solid;
+}
+.reader-content a.flint-ambiguous-link::after {
+  content: ' \26A0';
+  font-size: 0.85em;
+}
 .reader-content ul {
   list-style-type: disc;
   margin: 0 0 13px 0;

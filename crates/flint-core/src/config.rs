@@ -134,6 +134,10 @@ pub struct BehaviourConfig {
     pub autosave_ms: u32,
     #[serde(default)]
     pub rewrite_links_on_rename: bool,
+    /// Whether renaming a tag also rewrites inline `#tag` occurrences across the workspace, on
+    /// top of the front-matter `tags:` entries a tag rename always rewrites (SPEC/M10.25).
+    #[serde(default)]
+    pub rewrite_tags_on_rename: bool,
     #[serde(default)]
     pub delete_to_trash: bool,
     #[serde(default)]
@@ -149,6 +153,7 @@ impl Default for BehaviourConfig {
         Self {
             autosave_ms: 400,
             rewrite_links_on_rename: true,
+            rewrite_tags_on_rename: true,
             delete_to_trash: true,
             new_note_folder: String::new(),
             default_mode: "edit".to_string(),

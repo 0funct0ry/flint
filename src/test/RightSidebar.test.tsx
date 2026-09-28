@@ -169,4 +169,48 @@ describe('RightSidebar', () => {
 
     expect(onFrontmatterSave).toHaveBeenCalledWith([['title', 'New Title']]);
   });
+
+  it('shows real per-tag workspace counts and filters by tag on click (M10.25)', () => {
+    const onNavigate = vi.fn();
+    const onFilterByTag = vi.fn();
+
+    render(
+      <RightSidebar
+        note={sampleNote}
+        onNavigate={onNavigate}
+        onFilterByTag={onFilterByTag}
+        tagCounts={[
+          { tag: 'payments', count: 4 },
+          { tag: 'finance', count: 1 },
+        ]}
+      />
+    );
+
+    expect(screen.getByText('4')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('payments'));
+    expect(onFilterByTag).toHaveBeenCalledWith('payments');
+  });
+
+  it('renames a tag via the context menu (M10.25)', () => {
+    const onNavigate = vi.fn();
+    const onTagRename = vi.fn();
+
+    render(
+      <RightSidebar
+        note={sampleNote}
+        onNavigate={onNavigate}
+        onTagRename={onTagRename}
+        tagCounts={[{ tag: 'payments', count: 2 }]}
+      />
+    );
+
+    fireEvent.contextMenu(screen.getByText('payments'));
+    fireEvent.click(screen.getByText('Rename tag…'));
+
+    const input = screen.getByDisplayValue('payments');
+    fireEvent.change(input, { target: { value: 'billing' } });
+    fireEvent.keyDown(input, { key: 'Enter' });
+
+    expect(onTagRename).toHaveBeenCalledWith('payments', 'billing');
+  });
 });

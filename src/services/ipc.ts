@@ -12,6 +12,7 @@ import {
   NoteContent,
   NoteMeta,
   RenameResult,
+  TagRenameResult,
   RenderResult,
   TreeNodeItem,
   WorkspaceInfo,
@@ -332,6 +333,17 @@ export const api = {
     return {
       moved: true,
       links_updated: 0,
+    };
+  },
+
+  async tagRename(oldTag: string, newTag: string): Promise<TagRenameResult> {
+    if (isTauriEnvironment()) {
+      return await invoke<TagRenameResult>("tag_rename", { old: oldTag, new: newTag });
+    }
+
+    return {
+      renamed: true,
+      notes_updated: 0,
     };
   },
 

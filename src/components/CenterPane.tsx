@@ -935,6 +935,10 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       const openBracketMatch = /\[([^\]]*)$/.exec(lineBefore);
       const openParenMatch = /\]\(([^)]*)$/.exec(lineBefore);
       const wikilinkMatch = config.markdown.wikilinks ? /\[\[([^\]]*)$/.exec(lineBefore) : null;
+      // Trigger tag autocomplete on `#` at line-start or after whitespace (M10.25) — the leading
+      // `(?:^|\s)` is load-bearing, not stylistic: it's what keeps this from firing while typing
+      // an ATX heading (`# Heading`) or mid-word.
+      const openHashMatch = /(?:^|\s)#([\w-]*)$/.exec(lineBefore);
 
       const notes = indexedNotesRef.current && indexedNotesRef.current.length > 0
         ? indexedNotesRef.current.map((n) => ({
@@ -1003,6 +1007,54 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
             };
           }),
         };
+      } else if (openHashMatch) {
+        const typed = openHashMatch[1];
+        const from = context.pos - typed.length;
+        const tagCounts = new Map<string, number>();
+        (indexedNotesRef.current || []).forEach((n) => {
+          (n.tags || []).forEach((tag) => {
+            const key = tag.toLowerCase();
+            const existing = tagCounts.get(key);
+            if (existing) {
+              tagCounts.set(key, existing + 1);
+            } else {
+              tagCounts.set(key, 1);
+            }
+          });
+        });
+        // Preserve first-seen casing per tag (mirrors the workspace index's canonical-casing rule).
+        const canonicalCasing = new Map<string, string>();
+        (indexedNotesRef.current || []).forEach((n) => {
+          (n.tags || []).forEach((tag) => {
+            const key = tag.toLowerCase();
+            if (!canonicalCasing.has(key)) {
+              canonicalCasing.set(key, tag);
+            }
+          });
+        });
+        const rankedTags = Array.from(tagCounts.entries())
+          .map(([key, count]) => ({ tag: canonicalCasing.get(key) || key, count }))
+          .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
+
+        const options = rankedTags.map((t) => ({
+          label: t.tag,
+          detail: `${t.count} note${t.count === 1 ? '' : 's'}`,
+          type: 'keyword',
+          apply: t.tag,
+        }));
+        // Offer a free-text "create new tag" option when the typed text doesn't already match.
+        if (
+          typed.length > 0 &&
+          !rankedTags.some((t) => t.tag.toLowerCase() === typed.toLowerCase())
+        ) {
+          options.push({
+            label: typed,
+            detail: 'New tag',
+            type: 'keyword',
+            apply: typed,
+          });
+        }
+        return { from, options };
       }
       return null;
     };

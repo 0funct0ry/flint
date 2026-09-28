@@ -4,10 +4,10 @@ use flint_core::{
     bootstrap_workspace, build_workspace_tree, create_folder, create_note, delete_folder,
     delete_path, duplicate_note, get_last_workspace, get_recent_workspaces, is_default_ignored,
     is_note_path, read_note, rename_path, resolve_workspace_root, resolve_workspace_target,
-    rewrite_workspace_links_for_rename, save_last_workspace, set_front_matter_fields,
-    to_posix_path, write_note_atomic, BacklinkGroup, Fingerprint, Index, Link, NoteContent,
-    NoteMeta, RenderResult, ResolvedWorkspaceTarget, SafePath, TreeNodeItem, WorkspaceInfo,
-    WorkspaceStats,
+    rewrite_tags_workspace, rewrite_workspace_links_for_rename, save_last_workspace,
+    set_front_matter_fields, to_posix_path, write_note_atomic, BacklinkGroup, Fingerprint, Index,
+    Link, NoteContent, NoteMeta, RenderResult, ResolvedWorkspaceTarget, SafePath, TreeNodeItem,
+    WorkspaceInfo, WorkspaceStats,
 };
 pub use mcp::{McpHandle, McpStatus};
 use notify::{Config, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -127,6 +127,17 @@ fn read_wikilinks_enabled(root: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Read `behaviour.rewriteTagsOnRename` (M10.25), same fallback-to-default pattern as
+/// [`read_wikilinks_enabled`] — defaults to `true` when config can't be loaded, matching
+/// `BehaviourConfig::default()`.
+fn read_rewrite_tags_on_rename(root: &Path) -> bool {
+    flint_core::config_get(root, None)
+        .ok()
+        .and_then(|r| serde_json::from_value::<flint_core::config::FlintConfig>(r.config).ok())
+        .map(|c| c.behaviour.rewrite_tags_on_rename)
+        .unwrap_or(true)
+}
+
 /// Helper to obtain the active workspace root or fallback to current dir.
 fn get_workspace_root(state: &State<AppState>) -> Result<PathBuf, String> {
     let lock = state
@@ -154,6 +165,13 @@ pub struct IndexProgressPayload {
 pub struct RenameResult {
     pub moved: bool,
     pub links_updated: usize,
+}
+
+/// Result returned from tag_rename (M10.25).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagRenameResult {
+    pub renamed: bool,
+    pub notes_updated: usize,
 }
 
 /// Event payload emitted when a note is changed, created, or removed.
@@ -830,6 +848,44 @@ fn note_rename(
     })
 }
 
+/// Rename a tag across the whole workspace: every front-matter `tags:` entry carrying it is
+/// always rewritten, and every inline `#tag` occurrence is too unless `behaviour.rewriteTagsOnRename`
+/// is off (SPEC/M10.25).
+#[tauri::command]
+fn tag_rename(old: String, new: String, state: State<AppState>) -> Result<TagRenameResult, String> {
+    let root = get_workspace_root(&state)?;
+    let rewrite_inline = read_rewrite_tags_on_rename(&root);
+
+    let tag_index = state
+        .index
+        .read()
+        .map(|lock| lock.tags.clone())
+        .unwrap_or_default();
+
+    let summary = rewrite_tags_workspace(&root, &old, &new, &tag_index, rewrite_inline)
+        .map_err(|e| e.to_string())?;
+
+    for (rewritten_path, new_content) in &summary.rewritten_notes {
+        let hash = flint_core::hash_bytes(new_content.as_bytes());
+        record_suppressed_write(&state.suppressed_writes, rewritten_path, Some(hash));
+    }
+
+    if let Ok(mut lock) = state.index.write() {
+        for (rewritten_path, _) in &summary.rewritten_notes {
+            if let Ok(safe) = SafePath::resolve(&root, rewritten_path) {
+                if let Ok(content) = std::fs::read_to_string(safe.as_path()) {
+                    lock.insert_or_update_note(&root, &safe, &content);
+                }
+            }
+        }
+    }
+
+    Ok(TagRenameResult {
+        renamed: true,
+        notes_updated: summary.notes_updated,
+    })
+}
+
 /// Duplicate a note (SPEC §11, M4).
 #[tauri::command]
 fn note_duplicate(path: String, state: State<AppState>) -> Result<NoteMeta, String> {
@@ -1206,6 +1262,7 @@ pub fn build_app_with_mcp_flags(
             frontmatter_set,
             note_create,
             note_rename,
+            tag_rename,
             note_duplicate,
             note_delete,
             folder_create,

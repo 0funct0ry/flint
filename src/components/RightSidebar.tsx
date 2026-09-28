@@ -1,6 +1,7 @@
-import React, { useRef, useState } from 'react';
-import { FrontMatterField, NoteFixture } from '../types';
+import React, { useRef, useState, useEffect } from 'react';
+import { FrontMatterField, NoteFixture, TagCount } from '../types';
 import { FrontmatterPanel } from './FrontmatterPanel';
+import { ContextMenu, ContextMenuItem } from './ContextMenu';
 
 export interface RightSidebarProps {
   note: NoteFixture;
@@ -9,6 +10,10 @@ export interface RightSidebarProps {
   onOpenExternal?: (url: string) => void;
   onClose?: () => void;
   onFrontmatterSave?: (fields: FrontMatterField[]) => void;
+  /** Every workspace tag with its total note count, sorted count desc then alpha (M10.25). */
+  tagCounts?: TagCount[];
+  onFilterByTag?: (tag: string) => void;
+  onTagRename?: (oldTag: string, newTag: string) => void;
 }
 
 type RightTab = 'links' | 'frontmatter';
@@ -24,9 +29,52 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
   onOpenExternal,
   onClose,
   onFrontmatterSave,
+  tagCounts = [],
+  onFilterByTag,
+  onTagRename,
 }) => {
   const [activeTab, setActiveTab] = useState<RightTab>('links');
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+
+  // Tag rename affordance (M10.25) — mirrors the left-sidebar Tags tab's inline rename.
+  const [tagContextMenu, setTagContextMenu] = useState<{ x: number; y: number; tag: string } | null>(null);
+  const [renamingTag, setRenamingTag] = useState<string | null>(null);
+  const [renameTagValue, setRenameTagValue] = useState('');
+  const renameTagInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (renamingTag !== null) {
+      renameTagInputRef.current?.focus();
+      renameTagInputRef.current?.select();
+    }
+  }, [renamingTag]);
+
+  const tagCountFor = (tag: string): number =>
+    tagCounts.find((t) => t.tag.toLowerCase() === tag.toLowerCase())?.count ?? 1;
+
+  const startTagRename = (tag: string) => {
+    setRenamingTag(tag);
+    setRenameTagValue(tag);
+    setTagContextMenu(null);
+  };
+
+  const commitTagRename = () => {
+    if (renamingTag !== null) {
+      const trimmed = renameTagValue.trim().replace(/^#/, '');
+      if (trimmed && trimmed !== renamingTag) {
+        onTagRename?.(renamingTag, trimmed);
+      }
+    }
+    setRenamingTag(null);
+  };
+
+  const buildTagMenuItems = (tag: string): ContextMenuItem[] => [
+    {
+      id: 'rename-tag',
+      label: 'Rename tag…',
+      onClick: () => startTagRename(tag),
+    },
+  ];
 
   const totalBacklinks = note.backlinks.reduce(
     (acc, b) => acc + b.occurrences.length,
@@ -266,20 +314,64 @@ export const RightSidebar: React.FC<RightSidebarProps> = ({
             No tags.
           </div>
         ) : (
-          note.tags.map((tag) => (
-            <div
-              key={tag}
-              className="flex items-center gap-1.5 px-3 py-1 text-[12.5px] text-[var(--text-2)] hover:bg-[var(--panel-2)] cursor-pointer"
-            >
-              <span className="text-[var(--faint)] text-xs">#</span>
-              <span>{tag}</span>
-              <i className="ml-auto not-italic text-[var(--faint)] text-[11px] font-mono">
-                1
-              </i>
-            </div>
-          ))
+          note.tags.map((tag) =>
+            renamingTag === tag ? (
+              <div
+                key={tag}
+                className="flex items-center gap-1.5 h-[26px] mx-1.5 my-0.5 px-2 bg-[var(--panel-2)] rounded-[4px] border border-[var(--accent)]"
+              >
+                <span className="text-[var(--faint)] text-xs">#</span>
+                <input
+                  ref={renameTagInputRef}
+                  type="text"
+                  value={renameTagValue}
+                  onChange={(e) => setRenameTagValue(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') commitTagRename();
+                    else if (e.key === 'Escape') setRenamingTag(null);
+                  }}
+                  onBlur={commitTagRename}
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  className="w-full bg-transparent text-[12.5px] text-[var(--text)] focus:outline-none"
+                />
+              </div>
+            ) : (
+              <div
+                key={tag}
+                role="button"
+                tabIndex={0}
+                onClick={() => onFilterByTag?.(tag)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') onFilterByTag?.(tag);
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setTagContextMenu({ x: e.clientX, y: e.clientY, tag });
+                }}
+                className="flex items-center gap-1.5 px-3 py-1 text-[12.5px] text-[var(--text-2)] hover:bg-[var(--panel-2)] cursor-pointer focus:outline-none focus:ring-1 focus:ring-inset focus:ring-[var(--accent)]"
+              >
+                <span className="text-[var(--faint)] text-xs">#</span>
+                <span>{tag}</span>
+                <i className="ml-auto not-italic text-[var(--faint)] text-[11px] font-mono">
+                  {tagCountFor(tag)}
+                </i>
+              </div>
+            )
+          )
         )}
       </div>
+      )}
+
+      {tagContextMenu && (
+        <ContextMenu
+          x={tagContextMenu.x}
+          y={tagContextMenu.y}
+          items={buildTagMenuItems(tagContextMenu.tag)}
+          onClose={() => setTagContextMenu(null)}
+        />
       )}
     </aside>
   );

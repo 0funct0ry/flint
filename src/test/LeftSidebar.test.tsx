@@ -243,4 +243,113 @@ describe("LeftSidebar", () => {
     expect(screen.getByPlaceholderText("Search in workspace...")).toBeInTheDocument();
     expect(screen.getByText("Type a query to search across all notes.")).toBeInTheDocument();
   });
+
+  describe("Tags tab (M10.25)", () => {
+    const tagCounts = [
+      { tag: "payments", count: 2 },
+      { tag: "alpha", count: 1 },
+    ];
+    const indexedNotes = [
+      {
+        path: "projects/payments/settlement.md",
+        title: "Settlement",
+        size_bytes: 0,
+        modified_ms: 0,
+        headings: [],
+        tags: ["payments"],
+      },
+      {
+        path: "daily.md",
+        title: "Daily Log",
+        size_bytes: 0,
+        modified_ms: 0,
+        headings: [],
+        tags: ["alpha", "payments"],
+      },
+    ];
+
+    it("lists workspace tags with counts, filterable by name", () => {
+      render(<LeftSidebar {...defaultProps} activeTab="tags" tagCounts={tagCounts} />);
+
+      expect(screen.getByText("payments")).toBeInTheDocument();
+      expect(screen.getByText("2")).toBeInTheDocument();
+      expect(screen.getByText("alpha")).toBeInTheDocument();
+
+      fireEvent.change(screen.getByPlaceholderText("Filter tags..."), {
+        target: { value: "pay" },
+      });
+      expect(screen.getByText("payments")).toBeInTheDocument();
+      expect(screen.queryByText("alpha")).not.toBeInTheDocument();
+    });
+
+    it("clicking a tag row filters and switches to the tree tab", () => {
+      const onFilterByTag = vi.fn();
+      render(
+        <LeftSidebar
+          {...defaultProps}
+          activeTab="tags"
+          tagCounts={tagCounts}
+          onFilterByTag={onFilterByTag}
+        />
+      );
+
+      fireEvent.click(screen.getByText("payments"));
+      expect(onFilterByTag).toHaveBeenCalledWith("payments");
+    });
+
+    it("Enter on a keyboard-focused tag row also filters", () => {
+      const onFilterByTag = vi.fn();
+      render(
+        <LeftSidebar
+          {...defaultProps}
+          activeTab="tags"
+          tagCounts={tagCounts}
+          onFilterByTag={onFilterByTag}
+        />
+      );
+
+      fireEvent.keyDown(screen.getByText("alpha"), { key: "Enter" });
+      expect(onFilterByTag).toHaveBeenCalledWith("alpha");
+    });
+
+    it("renames a tag via the row's context menu", () => {
+      const onTagRename = vi.fn();
+      render(
+        <LeftSidebar
+          {...defaultProps}
+          activeTab="tags"
+          tagCounts={tagCounts}
+          onTagRename={onTagRename}
+        />
+      );
+
+      fireEvent.contextMenu(screen.getByText("payments"));
+      fireEvent.click(screen.getByText("Rename tag…"));
+      const input = screen.getByDisplayValue("payments");
+      fireEvent.change(input, { target: { value: "billing" } });
+      fireEvent.keyDown(input, { key: "Enter" });
+
+      expect(onTagRename).toHaveBeenCalledWith("payments", "billing");
+    });
+
+    it("filters the tree to notes carrying the active tag, with a dismissible chip", () => {
+      const onClearTagFilter = vi.fn();
+      render(
+        <LeftSidebar
+          {...defaultProps}
+          activeTab="tree"
+          indexedNotes={indexedNotes}
+          activeTagFilter="alpha"
+          onClearTagFilter={onClearTagFilter}
+        />
+      );
+
+      expect(screen.getByText("daily.md")).toBeInTheDocument();
+      expect(screen.queryByText("settlement.md")).not.toBeInTheDocument();
+      expect(screen.getByText("#alpha")).toBeInTheDocument();
+
+      fireEvent.click(screen.getByLabelText("Clear filter for tag alpha"));
+      expect(onClearTagFilter).toHaveBeenCalled();
+    });
+  });
 });

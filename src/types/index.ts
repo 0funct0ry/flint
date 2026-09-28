@@ -114,6 +114,17 @@ export interface RenameResult {
   links_updated: number;
 }
 
+export interface TagRenameResult {
+  renamed: boolean;
+  notes_updated: number;
+}
+
+/** A workspace tag with its total note count, sorted count desc then alpha (M10.25). */
+export interface TagCount {
+  tag: string;
+  count: number;
+}
+
 export interface RenderResult {
   html: string;
   headings: HeadingItem[];

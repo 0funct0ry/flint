@@ -150,6 +150,13 @@ pub struct Index {
     /// pipeline's own opt-in gating.
     #[serde(default)]
     pub wikilinks_enabled: bool,
+    /// Reverse map of tag text (front-matter `tags:` ∪ inline `#tag`) to every note carrying it
+    /// (M10.25). Keyed by the canonical casing of each case-insensitively distinct tag — the
+    /// casing of whichever note introduced that tag first in workspace-walk order — looked up via
+    /// [`Index::tag_canonical_key`] rather than by re-lowercasing the whole key, so display casing
+    /// stays stable across rebuilds.
+    #[serde(default)]
+    pub tags: HashMap<String, Vec<NotePath>>,
 }
 
 /// Workspace statistics.
@@ -1560,6 +1567,136 @@ pub fn extract_links(workspace_root: &Path, source_note_rel: &str, content: &str
     links
 }
 
+/// The pattern a candidate inline tag's characters must match, not counting the leading `#`.
+const INLINE_TAG_PATTERN: &str = r"#[A-Za-z0-9_-]+";
+
+/// Scan a note body's Markdown event stream for inline `#tag` tokens, returning each match's
+/// absolute byte range within `body` and its tag text (without the leading `#`). Shared by
+/// [`extract_inline_tags`] and [`rewrite_inline_tags`] (M10.25).
+///
+/// Only `Event::Text` runs outside a fenced/indented code block are scanned, so inline code spans
+/// (`Event::Code`, a distinct event pulldown-cmark never turns into `Text`) and code blocks are
+/// structurally excluded rather than regexed around. ATX heading markers (`# Heading`) need no
+/// separate exclusion either: pulldown-cmark consumes the leading `#`s as the heading marker
+/// before emitting `Event::Text`, so they're never candidate text — a tag appearing later on a
+/// heading line (`## Sub #tag`) is still recognized normally. A `#` immediately preceded by a word
+/// character (e.g. `C#`, `foo#bar`) is never a tag start; the preceding character is checked
+/// against the original `body` (not just the current text run), so a tag split across inline
+/// markup boundaries still excludes correctly.
+fn scan_inline_tag_matches(body: &str) -> Vec<(usize, usize, String)> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
+    static TAG_REGEX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = TAG_REGEX.get_or_init(|| {
+        regex::Regex::new(INLINE_TAG_PATTERN).expect("static tag pattern is valid")
+    });
+
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
+    options.insert(Options::ENABLE_FOOTNOTES);
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TASKLISTS);
+
+    let parser = Parser::new_ext(body, options).into_offset_iter();
+    let mut in_code_block = false;
+    let mut matches = Vec::new();
+
+    for (event, range) in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
+            Event::End(TagEnd::CodeBlock) => in_code_block = false,
+            Event::Text(text) if !in_code_block => {
+                let text_str = text.as_ref();
+                for m in re.find_iter(text_str) {
+                    let abs_start = range.start + m.start();
+                    let abs_end = range.start + m.end();
+                    let preceded_by_word = body[..abs_start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    if preceded_by_word {
+                        continue;
+                    }
+                    matches.push((abs_start, abs_end, m.as_str()[1..].to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    matches
+}
+
+/// Extract inline `#tag` tokens from a note's post-front-matter body, with 1-based line/col
+/// positions (SPEC/M10.25). See [`scan_inline_tag_matches`] for the exclusion rules.
+pub fn extract_inline_tags(body: &str) -> Vec<(String, u32, u32)> {
+    let line_offsets: Vec<usize> = std::iter::once(0)
+        .chain(body.match_indices('\n').map(|(i, _)| i + 1))
+        .collect();
+    let offset_to_line_col = |byte_idx: usize| -> (u32, u32) {
+        let line_idx = match line_offsets.binary_search(&byte_idx) {
+            Ok(idx) => idx,
+            Err(idx) => idx.saturating_sub(1),
+        };
+        let line_start = line_offsets[line_idx];
+        let col = byte_idx.saturating_sub(line_start) + 1;
+        ((line_idx + 1) as u32, col as u32)
+    };
+
+    scan_inline_tag_matches(body)
+        .into_iter()
+        .map(|(start, _end, tag)| {
+            let (line, col) = offset_to_line_col(start);
+            (tag, line, col)
+        })
+        .collect()
+}
+
+/// Rewrite every inline `#old_tag` occurrence in a note body to `#new_tag` (case-insensitive
+/// match on the tag text), using the same exclusion rules as [`extract_inline_tags`] so a rename
+/// can never corrupt a `C#`/code-span occurrence or an ATX heading marker (M10.25). Returns
+/// `(new_body, rewritten_count)`.
+pub fn rewrite_inline_tags(body: &str, old_tag: &str, new_tag: &str) -> (String, usize) {
+    let mut replacements: Vec<(usize, usize, String)> = scan_inline_tag_matches(body)
+        .into_iter()
+        .filter(|(_, _, tag)| tag.eq_ignore_ascii_case(old_tag))
+        .map(|(start, end, _)| (start, end, format!("#{}", new_tag)))
+        .collect();
+
+    if replacements.is_empty() {
+        return (body.to_string(), 0);
+    }
+
+    replacements.sort_by_key(|r| std::cmp::Reverse(r.0));
+    let mut updated = body.to_string();
+    let count = replacements.len();
+    for (start, end, replacement) in replacements {
+        if start <= end && end <= updated.len() {
+            updated.replace_range(start..end, &replacement);
+        }
+    }
+    (updated, count)
+}
+
+/// Union of a note's front-matter `tags:` entries and its body's inline `#tag` tokens, de-duped
+/// case-insensitively with the first occurrence's casing kept (front-matter entries are scanned
+/// before inline ones, so a front-matter `tags: [Rust]` wins over a later inline `#rust`) (M10.25).
+fn merged_note_tags(front_matter_tags: Vec<String>, body: &str) -> Vec<String> {
+    let mut merged = Vec::new();
+    let mut seen_lower: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for t in front_matter_tags {
+        if seen_lower.insert(t.to_lowercase()) {
+            merged.push(t);
+        }
+    }
+    for (t, _, _) in extract_inline_tags(body) {
+        if seen_lower.insert(t.to_lowercase()) {
+            merged.push(t);
+        }
+    }
+    merged
+}
+
 /// Resolve a wikilink `target` (bare-name or path-shaped) against the workspace, per SPEC/M10.23:
 /// - A `target` containing `/` is path-shaped: resolved exactly like a Markdown link target
 ///   (delegates to [`resolve_link_target`]), skipping name lookup entirely.
@@ -2356,6 +2493,125 @@ pub fn rewrite_workspace_links_for_rename(
     })
 }
 
+/// Re-serialize a front-matter `tags:` field's raw value, matching whatever container shape the
+/// original raw value used (inline `[a, b]` list, `- item` block list, or a single bare scalar)
+/// so an unrelated stylistic change isn't introduced alongside the rename (M10.25).
+fn serialize_tags_field(original_raw: &str, tags: &[String]) -> String {
+    if tags.is_empty() {
+        return String::new();
+    }
+    let trimmed = original_raw.trim_start();
+    if trimmed.starts_with('[') {
+        format!("[{}]", tags.join(", "))
+    } else if trimmed.starts_with("- ") {
+        tags.iter()
+            .map(|t| format!("- {}", t))
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else if tags.len() == 1 {
+        tags[0].clone()
+    } else {
+        format!("[{}]", tags.join(", "))
+    }
+}
+
+/// Summary of a workspace-wide tag rename (M10.25).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TagRenameSummary {
+    pub notes_updated: usize,
+    /// `(note_path, new_content)` for every note actually rewritten, so a caller can suppress the
+    /// watcher for these writes and update the in-memory index without a re-read (mirrors
+    /// `RewriteSummary::rewritten_notes`).
+    #[serde(default)]
+    pub rewritten_notes: Vec<(String, String)>,
+}
+
+/// Rename `old_tag` to `new_tag` across every note that carries it (case-insensitive match),
+/// rewriting both representations per note: the front-matter `tags:` entry (always, since that's
+/// the core meaning of "rename this tag") and, when `rewrite_inline` is true, every inline
+/// `#old_tag` occurrence in the body too (M10.25). `tag_index` is an [`Index`]'s `tags` map, used
+/// to find the affected notes directly rather than re-walking the whole workspace. A note counts
+/// once in the returned summary even when both representations changed.
+pub fn rewrite_tags_workspace(
+    root: &Path,
+    old_tag: &str,
+    new_tag: &str,
+    tag_index: &HashMap<String, Vec<NotePath>>,
+    rewrite_inline: bool,
+) -> Result<TagRenameSummary, NoteError> {
+    let lower = old_tag.to_lowercase();
+    let note_paths: Vec<NotePath> = tag_index
+        .iter()
+        .find(|(k, _)| k.to_lowercase() == lower)
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
+
+    let mut notes_updated = 0;
+    let mut rewritten_notes = Vec::new();
+
+    for note_path in &note_paths {
+        let safe_path = match SafePath::resolve(root, note_path) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let content = match fs::read_to_string(safe_path.as_path()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let (_, _, fm_tags, fields) = parse_front_matter(&content);
+        let mut new_content = content.clone();
+        let mut changed = false;
+
+        if let Some(idx) = fields.iter().position(|(k, _)| k == "tags") {
+            if fm_tags.iter().any(|t| t.eq_ignore_ascii_case(old_tag)) {
+                let new_fm_tags: Vec<String> = fm_tags
+                    .iter()
+                    .map(|t| {
+                        if t.eq_ignore_ascii_case(old_tag) {
+                            new_tag.to_string()
+                        } else {
+                            t.clone()
+                        }
+                    })
+                    .collect();
+                let mut new_fields = fields.clone();
+                new_fields[idx].1 = serialize_tags_field(&fields[idx].1, &new_fm_tags);
+                new_content = set_front_matter_fields(&content, &new_fields);
+                changed = true;
+            }
+        }
+
+        if rewrite_inline {
+            let spliced = {
+                let (_, body_now, _, _) = parse_front_matter(&new_content);
+                let (new_body, inline_count) = rewrite_inline_tags(body_now, old_tag, new_tag);
+                if inline_count > 0 {
+                    let body_offset = new_content.len() - body_now.len();
+                    Some(format!("{}{}", &new_content[..body_offset], new_body))
+                } else {
+                    None
+                }
+            };
+            if let Some(s) = spliced {
+                new_content = s;
+                changed = true;
+            }
+        }
+
+        if changed && new_content != content {
+            write_note_atomic(root, &safe_path, &new_content, None)?;
+            rewritten_notes.push((note_path.clone(), new_content));
+            notes_updated += 1;
+        }
+    }
+
+    Ok(TagRenameSummary {
+        notes_updated,
+        rewritten_notes,
+    })
+}
+
 /// The lookup key `filename_stems` uses for a note path: its filename stem, lower-cased (M10.23).
 fn stem_key(note_path: &str) -> String {
     Path::new(note_path)
@@ -2372,6 +2628,44 @@ impl Index {
             links_in: HashMap::new(),
             filename_stems: HashMap::new(),
             wikilinks_enabled: false,
+            tags: HashMap::new(),
+        }
+    }
+
+    /// Find the canonical (first-seen-casing) key in `self.tags` matching `tag`
+    /// case-insensitively, if one already exists (M10.25).
+    fn tag_canonical_key(&self, tag: &str) -> Option<String> {
+        let lower = tag.to_lowercase();
+        self.tags
+            .keys()
+            .find(|k| k.to_lowercase() == lower)
+            .cloned()
+    }
+
+    /// Record that `note_path` carries `tag`, reusing this tag's existing canonical casing (from
+    /// whichever note introduced it first) if one is already known (M10.25).
+    fn add_note_to_tag(&mut self, tag: &str, note_path: &NotePath) {
+        let key = self
+            .tag_canonical_key(tag)
+            .unwrap_or_else(|| tag.to_string());
+        let entry = self.tags.entry(key).or_default();
+        if !entry.contains(note_path) {
+            entry.push(note_path.clone());
+        }
+    }
+
+    /// Remove `note_path` from every tag bucket it appears in, dropping any bucket that becomes
+    /// empty as a result (M10.25).
+    fn remove_note_from_all_tags(&mut self, note_path: &str) {
+        let mut empty_keys = Vec::new();
+        for (key, notes) in self.tags.iter_mut() {
+            notes.retain(|p| p != note_path);
+            if notes.is_empty() {
+                empty_keys.push(key.clone());
+            }
+        }
+        for key in empty_keys {
+            self.tags.remove(&key);
         }
     }
 
@@ -2464,7 +2758,8 @@ impl Index {
                 if let Ok(content) = String::from_utf8(bytes) {
                     let title = resolve_note_title(&content, safe_path.as_relative_path());
                     let headings = extract_headings(&content);
-                    let (_, _, tags, _) = parse_front_matter(&content);
+                    let (_, body, fm_tags, _) = parse_front_matter(&content);
+                    let tags = merged_note_tags(fm_tags, body);
                     let meta = fs::metadata(abs_path).ok();
                     let size_bytes = meta.as_ref().map(|m| m.len()).unwrap_or(0);
                     let modified_ms = meta
@@ -2473,6 +2768,9 @@ impl Index {
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
 
+                    for tag in &tags {
+                        index.add_note_to_tag(tag, &rel_posix);
+                    }
                     index.notes.insert(
                         rel_posix.clone(),
                         NoteMeta {
@@ -2536,7 +2834,8 @@ impl Index {
 
         let title = resolve_note_title(content, safe_path.as_relative_path());
         let headings = extract_headings(content);
-        let (_, _, tags, _) = parse_front_matter(content);
+        let (_, body, fm_tags, _) = parse_front_matter(content);
+        let tags = merged_note_tags(fm_tags, body);
         let meta = fs::metadata(abs_path).ok();
         let size_bytes = meta
             .as_ref()
@@ -2552,6 +2851,11 @@ impl Index {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0)
             });
+
+        self.remove_note_from_all_tags(&rel_posix);
+        for tag in &tags {
+            self.add_note_to_tag(tag, &rel_posix);
+        }
 
         self.notes.insert(
             rel_posix.clone(),
@@ -2646,6 +2950,7 @@ impl Index {
     pub fn remove_note(&mut self, _root: Option<&Path>, rel_path: &str) {
         self.notes.remove(rel_path);
         self.links_out.remove(rel_path);
+        self.remove_note_from_all_tags(rel_path);
 
         let stem = stem_key(rel_path);
         if let Some(entry) = self.filename_stems.get_mut(&stem) {
@@ -4826,6 +5131,168 @@ Also [Unrelated link](https://example.com) and [Other Note](../other.md).
         assert_eq!(report.broken_links[0].raw_target, "./missing.md");
         assert_eq!(report.orphan_notes, vec!["notes/lonely.md".to_string()]);
         assert!(report.unreadable_files.is_empty());
+    }
+
+    // --- M10.25: tags and tag navigation ---
+
+    #[test]
+    fn extract_inline_tags_finds_plain_tag() {
+        let tags = extract_inline_tags("Some text with a #project-x tag in it.");
+        assert_eq!(tags, vec![("project-x".to_string(), 1, 18)]);
+    }
+
+    #[test]
+    fn extract_inline_tags_excludes_word_char_prefix() {
+        // `foo#bar` and `C#` must not be treated as tags: the `#` is preceded by a word char.
+        let tags = extract_inline_tags("This is foo#bar and also C# code.");
+        assert!(tags.is_empty());
+    }
+
+    #[test]
+    fn extract_inline_tags_excludes_atx_heading_marker_but_finds_tag_later_on_line() {
+        let tags = extract_inline_tags("# Heading\n\n## Sub #tag\n\nBody #ok.");
+        let names: Vec<&str> = tags.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(names, vec!["tag", "ok"]);
+    }
+
+    #[test]
+    fn extract_inline_tags_excludes_code_span_and_fence() {
+        let body = "Inline `#not_a_tag` code.\n\n```\n#also_not_a_tag\n```\n\n#real_tag here.";
+        let tags = extract_inline_tags(body);
+        let names: Vec<&str> = tags.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(names, vec!["real_tag"]);
+    }
+
+    #[test]
+    fn extract_inline_tags_matches_after_punctuation_and_line_start() {
+        let tags = extract_inline_tags("#start-tag and (#paren-tag) and, #after-comma.");
+        let names: Vec<&str> = tags.iter().map(|(t, _, _)| t.as_str()).collect();
+        assert_eq!(names, vec!["start-tag", "paren-tag", "after-comma"]);
+    }
+
+    #[test]
+    fn rewrite_inline_tags_replaces_matching_occurrences_case_insensitively() {
+        let body = "Work on #Project-X today. See also #project-x notes. Skip foo#project-x.";
+        let (new_body, count) = rewrite_inline_tags(body, "project-x", "project-y");
+        assert_eq!(count, 2);
+        assert_eq!(
+            new_body,
+            "Work on #project-y today. See also #project-y notes. Skip foo#project-x."
+        );
+    }
+
+    #[test]
+    fn rewrite_inline_tags_never_touches_heading_marker_or_code() {
+        let body = "# Heading\n\n`#project-x` in code.\n\n```\n#project-x\n```\n";
+        let (new_body, count) = rewrite_inline_tags(body, "project-x", "project-y");
+        assert_eq!(count, 0);
+        assert_eq!(new_body, body);
+    }
+
+    #[test]
+    fn note_meta_tags_is_union_of_front_matter_and_inline_case_insensitive_dedup() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("note.md"),
+            "---\ntags: [Rust, alpha]\n---\n# Title\n\nBody with #rust and #beta tags.\n",
+        )
+        .unwrap();
+
+        let mut index = Index::new();
+        let safe = SafePath::resolve(root, "note.md").unwrap();
+        let content = fs::read_to_string(safe.as_path()).unwrap();
+        index.insert_or_update_note(root, &safe, &content);
+
+        let meta = index.notes.get("note.md").unwrap();
+        // `Rust` (front-matter) wins over `rust` (inline) casing; `beta` is added from inline.
+        assert_eq!(meta.tags, vec!["Rust", "alpha", "beta"]);
+    }
+
+    #[test]
+    fn index_tags_reverse_map_tracks_notes_and_updates_incrementally() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.md"), "---\ntags: [shared]\n---\n# A\n").unwrap();
+        fs::write(root.join("b.md"), "# B\n\nBody with #shared and #only-b.\n").unwrap();
+
+        let index = Index::build_from_workspace(root, |_, _| {}).unwrap();
+        let shared_key = index.tag_canonical_key("shared").unwrap();
+        let mut shared_notes = index.tags.get(&shared_key).unwrap().clone();
+        shared_notes.sort();
+        assert_eq!(shared_notes, vec!["a.md".to_string(), "b.md".to_string()]);
+        assert!(index
+            .tags
+            .contains_key(&index.tag_canonical_key("only-b").unwrap()));
+
+        // Removing b.md should drop it from `shared` and remove the now-empty `only-b` bucket.
+        let mut index = index;
+        index.remove_note(Some(root), "b.md");
+        let shared_key = index.tag_canonical_key("shared").unwrap();
+        assert_eq!(
+            index.tags.get(&shared_key).unwrap(),
+            &vec!["a.md".to_string()]
+        );
+        assert!(index.tag_canonical_key("only-b").is_none());
+    }
+
+    #[test]
+    fn rewrite_tags_workspace_renames_front_matter_and_inline_across_notes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("fm-only.md"),
+            "---\ntags: [old-tag, keep]\n---\n# FM Only\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("inline-only.md"),
+            "# Inline Only\n\nSome #old-tag text.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("both.md"),
+            "---\ntags: [old-tag]\n---\n# Both\n\nAlso #old-tag inline.\n",
+        )
+        .unwrap();
+
+        let index = Index::build_from_workspace(root, |_, _| {}).unwrap();
+        let summary =
+            rewrite_tags_workspace(root, "old-tag", "new-tag", &index.tags, true).unwrap();
+        assert_eq!(summary.notes_updated, 3);
+
+        assert_eq!(
+            fs::read_to_string(root.join("fm-only.md")).unwrap(),
+            "---\ntags: [new-tag, keep]\n---\n# FM Only\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("inline-only.md")).unwrap(),
+            "# Inline Only\n\nSome #new-tag text.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("both.md")).unwrap(),
+            "---\ntags: [new-tag]\n---\n# Both\n\nAlso #new-tag inline.\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_tags_workspace_skips_inline_when_disabled() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("both.md"),
+            "---\ntags: [old-tag]\n---\n# Both\n\nAlso #old-tag inline.\n",
+        )
+        .unwrap();
+
+        let index = Index::build_from_workspace(root, |_, _| {}).unwrap();
+        let summary =
+            rewrite_tags_workspace(root, "old-tag", "new-tag", &index.tags, false).unwrap();
+        assert_eq!(summary.notes_updated, 1);
+        assert_eq!(
+            fs::read_to_string(root.join("both.md")).unwrap(),
+            "---\ntags: [new-tag]\n---\n# Both\n\nAlso #old-tag inline.\n"
+        );
     }
 }
 

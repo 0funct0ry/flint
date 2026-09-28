@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { TitleBar, ViewMode } from './components/TitleBar';
 import { LeftSidebar, LeftTab, InlineActionState } from './components/LeftSidebar';
@@ -28,6 +28,7 @@ import {
   NoteContent,
   NoteFixture,
   NoteMeta,
+  TagCount,
   TreeNodeItem,
   WorkspaceInfo,
   WorkspaceStats,
@@ -113,6 +114,10 @@ export const App: React.FC = () => {
 
   // Inline tree action state (create-note, create-folder, rename)
   const [inlineAction, setInlineAction] = useState<InlineActionState | null>(null);
+
+  // Tag click-to-filter state (M10.25) — no precedent among the note-navigation callbacks above,
+  // since a tag click filters the tree rather than navigating to a single note.
+  const [activeTagFilter, setActiveTagFilter] = useState<string | null>(null);
 
   // Outline heading & search target line state
   const [activeHeadingAnchor, setActiveHeadingAnchor] = useState<string>('');
@@ -206,6 +211,58 @@ export const App: React.FC = () => {
       console.warn('Failed to fetch workspace stats / index:', err);
     }
   }, []);
+
+  // Workspace-wide tag counts, derived client-side from `indexedNotes` (which already carries
+  // each note's merged front-matter ∪ inline tags) rather than a dedicated backend endpoint
+  // (SPEC/M10.25). Case-insensitively de-duped, first-seen casing kept, sorted count desc then
+  // alpha for the left-sidebar Tags tab; right-sidebar per-tag counts read the same map.
+  const tagCounts = useMemo<TagCount[]>(() => {
+    const counts = new Map<string, number>();
+    const canonicalCasing = new Map<string, string>();
+    for (const note of indexedNotes) {
+      for (const tag of note.tags || []) {
+        const key = tag.toLowerCase();
+        counts.set(key, (counts.get(key) || 0) + 1);
+        if (!canonicalCasing.has(key)) {
+          canonicalCasing.set(key, tag);
+        }
+      }
+    }
+    return Array.from(counts.entries())
+      .map(([key, count]) => ({ tag: canonicalCasing.get(key) || key, count }))
+      .sort((a, b) => b.count - a.count || a.tag.localeCompare(b.tag));
+  }, [indexedNotes]);
+
+  const handleFilterByTag = useCallback((tag: string) => {
+    setActiveTagFilter(tag);
+    setLeftTab('tree');
+  }, []);
+
+  const handleClearTagFilter = useCallback(() => {
+    setActiveTagFilter(null);
+  }, []);
+
+  const handleTagRename = useCallback(
+    async (oldTag: string, newTag: string) => {
+      if (!oldTag || !newTag || oldTag === newTag) return;
+      try {
+        const res = await api.tagRename(oldTag, newTag);
+        await refreshTree();
+        await refreshStats();
+        if (activeTagFilter && activeTagFilter.toLowerCase() === oldTag.toLowerCase()) {
+          setActiveTagFilter(newTag);
+        }
+        showToast(
+          `Renamed tag "#${oldTag}" to "#${newTag}". Updated ${res.notes_updated} note${
+            res.notes_updated === 1 ? '' : 's'
+          }`
+        );
+      } catch (err: any) {
+        showToast(`Failed to rename tag: ${err?.message || String(err)}`);
+      }
+    },
+    [activeTagFilter, refreshStats, refreshTree, showToast]
+  );
 
   // Load note via IPC
   const loadNote = useCallback(async (path: string) => {
@@ -1467,6 +1524,12 @@ export const App: React.FC = () => {
             onSectionMoveFailed={(message) => {
               showToast(`Could not move section: ${message}`);
             }}
+            indexedNotes={indexedNotes}
+            tagCounts={tagCounts}
+            activeTagFilter={activeTagFilter}
+            onFilterByTag={handleFilterByTag}
+            onClearTagFilter={handleClearTagFilter}
+            onTagRename={handleTagRename}
           />
         )}
 
@@ -1517,6 +1580,9 @@ export const App: React.FC = () => {
             onOpenExternal={handleOpenExternal}
             onClose={() => setRightSidebarVisible(false)}
             onFrontmatterSave={handleFrontmatterSave}
+            tagCounts={tagCounts}
+            onFilterByTag={handleFilterByTag}
+            onTagRename={handleTagRename}
           />
         )}
         </>

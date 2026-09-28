@@ -1,5 +1,5 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { TreeNodeItem, HeadingItem, ContentHitGroup } from '../types';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
+import { TreeNodeItem, HeadingItem, ContentHitGroup, NoteMeta, TagCount } from '../types';
 import { api } from '../services/ipc';
 import { slugify } from '../services/markdown';
 import {
@@ -18,7 +18,24 @@ import { applyOutlineEdit } from '../services/outlineEditBridge';
 
 const CONFIRM_MOVE_TO_NEW_NOTE_KEY = 'outline.confirmMoveToNewNote';
 
-export type LeftTab = 'tree' | 'search' | 'outline';
+/** Prune a workspace tree to notes in `matching`, keeping ancestor folders with a matching
+ * descendant and dropping non-matching siblings (M10.25 tag click-to-filter). */
+function filterTreeByTag(nodes: TreeNodeItem[], matching: Set<string>): TreeNodeItem[] {
+  const result: TreeNodeItem[] = [];
+  for (const node of nodes) {
+    if (node.is_folder) {
+      const children = node.children ? filterTreeByTag(node.children, matching) : [];
+      if (children.length > 0) {
+        result.push({ ...node, children });
+      }
+    } else if (matching.has(node.path)) {
+      result.push(node);
+    }
+  }
+  return result;
+}
+
+export type LeftTab = 'tree' | 'search' | 'outline' | 'tags';
 
 export interface InlineActionState {
   type: 'create-note' | 'create-folder' | 'rename';
@@ -57,6 +74,15 @@ export interface LeftSidebarProps {
   onSectionMovedToNewNote?: (newNotePath: string) => void;
   /** Fired if "Move to new note" fails (e.g. destination already exists). */
   onSectionMoveFailed?: (message: string) => void;
+  /** Full workspace note index (path + tags), used to filter the tree by `activeTagFilter` (M10.25). */
+  indexedNotes?: NoteMeta[];
+  /** Every workspace tag with its total note count, sorted count desc then alpha (M10.25). */
+  tagCounts?: TagCount[];
+  /** The tag currently filtering the tree view, if any (M10.25). */
+  activeTagFilter?: string | null;
+  onFilterByTag?: (tag: string) => void;
+  onClearTagFilter?: () => void;
+  onTagRename?: (oldTag: string, newTag: string) => void;
 }
 
 export const LeftSidebar: React.FC<LeftSidebarProps> = ({
@@ -86,6 +112,12 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   noteContent = '',
   onSectionMovedToNewNote,
   onSectionMoveFailed,
+  indexedNotes = [],
+  tagCounts = [],
+  activeTagFilter = null,
+  onFilterByTag,
+  onClearTagFilter,
+  onTagRename,
 }) => {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set(['projects', 'projects/payments', 'archive', 'reading', 'guides'])
@@ -117,6 +149,67 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   const [extractState, setExtractState] = useState<{ index: number; value: string; error: string | null } | null>(null);
   const [confirmExtractState, setConfirmExtractState] = useState<{ index: number; destPath: string } | null>(null);
   const extractInputRef = useRef<HTMLInputElement>(null);
+
+  // Tags tab state (M10.25)
+  const [tagFilterQuery, setTagFilterQuery] = useState('');
+  const [tagContextMenu, setTagContextMenu] = useState<{ x: number; y: number; tag: string } | null>(null);
+  const [renamingTag, setRenamingTag] = useState<string | null>(null);
+  const [renameTagValue, setRenameTagValue] = useState('');
+  const renameTagInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (renamingTag !== null) {
+      renameTagInputRef.current?.focus();
+      renameTagInputRef.current?.select();
+    }
+  }, [renamingTag]);
+
+  const filteredTagCounts = useMemo(() => {
+    const q = tagFilterQuery.trim().toLowerCase();
+    if (!q) return tagCounts;
+    return tagCounts.filter((t) => t.tag.toLowerCase().includes(q));
+  }, [tagCounts, tagFilterQuery]);
+
+  const tagFilteredNoteSet = useMemo(() => {
+    if (!activeTagFilter) return null;
+    const lower = activeTagFilter.toLowerCase();
+    const set = new Set<string>();
+    indexedNotes.forEach((n) => {
+      if ((n.tags || []).some((t) => t.toLowerCase() === lower)) {
+        set.add(n.path);
+      }
+    });
+    return set;
+  }, [activeTagFilter, indexedNotes]);
+
+  const displayedTreeData = useMemo(() => {
+    if (!tagFilteredNoteSet) return treeData;
+    return filterTreeByTag(treeData, tagFilteredNoteSet);
+  }, [treeData, tagFilteredNoteSet]);
+
+  const startTagRename = (tag: string) => {
+    setRenamingTag(tag);
+    setRenameTagValue(tag);
+    setTagContextMenu(null);
+  };
+
+  const commitTagRename = () => {
+    if (renamingTag !== null) {
+      const trimmed = renameTagValue.trim().replace(/^#/, '');
+      if (trimmed && trimmed !== renamingTag) {
+        onTagRename?.(renamingTag, trimmed);
+      }
+    }
+    setRenamingTag(null);
+  };
+
+  const buildTagMenuItems = (tag: string): ContextMenuItem[] => [
+    {
+      id: 'rename-tag',
+      label: 'Rename tag…',
+      onClick: () => startTagRename(tag),
+    },
+  ];
 
   // Keyboard tree navigation (Up/Down move focus between visible rows in document order;
   // Left/Right collapse/expand a focused folder, or hop to its parent when already collapsed).
@@ -1030,6 +1123,18 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
         >
           Outline
         </button>
+        <button
+          role="tab"
+          aria-selected={activeTab === 'tags'}
+          onClick={() => onTabChange('tags')}
+          className={`px-3 text-[11.5px] tracking-wide transition-colors ${
+            activeTab === 'tags'
+              ? 'text-[var(--text)] font-medium shadow-[inset_0_-2px_0_var(--accent)]'
+              : 'text-[var(--muted)] hover:text-[var(--text)]'
+          }`}
+        >
+          Tags
+        </button>
 
         {onClose && (
           <button
@@ -1047,40 +1152,60 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
       <div className="flex-1 overflow-auto py-1.5 min-h-0">
         {/* WORKSPACE TREE TAB */}
         {activeTab === 'tree' && (
-          <div
-            ref={treeContainerRef}
-            role="tree"
-            aria-label="Workspace file tree"
-            tabIndex={0}
-            onContextMenu={(e) => handleContextMenu(e, null)}
-            onDragOver={(e) => handleDragOver(e, null)}
-            onDrop={(e) => handleDrop(e, '')}
-            className={`focus:outline-none h-full ${dragOverTarget === '' ? 'bg-[var(--accent-soft)]/20' : ''}`}
-          >
-            {error ? (
-              <div className="p-4 text-center">
-                <div className="text-xs text-[var(--spark)] mb-2 font-medium">
-                  {error}
-                </div>
-                <div className="text-[11px] text-[var(--muted)]">
-                  Check workspace path and folder permissions.
-                </div>
+          <div className="flex flex-col h-full">
+            {activeTagFilter && (
+              <div className="flex items-center gap-1.5 px-2.5 py-1.5 border-b border-[var(--border)]">
+                <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-[var(--accent-soft)] text-[var(--accent)] text-[11px] font-medium">
+                  <span>#{activeTagFilter}</span>
+                  <button
+                    onClick={onClearTagFilter}
+                    aria-label={`Clear filter for tag ${activeTagFilter}`}
+                    className="hover:opacity-70"
+                  >
+                    ×
+                  </button>
+                </span>
               </div>
-            ) : isEmpty && !inlineAction ? (
-              <div className="p-4 flex flex-col items-center justify-center text-center h-48">
-                <div className="text-xs text-[var(--muted)] mb-3 font-medium">
-                  Workspace is empty
-                </div>
-                <button
-                  onClick={() => onCreateNote('')}
-                  className="px-2.5 py-1 text-xs bg-[var(--accent)] text-white rounded-[5px] hover:opacity-90 font-medium transition-opacity"
-                >
-                  Create your first note
-                </button>
-              </div>
-            ) : (
-              renderTree(treeData, 0, '')
             )}
+            <div
+              ref={treeContainerRef}
+              role="tree"
+              aria-label="Workspace file tree"
+              tabIndex={0}
+              onContextMenu={(e) => handleContextMenu(e, null)}
+              onDragOver={(e) => handleDragOver(e, null)}
+              onDrop={(e) => handleDrop(e, '')}
+              className={`flex-1 overflow-auto focus:outline-none ${dragOverTarget === '' ? 'bg-[var(--accent-soft)]/20' : ''}`}
+            >
+              {error ? (
+                <div className="p-4 text-center">
+                  <div className="text-xs text-[var(--spark)] mb-2 font-medium">
+                    {error}
+                  </div>
+                  <div className="text-[11px] text-[var(--muted)]">
+                    Check workspace path and folder permissions.
+                  </div>
+                </div>
+              ) : isEmpty && !inlineAction ? (
+                <div className="p-4 flex flex-col items-center justify-center text-center h-48">
+                  <div className="text-xs text-[var(--muted)] mb-3 font-medium">
+                    Workspace is empty
+                  </div>
+                  <button
+                    onClick={() => onCreateNote('')}
+                    className="px-2.5 py-1 text-xs bg-[var(--accent)] text-white rounded-[5px] hover:opacity-90 font-medium transition-opacity"
+                  >
+                    Create your first note
+                  </button>
+                </div>
+              ) : activeTagFilter && displayedTreeData.length === 0 ? (
+                <div className="p-4 text-center text-xs text-[var(--faint)]">
+                  No notes tagged #{activeTagFilter}.
+                </div>
+              ) : (
+                renderTree(displayedTreeData, 0, '')
+              )}
+            </div>
           </div>
         )}
 
@@ -1324,6 +1449,85 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
             )}
           </div>
         )}
+
+        {/* TAGS TAB */}
+        {activeTab === 'tags' && (
+          <div className="flex flex-col h-full">
+            <div className="p-2.5 pb-2 border-b border-[var(--border)]">
+              <input
+                type="text"
+                value={tagFilterQuery}
+                onChange={(e) => setTagFilterQuery(e.target.value)}
+                placeholder="Filter tags..."
+                aria-label="Filter workspace tags"
+                className="w-full px-2 py-1 text-xs text-[var(--text)] bg-[var(--canvas)] border border-[var(--border)] rounded-[5px] focus:outline-none focus:border-[var(--accent)]"
+              />
+            </div>
+            <div className="flex-1 overflow-auto p-1">
+              {tagCounts.length === 0 ? (
+                <div className="p-4 text-center text-xs text-[var(--faint)]">
+                  No tags in this workspace yet.
+                </div>
+              ) : filteredTagCounts.length === 0 ? (
+                <div className="p-4 text-center text-xs text-[var(--faint)]">
+                  No tags match "{tagFilterQuery}".
+                </div>
+              ) : (
+                filteredTagCounts.map((t) =>
+                  renamingTag === t.tag ? (
+                    <div
+                      key={t.tag}
+                      className="flex items-center gap-2 h-[26px] mx-1 my-0.5 px-2 bg-[var(--panel-2)] rounded-[4px] border border-[var(--accent)]"
+                    >
+                      <span className="text-[var(--faint)] text-xs">#</span>
+                      <input
+                        ref={renameTagInputRef}
+                        type="text"
+                        value={renameTagValue}
+                        onChange={(e) => setRenameTagValue(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') commitTagRename();
+                          else if (e.key === 'Escape') setRenamingTag(null);
+                        }}
+                        onBlur={commitTagRename}
+                        autoComplete="off"
+                        autoCorrect="off"
+                        autoCapitalize="off"
+                        spellCheck={false}
+                        className="w-full bg-transparent text-[12.5px] text-[var(--text)] focus:outline-none"
+                      />
+                    </div>
+                  ) : (
+                    <div
+                      key={t.tag}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => onFilterByTag?.(t.tag)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') onFilterByTag?.(t.tag);
+                      }}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        setTagContextMenu({ x: e.clientX, y: e.clientY, tag: t.tag });
+                      }}
+                      className={`flex items-center gap-1.5 px-3 py-1 text-[12.5px] cursor-pointer rounded-[4px] mx-1 focus:outline-none focus:ring-1 focus:ring-inset focus:ring-[var(--accent)] ${
+                        activeTagFilter === t.tag
+                          ? 'bg-[var(--accent-soft)] text-[var(--accent)] font-medium'
+                          : 'text-[var(--text-2)] hover:bg-[var(--panel-2)] hover:text-[var(--text)]'
+                      }`}
+                    >
+                      <span className="text-[var(--faint)] text-xs">#</span>
+                      <span className="truncate">{t.tag}</span>
+                      <i className="ml-auto not-italic text-[var(--faint)] text-[11px] font-mono">
+                        {t.count}
+                      </i>
+                    </div>
+                  )
+                )
+              )}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Context Menu floating overlay */}
@@ -1333,6 +1537,16 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
           y={contextMenu.y}
           items={getContextMenuItems()}
           onClose={() => setContextMenu(null)}
+        />
+      )}
+
+      {/* Tag context menu (right sidebar / left Tags tab, M10.25) */}
+      {tagContextMenu && (
+        <ContextMenu
+          x={tagContextMenu.x}
+          y={tagContextMenu.y}
+          items={buildTagMenuItems(tagContextMenu.tag)}
+          onClose={() => setTagContextMenu(null)}
         />
       )}
 

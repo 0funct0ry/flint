@@ -186,7 +186,7 @@ fn run() -> Result<u8, (u8, String)> {
                 let _ = fs::create_dir_all(&templates_dir);
                 let _ = fs::write(
                     &daily_template,
-                    "# {{date}}\n\n## Notes\n\n## Tasks\n\n- [ ] \n",
+                    "# {{ date() }}\n\n## Notes\n\n## Tasks\n\n- [ ] \n",
                 );
             }
 

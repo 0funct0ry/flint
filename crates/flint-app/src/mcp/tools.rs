@@ -163,7 +163,7 @@ pub fn list_tools() -> Vec<Value> {
         ),
         tool_def(
             "note_create",
-            "Create a new note at a workspace-relative path. `template`, if given, is a path relative to .flint/templates/ whose content is rendered ({{date}}/{{time}}/{{title}}/{{path}}) into the note.",
+            "Create a new note at a workspace-relative path. `template`, if given, is a path relative to .flint/templates/ whose content is rendered (Tera syntax: {{ date() }}, {{ time() }}, {{ title }}, {{ path }}) into the note.",
             json!({
                 "type": "object",
                 "properties": {
@@ -255,7 +255,7 @@ pub fn list_tools() -> Vec<Value> {
         ),
         tool_def(
             "template_create",
-            "Author a new template under .flint/templates/ with a declared variable schema and an authored Markdown body. Placeholders: {{date}}, {{date:FORMAT}}, {{time}}, {{title}}, {{path}}, {{var:name}}, and pipe transforms like {{title|slug}}.",
+            "Author a new template under .flint/templates/ with a declared variable schema and an authored Markdown body. Tera syntax: {{ date(fmt=\"YYYY-MM-DD\") }}, {{ time() }}, {{ title }}, {{ path }}, {{ var.name }}, filters like {{ title | slugify }}, and {% for %}/{% if %}/{% set %} blocks. A template that fails to render is used as written.",
             json!({
                 "type": "object",
                 "properties": {
@@ -482,7 +482,7 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
             // Same template-file-path semantics as the `note_create` IPC command (M10.26) —
             // MCP writes must never diverge from what the GUI's "+" flow produces.
             let title = flint_core::resolve_note_title("", safe.as_relative_path());
-            let content = crate::resolve_new_note_content_with_variables(
+            let (content, template_warning) = crate::resolve_new_note_content_checked(
                 ctx.root,
                 &posix,
                 &title,
@@ -500,7 +500,11 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
                 lock.insert_or_update_note(ctx.root, &safe, &content);
             }
             emit_note_event(ctx, "note:created", &posix);
-            Ok(json!(meta))
+            let mut out = json!(meta);
+            if let (Some(w), Some(obj)) = (template_warning, out.as_object_mut()) {
+                obj.insert("templateWarning".into(), json!(w));
+            }
+            Ok(out)
         }
         "templates_list" => Ok(json!(flint_core::list_templates(ctx.root))),
         "daily_note_open" => {
@@ -549,18 +553,16 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
                 ..flint_core::TemplateContext::new("", "")
             };
             let note_ctx = crate::with_generators(note_ctx, ctx.root, cfg.template.as_deref());
-            let content = match cfg.template.as_deref() {
+            let (content, template_warning) = match cfg.template.as_deref() {
                 Some(name) => {
+                    // Same path as the GUI: carries the template's own front matter over
+                    // (minus its `templateVariables` schema).
                     let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, name);
-                    let tpl_safe = resolve(ctx.root, &template_rel)?;
-                    let raw = std::fs::read_to_string(tpl_safe.as_path())
-                        .map_err(|e| plain_error(e.to_string()))?;
-                    // Strip the template's own front matter before rendering — its
-                    // `templateVariables` schema field describes the template, not the note.
-                    let (_, template_body, _, _) = flint_core::parse_front_matter(&raw);
-                    flint_core::render_template(template_body, &note_ctx)
+                    resolve(ctx.root, &template_rel)?;
+                    crate::render_template_by_name(ctx.root, name, &note_ctx)
+                        .map_err(plain_error)?
                 }
-                None => String::new(),
+                None => (String::new(), None),
             };
 
             let meta = create_note(ctx.root, &safe, Some(&content)).map_err(map_note_error)?;
@@ -573,7 +575,11 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
                 lock.insert_or_update_note(ctx.root, &safe, &content);
             }
             emit_note_event(ctx, "note:created", &posix);
-            Ok(json!(meta))
+            let mut out = json!(meta);
+            if let (Some(w), Some(obj)) = (template_warning, out.as_object_mut()) {
+                obj.insert("templateWarning".into(), json!(w));
+            }
+            Ok(out)
         }
         "frontmatter_set" => {
             #[derive(Deserialize)]

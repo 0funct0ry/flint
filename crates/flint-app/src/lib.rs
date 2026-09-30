@@ -211,24 +211,64 @@ pub(crate) fn with_generators(
 /// Render a template file into note content. The template's own front-matter fields carry over
 /// to the note (with `{{...}}` placeholders resolved), except the `templateVariables` schema
 /// field, which describes the template itself and never belongs on a note.
-fn render_template_file(raw: &str, ctx: &flint_core::TemplateContext) -> String {
+///
+/// Returns the rendered content plus the first render warning (M10.29), if any part of the
+/// template fell back to its raw text.
+pub(crate) fn render_template_file(
+    raw: &str,
+    ctx: &flint_core::TemplateContext,
+) -> (String, Option<String>) {
     let (_, template_body, _, fields) = flint_core::parse_front_matter(raw);
-    let body = flint_core::render_template(template_body, ctx);
+    let body_out = flint_core::render_template_checked(template_body, ctx);
+    let mut warning = body_out.warning;
+    let body = body_out.text;
     let note_fields: Vec<(String, String)> = fields
         .into_iter()
         .filter(|(k, _)| k != flint_core::TEMPLATE_VARIABLES_FIELD)
-        .map(|(k, v)| (k, flint_core::render_template(&v, ctx)))
+        .map(|(k, v)| {
+            let out = flint_core::render_template_checked(&v, ctx);
+            if warning.is_none() {
+                warning = out.warning;
+            }
+            (k, out.text)
+        })
         .collect();
-    if note_fields.is_empty() {
+    let content = if note_fields.is_empty() {
         body
     } else {
         set_front_matter_fields(&body, &note_fields)
-    }
+    };
+    (content, warning)
+}
+
+/// Load `.flint/templates/<name>` through the path guard and render it with
+/// [`render_template_file`]. The single template-to-content path shared by `note_create`, the
+/// GUI's `daily_note_open`, and the MCP tools, so they can never diverge (e.g. on carrying the
+/// template's own front matter over).
+pub(crate) fn render_template_by_name(
+    root: &Path,
+    name: &str,
+    ctx: &flint_core::TemplateContext,
+) -> Result<(String, Option<String>), String> {
+    let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, name);
+    let safe = SafePath::resolve(root, &template_rel).map_err(|e| e.to_string())?;
+    let raw = std::fs::read_to_string(safe.as_path()).map_err(|e| e.to_string())?;
+    Ok(render_template_file(&raw, ctx))
+}
+
+/// A created/opened note plus the template render warning, if the template fell back to raw text
+/// (M10.29). `templateWarning` is omitted from the JSON when there is none.
+#[derive(serde::Serialize)]
+struct CreatedNote {
+    #[serde(flatten)]
+    meta: NoteMeta,
+    #[serde(rename = "templateWarning", skip_serializing_if = "Option::is_none")]
+    template_warning: Option<String>,
 }
 
 /// Resolve a `template` argument (a path relative to `.flint/templates/`, per M10.26) to its
 /// rendered content, or fall back to `NewNoteConfig.insert_heading` when no template was picked.
-/// `posix_path`/`title` seed the `{{path}}`/`{{title}}` placeholders. Every path here — including
+/// `posix_path`/`title` seed the `{{ path }}`/`{{ title }}` placeholders. Every path here — including
 /// the template file itself — still crosses [`SafePath::resolve`], the same guard every other
 /// filesystem-touching command uses; `.flint/templates/` is not a special case.
 #[allow(dead_code)]
@@ -241,7 +281,7 @@ pub(crate) fn resolve_new_note_content(
     resolve_new_note_content_with_variables(root, posix_path, title, template, &HashMap::new())
 }
 
-/// Same as [`resolve_new_note_content`], plus (M10.27) resolved `{{var:name}}` values. Variable
+/// Same as [`resolve_new_note_content`], plus (M10.27) resolved `{{ var.name }}` values. Variable
 /// values are only substituted into the template text — they are never recorded on the note as
 /// front matter.
 pub(crate) fn resolve_new_note_content_with_variables(
@@ -251,6 +291,17 @@ pub(crate) fn resolve_new_note_content_with_variables(
     template: Option<&str>,
     variables: &HashMap<String, String>,
 ) -> Result<String, String> {
+    resolve_new_note_content_checked(root, posix_path, title, template, variables).map(|(c, _)| c)
+}
+
+/// [`resolve_new_note_content_with_variables`] plus the template render warning (M10.29).
+pub(crate) fn resolve_new_note_content_checked(
+    root: &Path,
+    posix_path: &str,
+    title: &str,
+    template: Option<&str>,
+    variables: &HashMap<String, String>,
+) -> Result<(String, Option<String>), String> {
     let ctx = flint_core::TemplateContext {
         title: title.to_string(),
         path: posix_path.to_string(),
@@ -260,18 +311,13 @@ pub(crate) fn resolve_new_note_content_with_variables(
     };
     let ctx = with_generators(ctx, root, template);
     let content = match template {
-        Some(name) => {
-            let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, name);
-            let safe = SafePath::resolve(root, &template_rel).map_err(|e| e.to_string())?;
-            let raw = std::fs::read_to_string(safe.as_path()).map_err(|e| e.to_string())?;
-            render_template_file(&raw, &ctx)
-        }
+        Some(name) => render_template_by_name(root, name, &ctx)?,
         None => {
             let cfg = read_new_note_config(root);
             if cfg.insert_heading {
-                flint_core::render_template("# {{title}}\n", &ctx)
+                (flint_core::render_template("# {{ title }}\n", &ctx), None)
             } else {
-                String::new()
+                (String::new(), None)
             }
         }
     };
@@ -867,7 +913,7 @@ fn frontmatter_set(
 /// Create a new note at path and update index (SPEC §11, M4).
 ///
 /// `template` is a path relative to `.flint/templates/` (M10.26), not literal content: when set,
-/// the named template file is rendered (`{{date}}`/`{{time}}`/`{{title}}`/`{{path}}`) into the
+/// the named template file is rendered (Tera syntax, e.g. `{{ date() }}`, `{{ title }}`) into the
 /// new note's initial body. When `None`, `NewNoteConfig.insert_heading` decides whether a bare
 /// `# <title>` heading is inserted instead of an empty file.
 #[tauri::command]
@@ -876,13 +922,13 @@ fn note_create(
     template: Option<String>,
     variables: Option<HashMap<String, String>>,
     state: State<AppState>,
-) -> Result<NoteMeta, String> {
+) -> Result<CreatedNote, String> {
     let root = get_workspace_root(&state)?;
     let safe_path = SafePath::resolve(&root, &path).map_err(|e| e.to_string())?;
     let posix = safe_path.to_posix_string();
     let title = flint_core::resolve_note_title("", safe_path.as_relative_path());
 
-    let content = resolve_new_note_content_with_variables(
+    let (content, template_warning) = resolve_new_note_content_checked(
         &root,
         &posix,
         &title,
@@ -899,7 +945,10 @@ fn note_create(
         lock.insert_or_update_note(&root, &safe_path, &content);
     }
 
-    Ok(meta)
+    Ok(CreatedNote {
+        meta,
+        template_warning,
+    })
 }
 
 /// List the templates available under `.flint/templates/` (M10.26), for the new-note template
@@ -921,7 +970,7 @@ fn read_full_config(root: &Path) -> flint_core::config::FlintConfig {
 
 /// Author a new template file under `.flint/templates/` from Journey A's `TemplateEditorModal`
 /// (M10.27): writes the declared variable schema as the `templateVariables` front-matter field,
-/// plus a starter body with a `{{title}}` heading and one `{{var:name}}` placeholder per declared
+/// plus a starter body with a `{{ title }}` heading and one `{{ var.name }}` placeholder per declared
 /// variable, then returns its [`flint_core::TemplateMeta`] so the caller can open it directly in
 /// the editor ("template authoring *is* note editing").
 pub(crate) fn create_template_file(
@@ -938,12 +987,9 @@ pub(crate) fn create_template_file(
     let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, rel_path);
     let safe_path = SafePath::resolve(root, &template_rel).map_err(|e| e.to_string())?;
 
-    let content = set_front_matter_fields(
+    let content = compose_template(
+        Some(flint_core::serialize_template_variables(variables)),
         body,
-        &[(
-            flint_core::TEMPLATE_VARIABLES_FIELD.to_string(),
-            flint_core::serialize_template_variables(variables),
-        )],
     );
 
     let meta = flint_core::TemplateMeta {
@@ -1008,6 +1054,50 @@ fn template_variables_get(
     load_template_variables(&root, &template_path)
 }
 
+/// Build a template file from the body editor's text. The editor shows (and the user may type) the
+/// template's own front matter above the body; it is merged with the `templateVariables` schema
+/// (`schema`, the raw field value, kept first) instead of being dropped or duplicated. A
+/// `templateVariables` key typed into the editor is ignored — the schema is edited separately.
+fn compose_template(schema: Option<String>, editor_text: &str) -> String {
+    let (_, body, _, typed) = flint_core::parse_front_matter(editor_text);
+    let mut fields: Vec<(String, String)> = schema
+        .map(|v| (flint_core::TEMPLATE_VARIABLES_FIELD.to_string(), v))
+        .into_iter()
+        .collect();
+    fields.extend(
+        typed
+            .into_iter()
+            .filter(|(k, _)| k != flint_core::TEMPLATE_VARIABLES_FIELD),
+    );
+    set_front_matter_fields(body, &fields)
+}
+
+/// What the body editor shows for a template file: its own front matter (everything except the
+/// hidden `templateVariables` schema) followed by the body.
+fn template_editor_text(raw: &str) -> String {
+    let (_, body, _, fields) = flint_core::parse_front_matter(raw);
+    let visible: Vec<(String, String)> = fields
+        .into_iter()
+        .filter(|(k, _)| k != flint_core::TEMPLATE_VARIABLES_FIELD)
+        .collect();
+    set_front_matter_fields(body, &visible)
+}
+
+/// Replace (or add) only the `templateVariables` field of a template file's front matter, keeping
+/// every other field, in order, and the body.
+fn with_template_variables(current: &str, variables: &[flint_core::TemplateVariableDef]) -> String {
+    let (_, _, _, mut fields) = flint_core::parse_front_matter(current);
+    let value = flint_core::serialize_template_variables(variables);
+    match fields
+        .iter_mut()
+        .find(|(k, _)| k == flint_core::TEMPLATE_VARIABLES_FIELD)
+    {
+        Some(f) => f.1 = value,
+        None => fields.insert(0, (flint_core::TEMPLATE_VARIABLES_FIELD.to_string(), value)),
+    }
+    set_front_matter_fields(current, &fields)
+}
+
 /// Rewrite only a template file's `templateVariables` front-matter field, leaving its body
 /// untouched (Journey A, "Edit template variables…" — no hand-editing the JSON required).
 #[tauri::command]
@@ -1020,13 +1110,7 @@ fn template_variables_set(
     let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, template_path);
     let safe_path = SafePath::resolve(&root, &template_rel).map_err(|e| e.to_string())?;
     let current = std::fs::read_to_string(safe_path.as_path()).map_err(|e| e.to_string())?;
-    let new_content = set_front_matter_fields(
-        &current,
-        &[(
-            flint_core::TEMPLATE_VARIABLES_FIELD.to_string(),
-            flint_core::serialize_template_variables(&variables),
-        )],
-    );
+    let new_content = with_template_variables(&current, &variables);
     let fp = write_note_atomic(&root, &safe_path, &new_content, None).map_err(|e| e.to_string())?;
     record_suppressed_write(
         &state.suppressed_writes,
@@ -1044,11 +1128,11 @@ pub(crate) fn load_template_body(root: &Path, template_path: &str) -> Result<Str
     let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, template_path);
     let safe_path = SafePath::resolve(root, &template_rel).map_err(|e| e.to_string())?;
     let raw = std::fs::read_to_string(safe_path.as_path()).map_err(|e| e.to_string())?;
-    let (_, body, _, _) = flint_core::parse_front_matter(&raw);
-    Ok(body.to_string())
+    Ok(template_editor_text(&raw))
 }
 
-/// Read one template file's body (everything after its front-matter block, if any) for the
+/// Read one template file as the body editor shows it (its own front matter, minus the hidden
+/// `templateVariables` schema, followed by the body) for the
 /// Templates screen's CodeMirror body editor.
 #[tauri::command]
 fn template_body_get(template_path: String, state: State<AppState>) -> Result<String, String> {
@@ -1068,7 +1152,12 @@ fn template_body_set(
     let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, template_path);
     let safe_path = SafePath::resolve(&root, &template_rel).map_err(|e| e.to_string())?;
     let current = std::fs::read_to_string(safe_path.as_path()).map_err(|e| e.to_string())?;
-    let new_content = flint_core::set_note_body(&current, &body);
+    let (_, _, _, current_fields) = flint_core::parse_front_matter(&current);
+    let schema = current_fields
+        .into_iter()
+        .find(|(k, _)| k == flint_core::TEMPLATE_VARIABLES_FIELD)
+        .map(|(_, v)| v);
+    let new_content = compose_template(schema, &body);
     let fp = write_note_atomic(&root, &safe_path, &new_content, None).map_err(|e| e.to_string())?;
     record_suppressed_write(
         &state.suppressed_writes,
@@ -1193,7 +1282,7 @@ fn daily_note_open(
     date: Option<String>,
     variables: Option<HashMap<String, String>>,
     state: State<AppState>,
-) -> Result<NoteMeta, String> {
+) -> Result<CreatedNote, String> {
     let root = get_workspace_root(&state)?;
     let cfg = read_daily_notes_config(&root);
 
@@ -1217,7 +1306,10 @@ fn daily_note_open(
 
     if safe_path.as_path().exists() {
         return read_note(&root, &safe_path)
-            .map(|note| note.meta)
+            .map(|note| CreatedNote {
+                meta: note.meta,
+                template_warning: None,
+            })
             .map_err(|e| e.to_string());
     }
 
@@ -1232,14 +1324,9 @@ fn daily_note_open(
         ..flint_core::TemplateContext::new("", "")
     };
     let note_ctx = with_generators(note_ctx, &root, cfg.template.as_deref());
-    let content = match cfg.template.as_deref() {
-        Some(name) => {
-            let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, name);
-            let tpl_safe = SafePath::resolve(&root, &template_rel).map_err(|e| e.to_string())?;
-            let raw = std::fs::read_to_string(tpl_safe.as_path()).map_err(|e| e.to_string())?;
-            render_template_file(&raw, &note_ctx)
-        }
-        None => String::new(),
+    let (content, template_warning) = match cfg.template.as_deref() {
+        Some(name) => render_template_by_name(&root, name, &note_ctx)?,
+        None => (String::new(), None),
     };
 
     let meta = create_note(&root, &safe_path, Some(&content)).map_err(|e| e.to_string())?;
@@ -1249,7 +1336,10 @@ fn daily_note_open(
         lock.insert_or_update_note(&root, &safe_path, &content);
     }
 
-    Ok(meta)
+    Ok(CreatedNote {
+        meta,
+        template_warning,
+    })
 }
 
 /// Rename/move a note or folder and optionally rewrite all relative markdown links (SPEC §5.4, §11, M8).
@@ -1881,7 +1971,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".flint/templates")).unwrap();
         std::fs::write(
             root.join(".flint/templates/daily.md"),
-            "# {{title}}\nAt {{path}}",
+            "# {{ title }}\nAt {{ path }}",
         )
         .unwrap();
 
@@ -1896,7 +1986,7 @@ mod tests {
         let root = dir.path();
         let vars = sample_vars();
         let (safe_path, content, _) =
-            create_template_file(root, "Daily", &vars, "# {{title}}\nAt {{path}}").unwrap();
+            create_template_file(root, "Daily", &vars, "# {{ title }}\nAt {{ path }}").unwrap();
         create_note(root, &safe_path, Some(&content)).unwrap();
         assert!(content.contains(flint_core::TEMPLATE_VARIABLES_FIELD));
 
@@ -1998,14 +2088,14 @@ mod tests {
     fn template_create_writes_schema_and_authored_body() {
         let dir = tempfile::tempdir().unwrap();
         let vars = sample_vars();
-        let body = "# {{title}}\n\n## {{var:project}}\n\n## {{var:priority}}\n\n";
+        let body = "# {{ title }}\n\n## {{ var.project }}\n\n## {{ var.priority }}\n\n";
         let (safe_path, content, meta) =
             create_template_file(dir.path(), "Meeting Notes", &vars, body).unwrap();
         assert_eq!(meta.path, "meeting-notes.md");
         assert_eq!(meta.name, "Meeting Notes");
-        assert!(content.contains("{{title}}"));
-        assert!(content.contains("{{var:project}}"));
-        assert!(content.contains("{{var:priority}}"));
+        assert!(content.contains("{{ title }}"));
+        assert!(content.contains("{{ var.project }}"));
+        assert!(content.contains("{{ var.priority }}"));
         assert!(content.contains(flint_core::TEMPLATE_VARIABLES_FIELD));
 
         create_note(dir.path(), &safe_path, Some(&content)).unwrap();
@@ -2024,7 +2114,7 @@ mod tests {
     fn template_variables_set_rewrites_only_the_schema_field() {
         let dir = tempfile::tempdir().unwrap();
         let (safe_path, content, _) =
-            create_template_file(dir.path(), "Plain", &[], "# {{title}}\n\n").unwrap();
+            create_template_file(dir.path(), "Plain", &[], "# {{ title }}\n\n").unwrap();
         create_note(dir.path(), &safe_path, Some(&content)).unwrap();
 
         let new_vars = sample_vars();
@@ -2040,19 +2130,20 @@ mod tests {
 
         let round_tripped = load_template_variables(dir.path(), "plain.md").unwrap();
         assert_eq!(round_tripped, new_vars);
-        // Body (the `{{title}}` starter line) survives the field-only rewrite untouched.
-        assert!(new_content.contains("{{title}}"));
+        // Body (the `{{ title }}` starter line) survives the field-only rewrite untouched.
+        assert!(new_content.contains("{{ title }}"));
     }
 
     #[test]
     fn load_template_body_returns_content_after_front_matter() {
         let dir = tempfile::tempdir().unwrap();
         let (safe_path, content, _) =
-            create_template_file(dir.path(), "Plain", &[], "# {{title}}\n\nBody text.\n").unwrap();
+            create_template_file(dir.path(), "Plain", &[], "# {{ title }}\n\nBody text.\n")
+                .unwrap();
         create_note(dir.path(), &safe_path, Some(&content)).unwrap();
 
         let body = load_template_body(dir.path(), "plain.md").unwrap();
-        assert_eq!(body, "# {{title}}\n\nBody text.\n");
+        assert_eq!(body, "# {{ title }}\n\nBody text.\n");
     }
 
     #[test]
@@ -2060,15 +2151,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vars = sample_vars();
         let (safe_path, content, _) =
-            create_template_file(dir.path(), "Plain", &vars, "# {{title}}\n\nOld body.\n").unwrap();
+            create_template_file(dir.path(), "Plain", &vars, "# {{ title }}\n\nOld body.\n")
+                .unwrap();
         create_note(dir.path(), &safe_path, Some(&content)).unwrap();
 
         let current = std::fs::read_to_string(safe_path.as_path()).unwrap();
-        let new_content = flint_core::set_note_body(&current, "# {{title}}\n\nNew body.\n");
+        let new_content = flint_core::set_note_body(&current, "# {{ title }}\n\nNew body.\n");
         std::fs::write(safe_path.as_path(), &new_content).unwrap();
 
         let body = load_template_body(dir.path(), "plain.md").unwrap();
-        assert_eq!(body, "# {{title}}\n\nNew body.\n");
+        assert_eq!(body, "# {{ title }}\n\nNew body.\n");
         // The schema field survives the body-only rewrite untouched.
         let round_tripped = load_template_variables(dir.path(), "plain.md").unwrap();
         assert_eq!(round_tripped, vars);
@@ -2087,7 +2179,7 @@ mod tests {
         let root = dir.path();
         let vars = sample_vars();
         let (safe_path, content, _) =
-            create_template_file(root, "Client Note", &vars, "# {{title}}\n\n").unwrap();
+            create_template_file(root, "Client Note", &vars, "# {{ title }}\n\n").unwrap();
         create_note(root, &safe_path, Some(&content)).unwrap();
 
         // Global scope sets "project"; folder scope (nearest ancestor) overrides it for notes
@@ -2133,7 +2225,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".flint/templates")).unwrap();
         std::fs::write(
             root.join(".flint/templates/project.md"),
-            "# {{title}}\n\nProject: {{var:project}}\n",
+            "# {{ title }}\n\nProject: {{ var.project }}\n",
         )
         .unwrap();
 
@@ -2160,7 +2252,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".flint/templates")).unwrap();
         std::fs::write(
             root.join(".flint/templates/task.md"),
-            "---\ntemplateVariables: '[]'\nstatus: draft\ntags:\n- todo\n---\n# {{title}}\n",
+            "---\ntemplateVariables: '[]'\nstatus: draft\ntags:\n- todo\n---\n# {{ title }}\n",
         )
         .unwrap();
 
@@ -2177,5 +2269,97 @@ mod tests {
         assert!(content.contains("- todo"));
         assert!(content.contains("# n"));
         assert!(!content.contains("templateVariables"));
+    }
+
+    #[test]
+    fn saving_template_variables_keeps_other_front_matter_and_body() {
+        let current =
+            "---\ntemplateVariables: \"[]\"\nstatus: draft\ntags:\n- todo\n---\n# {{ title }}\n";
+        let vars = vec![flint_core::TemplateVariableDef {
+            name: "client".into(),
+            kind: flint_core::TemplateVariableKind::Text,
+            default: String::new(),
+            required: false,
+            options: Vec::new(),
+        }];
+        let out = with_template_variables(current, &vars);
+        assert!(out.contains("status: draft"));
+        assert!(out.contains("- todo"));
+        assert!(out.ends_with("---\n# {{ title }}\n"));
+        let (_, _, _, fields) = flint_core::parse_front_matter(&out);
+        let raw = &fields
+            .iter()
+            .find(|(k, _)| k == "templateVariables")
+            .unwrap()
+            .1;
+        assert_eq!(flint_core::parse_template_variables(raw), vars);
+        // A template with no schema yet gains one without losing its other fields.
+        let bare = with_template_variables("---\nstatus: draft\n---\nbody\n", &vars);
+        assert!(bare.contains("status: draft") && bare.contains("templateVariables"));
+    }
+
+    #[test]
+    fn render_template_by_name_carries_front_matter_for_every_caller() {
+        // Used by note_create, the GUI daily note, and the MCP daily note alike.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".flint/templates")).unwrap();
+        std::fs::write(
+            root.join(".flint/templates/daily.md"),
+            "---\ntemplateVariables: \"[]\"\nstatus: open\n---\n# {{ title }}\n",
+        )
+        .unwrap();
+        let ctx = flint_core::TemplateContext::new("Today", "daily/today.md");
+        let (content, warning) = render_template_by_name(root, "daily.md", &ctx).unwrap();
+        assert!(warning.is_none());
+        assert!(content.contains("status: open"));
+        assert!(content.contains("# Today"));
+        assert!(!content.contains("templateVariables"));
+        assert!(render_template_by_name(root, "../../etc/passwd", &ctx).is_err());
+    }
+
+    #[test]
+    fn template_front_matter_typed_in_the_editor_reaches_created_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let vars = sample_vars();
+        // 1. Creating a template whose editor text starts with front matter keeps it.
+        let (safe_path, content, _) = create_template_file(
+            root,
+            "Task",
+            &vars,
+            "---\nstatus: open\ntags:\n- todo\n---\n# {{ title }}\n",
+        )
+        .unwrap();
+        create_note(root, &safe_path, Some(&content)).unwrap();
+        let file = std::fs::read_to_string(safe_path.as_path()).unwrap();
+        assert_eq!(
+            file.matches("---\n").count(),
+            2,
+            "one front-matter block: {file}"
+        );
+        assert_eq!(load_template_variables(root, "task.md").unwrap(), vars);
+
+        let mut values = HashMap::new();
+        for v in &vars {
+            values.insert(v.name.clone(), "x".to_string());
+        }
+        let note =
+            resolve_new_note_content_with_variables(root, "n.md", "n", Some("task.md"), &values)
+                .unwrap();
+        assert!(note.starts_with("---\n"));
+        assert!(note.contains("status: open") && note.contains("- todo"));
+        assert!(!note.contains("templateVariables"));
+        assert!(note.contains("# n"));
+
+        // 2. The editor shows the front matter, and saving it back keeps everything (no duplicate
+        //    block, schema intact) — including after an edit.
+        let shown = load_template_body(root, "task.md").unwrap();
+        assert!(shown.starts_with("---\nstatus: open"));
+        assert!(!shown.contains("templateVariables"));
+        let schema = Some(flint_core::serialize_template_variables(&vars));
+        let saved = compose_template(schema, &shown.replace("status: open", "status: done"));
+        assert_eq!(saved.matches("---\n").count(), 2, "{saved}");
+        assert!(saved.contains("status: done") && saved.contains("templateVariables"));
     }
 }

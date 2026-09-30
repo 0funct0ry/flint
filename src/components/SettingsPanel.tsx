@@ -658,7 +658,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose, onOpenTem
           path="newNote.filenamePattern"
           origins={origins}
           onReset={resetField}
-          hint="Supports {{title}}, {{date}}, {{date:FORMAT}}, and {{time}}."
+          hint={'Template syntax: {{ title }}, {{ date() }}, {{ date(fmt="DD-MM-YYYY") }}, {{ time() }}.'}
         >
           <input
             type="text"
@@ -710,7 +710,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose, onOpenTem
           path="dailyNotes.pathPattern"
           origins={origins}
           onReset={resetField}
-          hint="e.g. daily/{{date:YYYY-MM-DD}}.md"
+          hint={'e.g. daily/{{ date(fmt="YYYY-MM-DD") }}.md'}
         >
           <input
             type="text"

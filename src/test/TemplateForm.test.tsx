@@ -6,7 +6,7 @@ describe('TemplateForm (M10.27 Journey A, inline in TemplatesScreen)', () => {
   it('creates a template with a declared variable schema and the authored body', () => {
     const onSave = vi.fn();
     render(
-      <TemplateForm mode="create" initialBody={"# {{title}}\n\n"} onSave={onSave} onCancel={vi.fn()} />
+      <TemplateForm mode="create" initialBody={"# {{ title }}\n\n"} onSave={onSave} onCancel={vi.fn()} />
     );
 
     fireEvent.change(screen.getByLabelText('Template name'), {
@@ -25,7 +25,7 @@ describe('TemplateForm (M10.27 Journey A, inline in TemplatesScreen)', () => {
     expect(onSave).toHaveBeenCalledWith(
       'Meeting Notes',
       [{ name: 'project', kind: 'text', default: '', required: true, options: [] }],
-      '# {{title}}\n\n'
+      '# {{ title }}\n\n'
     );
   });
 
@@ -47,7 +47,7 @@ describe('TemplateForm (M10.27 Journey A, inline in TemplatesScreen)', () => {
         initialVariables={[
           { name: 'client', kind: 'text', default: '', required: false, options: [] },
         ]}
-        initialBody={"# {{title}}\n\nExisting body.\n"}
+        initialBody={"# {{ title }}\n\nExisting body.\n"}
         onSave={onSave}
         onCancel={vi.fn()}
       />
@@ -58,7 +58,7 @@ describe('TemplateForm (M10.27 Journey A, inline in TemplatesScreen)', () => {
     expect(onSave).toHaveBeenCalledWith(
       '',
       [{ name: 'client', kind: 'text', default: '', required: false, options: [] }],
-      '# {{title}}\n\nExisting body.\n'
+      '# {{ title }}\n\nExisting body.\n'
     );
   });
 

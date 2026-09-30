@@ -180,6 +180,15 @@ export const App: React.FC = () => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
 
+  // M10.29: a template that failed to render is used as written — never silently (persistent
+  // toast, so it can't be missed while the new note opens).
+  const showTemplateWarning = useCallback(
+    (warning?: string) => {
+      if (warning) showToast(`Template didn't render — used as written. ${warning}`, undefined, undefined, 10000);
+    },
+    [showToast]
+  );
+
   // Delete modal confirmation state
   const [deleteModalState, setDeleteModalState] = useState<{
     isOpen: boolean;
@@ -902,16 +911,17 @@ export const App: React.FC = () => {
 
         // `template` is a path under .flint/templates/ (M10.26), not literal content — the
         // backend renders it (or, with no template, applies `newNote.insertHeading`).
-        await api.noteCreate(targetPath, config.templates.defaultTemplate ?? undefined);
+        const created = await api.noteCreate(targetPath, config.templates.defaultTemplate ?? undefined);
         await refreshTree();
         await refreshStats();
         showToast(`Created note "${targetPath}"`);
+        showTemplateWarning(created.templateWarning);
         await handleSelectNote(targetPath);
       } catch (err: any) {
         showToast(`Failed to create note: ${err?.message || String(err)}`);
       }
     },
-    [config.templates.defaultTemplate, handleSelectNote, refreshStats, refreshTree, showToast]
+    [config.templates.defaultTemplate, handleSelectNote, refreshStats, refreshTree, showToast, showTemplateWarning]
   );
 
   // Open (creating on first use) a daily note (M10.26). Only ever invoked from an explicit
@@ -922,11 +932,12 @@ export const App: React.FC = () => {
         const meta = await api.dailyNoteOpen(offsetDays, date);
         await refreshTree();
         await handleSelectNote(meta.path);
+        showTemplateWarning(meta.templateWarning);
       } catch (err: any) {
         showToast(`Failed to open daily note: ${err?.message || String(err)}`);
       }
     },
-    [handleSelectNote, refreshTree, showToast]
+    [handleSelectNote, refreshTree, showToast, showTemplateWarning]
   );
 
   // "Daily note: Pick a date…" — a lightweight native prompt rather than a bespoke popover,
@@ -1066,12 +1077,12 @@ export const App: React.FC = () => {
     }
   }, [history, historyIndex, isDirty, loadNote, saveNote]);
 
-  /** Render `newNote.filenamePattern`'s `{{title}}` placeholder against a filler title, used as
+  /** Render `newNote.filenamePattern`'s `{{ title }}` placeholder against a filler title, used as
    * both the inline-create field's initial value and the New Note modal's initial name field —
-   * the real render (with the user's chosen name as `{{title}}`) happens once, in Rust, inside
+   * the real render (with the user's chosen name as `{{ title }}`) happens once, in Rust, inside
    * `note_create`. */
   const newNoteInitialName = useMemo(() => {
-    const pattern = config.newNote.filenamePattern || '{{title}}';
+    const pattern = config.newNote.filenamePattern || '{{ title }}';
     const rendered = pattern.replace(/\{\{\s*title\s*\}\}/gi, 'Untitled');
     return rendered.endsWith('.md') || rendered.endsWith('.markdown') ? rendered : `${rendered}.md`;
   }, [config.newNote.filenamePattern]);
@@ -1109,16 +1120,17 @@ export const App: React.FC = () => {
       const relativePath = folder ? `${folder}/${noteFileName}` : noteFileName;
       const hasVariables = Object.keys(variables).length > 0;
       try {
-        await api.noteCreate(relativePath, templatePath, hasVariables ? variables : undefined);
+        const created = await api.noteCreate(relativePath, templatePath, hasVariables ? variables : undefined);
         await refreshTree();
         setNewNoteModal(null);
         await handleSelectNote(relativePath);
         showToast(`Created note "${noteFileName}"`);
+        showTemplateWarning(created.templateWarning);
       } catch (e) {
         showToast(`Could not create note: ${e}`);
       }
     },
-    [newNoteModal, refreshTree, handleSelectNote, showToast]
+    [newNoteModal, refreshTree, handleSelectNote, showToast, showTemplateWarning]
   );
 
   const handleSaveFolderVariables = useCallback(
@@ -1183,11 +1195,12 @@ export const App: React.FC = () => {
         const relativePath = inlineAction.targetPath
           ? `${inlineAction.targetPath}/${noteFileName}`
           : noteFileName;
-        await api.noteCreate(relativePath, config.templates.defaultTemplate ?? undefined);
+        const created = await api.noteCreate(relativePath, config.templates.defaultTemplate ?? undefined);
         await refreshTree();
         setInlineAction(null);
         await handleSelectNote(relativePath);
         showToast(`Created note "${noteFileName}"`);
+        showTemplateWarning(created.templateWarning);
       } else if (inlineAction.type === 'create-folder') {
         const relativePath = inlineAction.targetPath ? `${inlineAction.targetPath}/${name}` : name;
         await api.folderCreate(relativePath);
@@ -1231,6 +1244,7 @@ export const App: React.FC = () => {
       showToast(`Error: ${err?.message || String(err)}`);
     }
   }, [
+    showTemplateWarning,
     config.templates.defaultTemplate,
     currentNotePath,
     handleSelectNote,

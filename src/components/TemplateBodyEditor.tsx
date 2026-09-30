@@ -14,7 +14,7 @@ import { parseDelimitedSelection, ColumnAlignment } from '../commands/tableBuild
 export interface TemplateBodyEditorProps {
   initialValue: string;
   onChange: (value: string) => void;
-  /** Declared variable names, for the `{{var:...}}` completion branch — read live via a ref so
+  /** Declared variable names, for the `var.` completion branch — read live via a ref so
    * adding/renaming a variable row updates completions without remounting the editor. */
   variableNames: string[];
   className?: string;

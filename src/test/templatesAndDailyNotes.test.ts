@@ -12,7 +12,7 @@ describe('templatesList (browser mock)', () => {
 });
 
 describe('noteCreate with a template path (browser mock)', () => {
-  it('renders {{title}}/{{path}} placeholders from the named template', async () => {
+  it('renders {{ title }}/{{path}} placeholders from the named template', async () => {
     const meta = await api.noteCreate('journal/entry-1.md', 'daily.md');
     const note = await api.noteRead('journal/entry-1.md');
 
@@ -31,7 +31,7 @@ describe('noteCreate with a template path (browser mock)', () => {
     await api.templateCreate(
       'Meeting',
       [{ name: 'project', kind: 'text', default: '', required: false, options: [] }],
-      '# {{title}}\n\n{{var:project}}\n'
+      '# {{ title }}\n\n{{ var.project }}\n'
     );
     const meta = await api.noteCreate('journal/meeting-1.md', 'meeting.md');
     const note = await api.noteRead(meta.path);

@@ -8,7 +8,7 @@ describe('TemplatesScreen (M10.27 Journey A, first-class screen)', () => {
     await api.templateCreate(
       'meeting-notes',
       [{ name: 'project', kind: 'text', default: '', required: false, options: [] }],
-      '# {{title}}\n\n{{var:project}}\n'
+      '# {{ title }}\n\n{{ var.project }}\n'
     );
   });
 
@@ -34,7 +34,7 @@ describe('TemplatesScreen (M10.27 Journey A, first-class screen)', () => {
 
     // The renamed file's content survived the move.
     const body = await api.templateBodyGet('standup-notes.md');
-    expect(body).toContain('{{var:project}}');
+    expect(body).toContain('{{ var.project }}');
   });
 
   it('cancels an in-progress rename on Escape without changing the name', async () => {

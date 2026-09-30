@@ -21,6 +21,7 @@ globset.workspace = true
 redb.workspace = true
 chrono.workspace = true
 rand.workspace = true
+tera.workspace = true
 
 [dev-dependencies]
 proptest = "1.6"

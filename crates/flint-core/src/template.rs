@@ -1,10 +1,9 @@
-//! Note template engine and `.flint/templates/` discovery (M10.26), extended with user variables
-//! and pipe transforms (M10.27).
+//! Note template engine and `.flint/templates/` discovery (M10.26), built on Tera (M10.29).
 //!
-//! Pure logic, no Tauri dependency: `render_template` substitutes `{{date}}`, `{{date:FORMAT}}`,
-//! `{{date+N:FORMAT}}` (date-math), `{{time}}`, `{{title}}`, `{{path}}`, and `{{var:name}}`
-//! (user-declared template variable) placeholders in a template body, each optionally piped
-//! through a small fixed helper table (`{{title|slug}}`, chainable: `{{title|slug|upper}}`).
+//! Pure logic, no Tera-host dependency: [`render_template`] renders a template body with the
+//! `tera` crate (Jinja-like syntax — `{{ title | kebab }}`, `{{ date(offset="+1w") }}`,
+//! `{% for %}`, `{% if var.x == "y" %}`, `{% set %}`), with autoescape off. Any syntax/render
+//! error returns the body unchanged plus a warning ([`render_template_checked`]).
 //! `list_templates` enumerates the plain `.md` files a workspace keeps under
 //! `.flint/templates/` — a workspace-portable directory, not hidden inside `.flint.db`, so
 //! templates travel with the notes. [`resolve_variables`] implements the explicit > folder >
@@ -46,16 +45,16 @@ pub struct TemplateContext {
     pub title: String,
     /// The new note's workspace-relative POSIX path.
     pub path: String,
-    /// The moment the note is being created, used for `{{date}}`/`{{date:FORMAT}}`/`{{time}}`.
+    /// The moment the note is being created, used by `date()`/`time()` and the `now` variable.
     pub now: DateTime<Local>,
-    /// Resolved `{{var:name}}` values (M10.27) — already precedence-resolved by
+    /// Resolved `var.name` values (M10.27) — already precedence-resolved by
     /// [`resolve_variables`]; the renderer never itself consults folder/global scope.
     pub variables: HashMap<String, String>,
     /// Template path (relative to `.flint/templates/`) — the scope of `seq`/`nestseq` counters.
     pub template: Option<String>,
-    /// Counter store; `None` leaves `seq`/`nestseq`/`regexseq` placeholders verbatim.
+    /// Counter store; `None` makes `seq`/`nestseq`/`regexseq` raise a render error (→ fallback).
     pub sequences: Option<Arc<dyn SequenceStore>>,
-    /// Cross-note lookups; `None` leaves the lookup placeholders verbatim.
+    /// Cross-note lookups; `None` makes the lookup functions raise a render error (→ fallback).
     pub lookup: Option<Arc<dyn NoteLookup>>,
 }
 
@@ -279,189 +278,299 @@ fn relative_path(from_dir: &str, to: &str) -> String {
     parts.join("/")
 }
 
-fn eval_placeholder(
-    name: &str,
-    offset: Option<&str>,
-    modifier: Option<&str>,
-    ctx: &TemplateContext,
-) -> Option<String> {
-    let dated = |ctx: &TemplateContext| -> Option<DateTime<Local>> {
-        match offset {
-            Some(o) => shift_date(ctx.now, o),
-            None => Some(ctx.now),
+// ---------------------------------------------------------------------------------------------
+// Tera engine (M10.29)
+// ---------------------------------------------------------------------------------------------
+
+/// The result of a checked render: the output text plus, when the template could not be rendered,
+/// a human-readable reason. On failure `text` is the original body, unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderOutcome {
+    pub text: String,
+    pub warning: Option<String>,
+}
+
+type Args = HashMap<String, tera::Value>;
+
+fn arg_str(args: &Args, name: &str) -> Option<String> {
+    args.get(name).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+fn req_str(args: &Args, fn_name: &str, name: &str) -> tera::Result<String> {
+    arg_str(args, name)
+        .ok_or_else(|| tera::Error::msg(format!("`{fn_name}` needs a string `{name}` argument")))
+}
+
+fn req_uint(args: &Args, fn_name: &str, name: &str) -> tera::Result<usize> {
+    args.get(name)
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .ok_or_else(|| tera::Error::msg(format!("`{fn_name}` needs a numeric `{name}` argument")))
+}
+
+/// Flatten a Tera error and its causes into one line.
+fn error_chain(err: &tera::Error) -> String {
+    use std::error::Error;
+    let mut msg = err.to_string();
+    let mut src = err.source();
+    while let Some(e) = src {
+        msg.push_str(": ");
+        msg.push_str(&e.to_string());
+        src = e.source();
+    }
+    msg
+}
+
+/// Register a string→string filter backed by [`apply_transform`]. `arg` names the (optional)
+/// keyword argument passed through as the transform's single `:` argument.
+fn register_text_filter(
+    tera: &mut tera::Tera,
+    name: &'static str,
+    transform: &'static str,
+    arg: Option<&'static str>,
+) {
+    tera.register_filter(
+        name,
+        move |value: &tera::Value, args: &Args| -> tera::Result<tera::Value> {
+            let text = match value {
+                tera::Value::String(s) => s.clone(),
+                tera::Value::Null => String::new(),
+                other => other.to_string(),
+            };
+            let arg_text = match arg {
+                Some(a) => match args.get(a) {
+                    Some(tera::Value::String(s)) => Some(s.clone()),
+                    Some(v) if !v.is_null() => Some(v.to_string()),
+                    _ => return Err(tera::Error::msg(format!("filter `{name}` needs `{a}=`"))),
+                },
+                None => None,
+            };
+            let argv: Vec<&str> = arg_text.iter().map(String::as_str).collect();
+            Ok(tera::Value::String(apply_transform(
+                transform, &argv, &text,
+            )))
+        },
+    );
+}
+
+fn build_tera(ctx: &TemplateContext) -> tera::Tera {
+    let mut tera = tera::Tera::default();
+    tera.autoescape_on(vec![]);
+
+    // Filters. `upper`/`lower`/`trim`/`replace`/`default` stay Tera's built-ins; the rest reuse
+    // `template_gen::apply_transform` so behaviour matches the M10.27 helper table.
+    for (name, transform) in [
+        ("slugify", "slug"),
+        ("kebab", "kebab"),
+        ("snake", "snake"),
+        ("titlecase", "titlecase"),
+        ("capitalize", "capitalize"),
+        ("initials", "initials"),
+        ("wordcount", "wordcount"),
+        ("charcount", "charcount"),
+    ] {
+        register_text_filter(&mut tera, name, transform, None);
+    }
+    register_text_filter(&mut tera, "pad", "pad", Some("width"));
+    // Overrides Tera's built-in `truncate`, which appends an ellipsis.
+    register_text_filter(&mut tera, "truncate", "truncate", Some("length"));
+
+    // Date functions.
+    let now = ctx.now;
+    let shifted = move |args: &Args| -> tera::Result<DateTime<Local>> {
+        match arg_str(args, "offset") {
+            Some(o) if !o.is_empty() => shift_date(now, &o)
+                .ok_or_else(|| tera::Error::msg(format!("unusable date offset `{o}`"))),
+            _ => Ok(now),
         }
     };
-    // Only the date-family names accept an offset.
-    if offset.is_some() && !matches!(name, "date" | "weekday" | "quarter" | "isoweek") {
-        return None;
-    }
-    let scope = ctx.template.as_deref().unwrap_or("");
-    match name {
-        "date" => Some(format_date_tokens(
-            &dated(ctx)?,
-            modifier.unwrap_or(DEFAULT_DATE_TOKENS),
-        )),
-        "time" => Some(format_date_tokens(&ctx.now, "HH:mm")),
-        "weekday" => Some(weekday_name(&dated(ctx)?).to_string()),
-        "quarter" => Some(quarter_label(&dated(ctx)?)),
-        "isoweek" => Some(iso_week_label(&dated(ctx)?)),
-        "title" => Some(ctx.title.clone()),
-        "path" => Some(ctx.path.clone()),
-        "var" => modifier.and_then(|v| ctx.variables.get(v).cloned()),
-        "uuid" => Some(uuid_v4()),
-        "parentfolder" => Some(ctx.folder().rsplit('/').next().unwrap_or("").to_string()),
-        "workspacename" => Some(ctx.lookup.as_ref()?.workspace_name()),
-        "relativepath" => Some(relative_path(ctx.folder(), modifier?.trim())),
-        "linkto" => {
-            let target = modifier?.trim();
-            let title = ctx.lookup.as_ref()?.title(target)?;
-            Some(format!(
-                "[{title}]({})",
-                relative_path(ctx.folder(), target)
-            ))
+    tera.register_function("date", move |args: &Args| {
+        let fmt = arg_str(args, "fmt").unwrap_or_else(|| DEFAULT_DATE_TOKENS.to_string());
+        Ok(format_date_tokens(&shifted(args)?, &fmt).into())
+    });
+    tera.register_function("time", move |args: &Args| {
+        let fmt = arg_str(args, "fmt").unwrap_or_else(|| "HH:mm".to_string());
+        Ok(format_date_tokens(&now, &fmt).into())
+    });
+    tera.register_function("weekday", move |args: &Args| {
+        Ok(weekday_name(&shifted(args)?).into())
+    });
+    tera.register_function("quarter", move |args: &Args| {
+        Ok(quarter_label(&shifted(args)?).into())
+    });
+    tera.register_function("isoweek", move |args: &Args| {
+        Ok(iso_week_label(&shifted(args)?).into())
+    });
+    tera.register_function("uuid", |_: &Args| Ok(uuid_v4().into()));
+    tera.register_function("regex", |args: &Args| {
+        let pattern = req_str(args, "regex", "pattern")?;
+        Pattern::parse(&pattern)
+            .map(|p| p.generate().into())
+            .ok_or_else(|| tera::Error::msg(format!("unsupported regex pattern `{pattern}`")))
+    });
+
+    // Path / lookup functions.
+    let folder = ctx.folder().to_string();
+    let parent = folder.rsplit('/').next().unwrap_or("").to_string();
+    tera.register_function("parentfolder", move |_: &Args| Ok(parent.clone().into()));
+    let lookup = ctx.lookup.clone();
+    tera.register_function("workspacename", {
+        let lookup = lookup.clone();
+        move |_: &Args| match &lookup {
+            Some(l) => Ok(l.workspace_name().into()),
+            None => Err(tera::Error::msg("`workspacename` needs a workspace")),
         }
-        "frontmatter" => {
-            let (target, key) = modifier?.split_once('#')?;
-            ctx.lookup.as_ref()?.frontmatter(target.trim(), key.trim())
+    });
+    tera.register_function("relativepath", {
+        let folder = folder.clone();
+        move |args: &Args| {
+            let to = req_str(args, "relativepath", "to")?;
+            Ok(relative_path(&folder, to.trim()).into())
         }
-        "regex" => Some(Pattern::parse(modifier?)?.generate()),
-        "regexseq" => {
-            let pattern = modifier?;
-            let parsed = Pattern::parse(pattern)?;
-            let store = ctx.sequences.as_ref()?;
-            let path = store.advance(&format!("regexseq:{scope}:{pattern}"), 1, 0)?;
-            parsed.sequence(*path.first()?)
+    });
+    tera.register_function("linkto", {
+        let (lookup, folder) = (lookup.clone(), folder.clone());
+        move |args: &Args| {
+            let target = req_str(args, "linkto", "path")?;
+            let target = target.trim();
+            let l = lookup
+                .as_ref()
+                .ok_or_else(|| tera::Error::msg("`linkto` needs a workspace"))?;
+            let title = l
+                .title(target)
+                .ok_or_else(|| tera::Error::msg(format!("no note at `{target}`")))?;
+            Ok(format!("[{title}]({})", relative_path(&folder, target)).into())
         }
-        // `{{seq:PREFIX[:WIDTH[:folder]]}}`
-        "seq" => {
-            let mut parts = modifier?.split(':');
-            let prefix = parts.next()?;
-            let width: usize = match parts.next() {
-                Some(w) if !w.is_empty() => w.parse().ok()?,
-                _ => 0,
-            };
-            let folder_scoped = match parts.next() {
-                None => false,
-                Some("folder") => true,
-                Some(_) => return None,
-            };
+    });
+    tera.register_function("frontmatter", {
+        let lookup = lookup.clone();
+        move |args: &Args| {
+            let path = req_str(args, "frontmatter", "path")?;
+            let key = req_str(args, "frontmatter", "key")?;
+            let l = lookup
+                .as_ref()
+                .ok_or_else(|| tera::Error::msg("`frontmatter` needs a workspace"))?;
+            l.frontmatter(path.trim(), key.trim())
+                .map(Into::into)
+                .ok_or_else(|| tera::Error::msg(format!("no `{key}` field in `{path}`")))
+        }
+    });
+
+    // Stateful sequence functions. Each validates its arguments *before* touching the store, so a
+    // rejected call never consumes a number.
+    let scope = ctx.template.clone().unwrap_or_default();
+    let store = ctx.sequences.clone();
+    let no_store = || tera::Error::msg("sequences are unavailable here (no counter store)");
+    tera.register_function("seq", {
+        let (store, scope, folder) = (store.clone(), scope.clone(), folder.clone());
+        move |args: &Args| {
+            let prefix = req_str(args, "seq", "prefix")?;
+            let width = args.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let folder_scoped = args
+                .get("folder")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let key = if folder_scoped {
-                format!("seq:{scope}@{}:{prefix}", ctx.folder())
+                format!("seq:{scope}@{folder}:{prefix}")
             } else {
                 format!("seq:{scope}:{prefix}")
             };
-            let n = *ctx.sequences.as_ref()?.advance(&key, 1, 0)?.first()?;
-            Some(format!("{prefix}{n:0width$}"))
+            let store = store.as_ref().ok_or_else(no_store)?;
+            let n = store
+                .advance(&key, 1, 0)
+                .and_then(|p| p.first().copied())
+                .ok_or_else(|| tera::Error::msg("could not advance the counter"))?;
+            Ok(format!("{prefix}{n:0width$}").into())
         }
-        // `{{nestseq:LEVELS[:BUMP]}}` — BUMP is the 1-based level to increment (default: last).
-        "nestseq" => {
-            let mut parts = modifier?.split(':');
-            let levels: usize = parts.next()?.trim().parse().ok()?;
+    });
+    tera.register_function("nestseq", {
+        let (store, scope) = (store.clone(), scope.clone());
+        move |args: &Args| {
+            let levels = req_uint(args, "nestseq", "levels")?;
             if !(1..=8).contains(&levels) {
-                return None;
+                return Err(tera::Error::msg("`nestseq` levels must be 1–8"));
             }
-            let bump: usize = match parts.next() {
-                Some(b) => b.trim().parse::<usize>().ok()?.checked_sub(1)?,
+            // `bump` is the 1-based level to increment (default: the last).
+            let bump = match args.get("bump") {
+                Some(_) => req_uint(args, "nestseq", "bump")?
+                    .checked_sub(1)
+                    .ok_or_else(|| tera::Error::msg("`nestseq` bump is 1-based"))?,
                 None => levels - 1,
             };
             if bump >= levels {
-                return None;
+                return Err(tera::Error::msg("`nestseq` bump exceeds levels"));
             }
-            let path = ctx.sequences.as_ref()?.advance(
-                &format!("nestseq:{scope}:{levels}"),
-                levels,
-                bump,
-            )?;
-            Some(format_path(&path))
+            let store = store.as_ref().ok_or_else(no_store)?;
+            let path = store
+                .advance(&format!("nestseq:{scope}:{levels}"), levels, bump)
+                .ok_or_else(|| tera::Error::msg("could not advance the counter"))?;
+            Ok(format_path(&path).into())
         }
-        _ => None,
+    });
+    tera.register_function("regexseq", {
+        let (store, scope) = (store, scope);
+        move |args: &Args| {
+            let pattern = req_str(args, "regexseq", "pattern")?;
+            let parsed = Pattern::parse(&pattern).ok_or_else(|| {
+                tera::Error::msg(format!("unsupported regex pattern `{pattern}`"))
+            })?;
+            let store = store.as_ref().ok_or_else(no_store)?;
+            let n = store
+                .advance(&format!("regexseq:{scope}:{pattern}"), 1, 0)
+                .and_then(|p| p.first().copied())
+                .ok_or_else(|| tera::Error::msg("could not advance the counter"))?;
+            parsed
+                .sequence(n)
+                .map(Into::into)
+                .ok_or_else(|| tera::Error::msg("regexseq counter overflowed its pattern"))
+        }
+    });
+
+    tera
+}
+
+fn build_context(ctx: &TemplateContext) -> tera::Context {
+    let mut c = tera::Context::new();
+    c.insert("title", &ctx.title);
+    c.insert("path", &ctx.path);
+    c.insert("folder", ctx.folder());
+    c.insert("var", &ctx.variables);
+    c.insert(
+        "now",
+        &serde_json::json!({
+            "year": ctx.now.year(),
+            "month": ctx.now.month(),
+            "day": ctx.now.day(),
+            "hour": ctx.now.hour(),
+            "minute": ctx.now.minute(),
+            "second": ctx.now.second(),
+            "date": format_date_tokens(&ctx.now, DEFAULT_DATE_TOKENS),
+        }),
+    );
+    c
+}
+
+/// Render `body` against `ctx` with Tera (Jinja-like: `{{ expr }}`, `{% for %}`, `{% if %}`,
+/// `{% set %}`, `{# comments #}`, filters via `|`). Autoescape is off (Markdown, not HTML). On any
+/// syntax or render error the original body is returned unchanged with a warning — a typo never
+/// blocks note creation or drops content, and never panics.
+pub fn render_template_checked(body: &str, ctx: &TemplateContext) -> RenderOutcome {
+    let mut tera = build_tera(ctx);
+    match tera.render_str(body, &build_context(ctx)) {
+        Ok(text) => RenderOutcome {
+            text,
+            warning: None,
+        },
+        Err(e) => RenderOutcome {
+            text: body.to_string(),
+            warning: Some(error_chain(&e)),
+        },
     }
 }
 
-/// Evaluate one `{{...}}` body (without the braces); `None` means "leave verbatim".
-fn eval_span(inner: &str, ctx: &TemplateContext) -> Option<String> {
-    let mut segments = inner.split('|');
-    let head = segments.next()?.trim();
-    let name_end = head
-        .find(|c: char| !c.is_ascii_alphabetic())
-        .unwrap_or(head.len());
-    let name = &head[..name_end];
-    if name.is_empty() {
-        return None;
-    }
-    let mut rest = &head[name_end..];
-    let mut offset = None;
-    if rest.starts_with(['+', '-']) {
-        let end = rest[1..]
-            .find(|c: char| !c.is_ascii_alphanumeric())
-            .map(|i| i + 1)
-            .unwrap_or(rest.len());
-        offset = Some(&rest[..end]);
-        rest = &rest[end..];
-    }
-    let modifier = match rest {
-        "" => None,
-        r if r.starts_with(':') => Some(&r[1..]),
-        _ => return None,
-    };
-    let mut value = eval_placeholder(name, offset, modifier, ctx)?;
-    for seg in segments {
-        let mut args = seg.split(':');
-        let fn_name = args.next().unwrap_or("").trim();
-        if fn_name.is_empty() || !fn_name.chars().all(|c| c.is_ascii_alphabetic()) {
-            return None;
-        }
-        let args: Vec<&str> = args.collect();
-        value = apply_transform(fn_name, &args, &value);
-    }
-    Some(value)
-}
-
-/// Render placeholders in `body` against `ctx`: `{{date}}`, `{{date:FORMAT}}`,
-/// `{{date+N[d|w|mo|y]:FORMAT}}`, `{{time}}`, `{{weekday}}`, `{{quarter}}`, `{{isoweek}}`,
-/// `{{title}}`, `{{path}}`, `{{var:name}}`, the sequence generators (`seq`, `nestseq`, `regex`,
-/// `regexseq`), and the lookups (`parentfolder`, `relativepath`, `linkto`, `frontmatter`,
-/// `workspacename`, `uuid`), each optionally chained through `|fn[:arg]` pipe transforms. Any other
-/// `{{...}}` span (unknown name, unusable arguments, missing store/lookup, or malformed syntax) is
-/// left in the output exactly as written: this function never panics and never drops content.
+/// [`render_template_checked`] without the warning, for callers with nowhere to show one.
 pub fn render_template(body: &str, ctx: &TemplateContext) -> String {
-    let mut out = String::with_capacity(body.len());
-    let mut rest = body;
-    while let Some(start) = rest.find("{{") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        // Find the closing `}}`, tolerating balanced inner braces (`REQ-\d{3}`).
-        let mut depth = 0usize;
-        let mut close = None;
-        let bytes = after.as_bytes();
-        for (i, &b) in bytes.iter().enumerate() {
-            match b {
-                b'{' => depth += 1,
-                b'}' if depth > 0 => depth -= 1,
-                b'}' if bytes.get(i + 1) == Some(&b'}') => {
-                    close = Some(i);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        match close {
-            Some(i) => {
-                let inner = &after[..i];
-                match eval_span(inner, ctx) {
-                    Some(v) => out.push_str(&v),
-                    None => out.push_str(&rest[start..start + 2 + i + 2]),
-                }
-                rest = &after[i + 2..];
-            }
-            None => {
-                out.push_str("{{");
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+    render_template_checked(body, ctx).text
 }
 
 /// Enumerate every `.md`/`.markdown` file under `<workspace-root>/.flint/templates/`, recursively,
@@ -552,7 +661,7 @@ mod tests {
     #[test]
     fn title_and_path_substitute() {
         let out = render_template(
-            "# {{title}}\n\nSaved at {{path}}\n",
+            "# {{ title }}\n\nSaved at {{ path }}\n",
             &ctx_at(2026, 9, 28, 8, 5, 0),
         );
         assert_eq!(out, "# My Title\n\nSaved at folder/note.md\n");
@@ -560,43 +669,49 @@ mod tests {
 
     #[test]
     fn repeated_placeholder_substitutes_every_occurrence() {
-        let out = render_template("{{title}} / {{title}}", &ctx_at(2026, 9, 28, 8, 5, 0));
+        let out = render_template("{{ title }} / {{ title }}", &ctx_at(2026, 9, 28, 8, 5, 0));
         assert_eq!(out, "My Title / My Title");
     }
 
     #[test]
     fn bare_date_uses_default_format() {
-        let out = render_template("{{date}}", &ctx_at(2026, 1, 5, 8, 5, 0));
+        let out = render_template("{{ date() }}", &ctx_at(2026, 1, 5, 8, 5, 0));
         assert_eq!(out, "2026-01-05");
     }
 
     #[test]
     fn custom_date_format_applies() {
-        let out = render_template("{{date:DD/MM/YYYY}}", &ctx_at(2026, 1, 5, 8, 5, 0));
+        let out = render_template(
+            "{{ date(fmt=\"DD/MM/YYYY\") }}",
+            &ctx_at(2026, 1, 5, 8, 5, 0),
+        );
         assert_eq!(out, "05/01/2026");
     }
 
     #[test]
     fn time_placeholder_renders_zero_padded() {
-        let out = render_template("{{time}}", &ctx_at(2026, 1, 5, 8, 5, 9));
+        let out = render_template("{{ time() }}", &ctx_at(2026, 1, 5, 8, 5, 9));
         assert_eq!(out, "08:05");
     }
 
     #[test]
-    fn unknown_placeholder_left_verbatim() {
-        let out = render_template("{{nope}}", &ctx_at(2026, 9, 28, 8, 5, 0));
-        assert_eq!(out, "{{nope}}");
+    fn unknown_variable_falls_back_with_warning() {
+        let out = render_template_checked("{{ nope }}", &ctx_at(2026, 9, 28, 8, 5, 0));
+        assert_eq!(out.text, "{{ nope }}");
+        assert!(out.warning.is_some());
     }
 
     #[test]
-    fn malformed_placeholder_left_verbatim() {
-        let out = render_template("{{ }} {{date", &ctx_at(2026, 9, 28, 8, 5, 0));
-        assert_eq!(out, "{{ }} {{date");
+    fn malformed_template_falls_back_with_warning() {
+        let body = "{{ }} {{ date";
+        let out = render_template_checked(body, &ctx_at(2026, 9, 28, 8, 5, 0));
+        assert_eq!(out.text, body);
+        assert!(out.warning.is_some());
     }
 
     #[test]
     fn unrecognized_date_token_passes_through() {
-        let out = render_template("{{date:QQQQ}}", &ctx_at(2026, 9, 28, 8, 5, 0));
+        let out = render_template(r#"{{ date(fmt="QQQQ") }}"#, &ctx_at(2026, 9, 28, 8, 5, 0));
         assert_eq!(out, "QQQQ");
     }
 
@@ -610,28 +725,40 @@ mod tests {
     fn slug_pipe_transforms_title() {
         let mut ctx = ctx_at(2026, 9, 28, 8, 5, 0);
         ctx.title = "My Cool Title!".to_string();
-        assert_eq!(render_template("{{title|slug}}", &ctx), "my-cool-title");
+        assert_eq!(
+            render_template("{{ title | slugify }}", &ctx),
+            "my-cool-title"
+        );
     }
 
     #[test]
     fn upper_and_lower_pipes() {
         let ctx = ctx_at(2026, 9, 28, 8, 5, 0);
-        assert_eq!(render_template("{{title|upper}}", &ctx), "MY TITLE");
-        assert_eq!(render_template("{{title|lower}}", &ctx), "my title");
+        assert_eq!(render_template("{{ title | upper }}", &ctx), "MY TITLE");
+        assert_eq!(render_template("{{ title | lower }}", &ctx), "my title");
     }
 
     #[test]
     fn chained_pipes_apply_in_order() {
         let mut ctx = ctx_at(2026, 9, 28, 8, 5, 0);
         ctx.title = "  Hello World  ".to_string();
-        assert_eq!(render_template("{{title|trim|slug}}", &ctx), "hello-world");
+        assert_eq!(
+            render_template("{{ title | trim | slugify }}", &ctx),
+            "hello-world"
+        );
     }
 
     #[test]
     fn date_offset_adds_days() {
         let ctx = ctx_at(2026, 1, 5, 8, 5, 0);
-        assert_eq!(render_template("{{date+7:YYYY-MM-DD}}", &ctx), "2026-01-12");
-        assert_eq!(render_template("{{date-5:YYYY-MM-DD}}", &ctx), "2025-12-31");
+        assert_eq!(
+            render_template("{{ date(offset=\"+7\") }}", &ctx),
+            "2026-01-12"
+        );
+        assert_eq!(
+            render_template("{{ date(offset=\"-5\") }}", &ctx),
+            "2025-12-31"
+        );
     }
 
     #[test]
@@ -639,13 +766,19 @@ mod tests {
         let mut ctx = ctx_at(2026, 9, 28, 8, 5, 0);
         ctx.variables
             .insert("project".to_string(), "Flint".to_string());
-        assert_eq!(render_template("{{var:project}}", &ctx), "Flint");
+        assert_eq!(render_template("{{ var.project }}", &ctx), "Flint");
     }
 
     #[test]
-    fn var_placeholder_missing_from_context_left_verbatim() {
+    fn var_missing_from_context_falls_back() {
         let ctx = ctx_at(2026, 9, 28, 8, 5, 0);
-        assert_eq!(render_template("{{var:unknown}}", &ctx), "{{var:unknown}}");
+        let out = render_template_checked("{{ var.unknown }}", &ctx);
+        assert_eq!(out.text, "{{ var.unknown }}");
+        assert!(out.warning.is_some());
+        assert_eq!(
+            render_template(r#"{{ var.unknown | default(value="none") }}"#, &ctx),
+            "none"
+        );
     }
 
     #[test]
@@ -653,7 +786,10 @@ mod tests {
         let mut ctx = ctx_at(2026, 9, 28, 8, 5, 0);
         ctx.variables
             .insert("project".to_string(), "Acme Corp".to_string());
-        assert_eq!(render_template("{{var:project|slug}}", &ctx), "acme-corp");
+        assert_eq!(
+            render_template("{{ var.project | slugify }}", &ctx),
+            "acme-corp"
+        );
     }
 
     #[test]
@@ -754,8 +890,8 @@ mod tests {
         let dir = tempdir().unwrap();
         let templates = dir.path().join(".flint/templates");
         std::fs::create_dir_all(templates.join("sub")).unwrap();
-        std::fs::write(templates.join("zeta.md"), "# {{title}}").unwrap();
-        std::fs::write(templates.join("sub/alpha.md"), "# {{title}}").unwrap();
+        std::fs::write(templates.join("zeta.md"), "# {{ title }}").unwrap();
+        std::fs::write(templates.join("sub/alpha.md"), "# {{ title }}").unwrap();
         std::fs::write(templates.join("ignore.txt"), "nope").unwrap();
 
         let found = list_templates(dir.path());
@@ -789,15 +925,21 @@ mod tests {
     #[test]
     fn new_pipes_via_render() {
         let ctx = ctx_at(2026, 9, 28, 8, 5, 0);
-        assert_eq!(render_template("{{title|truncate:2}}", &ctx), "My");
         assert_eq!(
-            render_template("{{title|replace:My:Your}}", &ctx),
+            render_template("{{ title | truncate(length=2) }}", &ctx),
+            "My"
+        );
+        assert_eq!(
+            render_template("{{ title | replace(from=\"My\", to=\"Your\") }}", &ctx),
             "Your Title"
         );
-        assert_eq!(render_template("{{title|kebab|upper}}", &ctx), "MY-TITLE");
         assert_eq!(
-            render_template("{{var:x|default:none}}", &ctx),
-            "{{var:x|default:none}}"
+            render_template("{{ title | kebab | upper }}", &ctx),
+            "MY-TITLE"
+        );
+        assert_eq!(
+            render_template(r#"{{ var.x | default(value="none") }}"#, &ctx),
+            "none"
         );
     }
 
@@ -805,24 +947,26 @@ mod tests {
     fn date_units_and_calendar() {
         let ctx = ctx_at(2026, 1, 31, 8, 5, 0);
         assert_eq!(
-            render_template("{{date+2w:YYYY-MM-DD}}", &ctx),
+            render_template("{{ date(offset=\"+2w\") }}", &ctx),
             "2026-02-14"
         );
         assert_eq!(
-            render_template("{{date-1mo:YYYY-MM-DD}}", &ctx),
+            render_template("{{ date(offset=\"-1mo\") }}", &ctx),
             "2025-12-31"
         );
         assert_eq!(
-            render_template("{{weekday}} {{quarter}} {{isoweek}}", &ctx),
+            render_template("{{ weekday() }} {{ quarter() }} {{ isoweek() }}", &ctx),
             "Saturday Q1 W05"
         );
-        assert_eq!(render_template("{{date+1zz}}", &ctx), "{{date+1zz}}");
+        let bad = render_template_checked(r#"{{ date(offset="+1zz") }}"#, &ctx);
+        assert_eq!(bad.text, r#"{{ date(offset="+1zz") }}"#);
+        assert!(bad.warning.is_some());
     }
 
     #[test]
     fn seq_persists_across_restart_and_notes() {
         let dir = tempdir().unwrap();
-        let body = "{{seq:T:4}}";
+        let body = r#"{{ seq(prefix="T", width=4) }}"#;
         assert_eq!(render_template(body, &seq_ctx(dir.path())), "T0001");
         assert_eq!(render_template(body, &seq_ctx(dir.path())), "T0002");
         // "Restart": brand-new store/context over the same .flint.db.
@@ -839,44 +983,62 @@ mod tests {
         a.path = "one/x.md".into();
         let mut b = seq_ctx(dir.path());
         b.path = "two/x.md".into();
-        assert_eq!(render_template("{{seq:F:2:folder}}", &a), "F01");
-        assert_eq!(render_template("{{seq:F:2:folder}}", &a), "F02");
-        assert_eq!(render_template("{{seq:F:2:folder}}", &b), "F01");
+        assert_eq!(
+            render_template(r#"{{ seq(prefix="F", width=2, folder=true) }}"#, &a),
+            "F01"
+        );
+        assert_eq!(
+            render_template(r#"{{ seq(prefix="F", width=2, folder=true) }}"#, &a),
+            "F02"
+        );
+        assert_eq!(
+            render_template(r#"{{ seq(prefix="F", width=2, folder=true) }}"#, &b),
+            "F01"
+        );
     }
 
     #[test]
     fn nestseq_resets_children_and_survives_restart() {
         let dir = tempdir().unwrap();
         let r = |b: &str| render_template(b, &seq_ctx(dir.path()));
-        assert_eq!(r("T{{nestseq:3}}"), "T01.01.01");
-        assert_eq!(r("T{{nestseq:3}}"), "T01.01.02");
-        assert_eq!(r("{{nestseq:3:2}}"), "01.02.01");
-        assert_eq!(r("{{nestseq:3}}"), "01.02.02");
-        assert_eq!(r("{{nestseq:3:1}}"), "02.01.01");
-        assert_eq!(r("{{nestseq:9}}"), "{{nestseq:9}}");
+        assert_eq!(r("T{{ nestseq(levels=3) }}"), "T01.01.01");
+        assert_eq!(r("T{{ nestseq(levels=3) }}"), "T01.01.02");
+        assert_eq!(r("{{ nestseq(levels=3, bump=2) }}"), "01.02.01");
+        assert_eq!(r("{{ nestseq(levels=3) }}"), "01.02.02");
+        assert_eq!(r("{{ nestseq(levels=3, bump=1) }}"), "02.01.01");
+        assert_eq!(r("{{ nestseq(levels=9) }}"), "{{ nestseq(levels=9) }}");
     }
 
     #[test]
     fn regexseq_increments_and_regex_matches() {
         let dir = tempdir().unwrap();
         let r = |b: &str| render_template(b, &seq_ctx(dir.path()));
-        assert_eq!(r(r"{{regexseq:REQ-\d{3}}}"), "REQ-001");
-        assert_eq!(r(r"{{regexseq:REQ-\d{3}}}"), "REQ-002");
-        let out = r(r"{{regex:[A-Z]{2}-\d{3}}}");
+        assert_eq!(r(r#"{{ regexseq(pattern="REQ-\d{3}") }}"#), "REQ-001");
+        assert_eq!(r(r#"{{ regexseq(pattern="REQ-\d{3}") }}"#), "REQ-002");
+        let out = r(r#"{{ regex(pattern="[A-Z]{2}-\d{3}") }}"#);
         assert!(
             regex::Regex::new(r"^[A-Z]{2}-\d{3}$")
                 .unwrap()
                 .is_match(&out),
             "{out}"
         );
-        assert_eq!(r("{{regex:a+}}"), "{{regex:a+}}");
+        assert_eq!(
+            r(r#"{{ regex(pattern="a+") }}"#),
+            r#"{{ regex(pattern="a+") }}"#
+        );
     }
 
     #[test]
-    fn sequences_without_store_left_verbatim() {
+    fn sequences_without_store_fall_back() {
         let ctx = ctx_at(2026, 9, 28, 8, 5, 0);
-        assert_eq!(render_template("{{seq:T:4}}", &ctx), "{{seq:T:4}}");
-        assert_eq!(render_template("{{nestseq:3}}", &ctx), "{{nestseq:3}}");
+        let body = r#"{{ seq(prefix="T", width=4) }}"#;
+        let out = render_template_checked(body, &ctx);
+        assert_eq!(out.text, body);
+        assert!(out.warning.is_some());
+        assert_eq!(
+            render_template("{{ nestseq(levels=3) }}", &ctx),
+            "{{ nestseq(levels=3) }}"
+        );
     }
 
     #[test]
@@ -884,29 +1046,123 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut ctx = seq_ctx(dir.path());
         ctx.path = "projects/x/new.md".into();
-        assert_eq!(render_template("{{parentfolder}}", &ctx), "x");
-        assert_eq!(render_template("{{workspacename}}", &ctx), "ws");
+        assert_eq!(render_template("{{ parentfolder() }}", &ctx), "x");
+        assert_eq!(render_template("{{ workspacename() }}", &ctx), "ws");
         assert_eq!(
-            render_template("{{relativepath:notes/a.md}}", &ctx),
+            render_template(r#"{{ relativepath(to="notes/a.md") }}"#, &ctx),
             "../../notes/a.md"
         );
         assert_eq!(
-            render_template("{{linkto:notes/a.md}}", &ctx),
+            render_template(r#"{{ linkto(path="notes/a.md") }}"#, &ctx),
             "[Alpha](../../notes/a.md)"
         );
         assert_eq!(
-            render_template("{{linkto:nope.md}}", &ctx),
-            "{{linkto:nope.md}}"
+            render_template(r#"{{ linkto(path="nope.md") }}"#, &ctx),
+            r#"{{ linkto(path="nope.md") }}"#
         );
         assert_eq!(
-            render_template("{{frontmatter:notes/a.md#status}}", &ctx),
+            render_template(
+                r#"{{ frontmatter(path="notes/a.md", key="status") }}"#,
+                &ctx
+            ),
             "draft"
         );
-        assert_eq!(render_template("{{uuid}}", &ctx).len(), 36);
+        assert_eq!(render_template("{{ uuid() }}", &ctx).len(), 36);
         let bare = ctx_at(2026, 9, 28, 8, 5, 0);
         assert_eq!(
-            render_template("{{workspacename}}", &bare),
-            "{{workspacename}}"
+            render_template("{{ workspacename() }}", &bare),
+            "{{ workspacename() }}"
         );
+    }
+
+    #[test]
+    fn for_loop_with_seq_is_monotonic() {
+        let dir = tempdir().unwrap();
+        let body = r#"{% for i in range(end=3) %}{{ seq(prefix="T", width=3) }} {% endfor %}"#;
+        assert_eq!(
+            render_template(body, &seq_ctx(dir.path())),
+            "T001 T002 T003 "
+        );
+        assert_eq!(
+            render_template(body, &seq_ctx(dir.path())),
+            "T004 T005 T006 "
+        );
+    }
+
+    #[test]
+    fn if_on_declared_variable_and_set_and_comment() {
+        let mut ctx = ctx_at(2026, 9, 28, 8, 5, 0);
+        ctx.variables.insert("priority".into(), "High".into());
+        let body = r#"{# hidden #}{% set who = "me" %}{% if var.priority == "High" %}urgent {{ who }}{% else %}later{% endif %}"#;
+        assert_eq!(render_template(body, &ctx), "urgent me");
+        ctx.variables.insert("priority".into(), "Low".into());
+        assert_eq!(render_template(body, &ctx), "later");
+    }
+
+    #[test]
+    fn autoescape_is_off() {
+        let mut ctx = ctx_at(2026, 9, 28, 8, 5, 0);
+        ctx.title = "a < b & c".into();
+        assert_eq!(render_template("{{ title }}", &ctx), "a < b & c");
+    }
+
+    #[test]
+    fn unknown_filter_and_function_fall_back() {
+        let ctx = ctx_at(2026, 9, 28, 8, 5, 0);
+        for body in ["{{ title | nofilter }}", "{{ nofunc() }}", "{% for %}"] {
+            let out = render_template_checked(body, &ctx);
+            assert_eq!(out.text, body);
+            assert!(out.warning.is_some(), "{body}");
+        }
+    }
+
+    #[test]
+    fn failed_render_does_not_consume_counter() {
+        let dir = tempdir().unwrap();
+        // The bad call comes after a good `seq`: the whole render falls back, but a later clean
+        // render must still see the counter only where a render succeeded far enough to advance.
+        let bad = render_template_checked(r#"{{ nestseq(levels=9) }}"#, &seq_ctx(dir.path()));
+        assert!(bad.warning.is_some());
+        assert_eq!(
+            render_template("{{ nestseq(levels=3) }}", &seq_ctx(dir.path())),
+            "01.01.01"
+        );
+    }
+
+    #[test]
+    fn path_pattern_seq_without_store_keeps_raw_pattern() {
+        let dir = tempdir().unwrap();
+        // Path-pattern renders attach no store, so the counter must not move.
+        let path_ctx = ctx_at(2026, 9, 28, 8, 5, 0).with_template(Some("proj.md".into()));
+        let pat = r#"daily/{{ seq(prefix="T") }}.md"#;
+        let out = render_template_checked(pat, &path_ctx);
+        assert_eq!(out.text, pat);
+        assert!(out.warning.is_some());
+        assert_eq!(
+            render_template(r#"{{ seq(prefix="T") }}"#, &seq_ctx(dir.path())),
+            "T1"
+        );
+    }
+
+    #[test]
+    fn nestseq_survives_restart_via_tera() {
+        let dir = tempdir().unwrap();
+        assert_eq!(
+            render_template("{{ nestseq(levels=2) }}", &seq_ctx(dir.path())),
+            "01.01"
+        );
+        assert_eq!(
+            render_template("{{ nestseq(levels=2) }}", &seq_ctx(dir.path())),
+            "01.02"
+        );
+    }
+
+    #[test]
+    fn filters_pad_wordcount_initials() {
+        let ctx = ctx_at(2026, 9, 28, 8, 5, 0);
+        assert_eq!(render_template("{{ 7 | pad(width=3) }}", &ctx), "007");
+        assert_eq!(render_template("{{ title | wordcount }}", &ctx), "2");
+        assert_eq!(render_template("{{ title | initials }}", &ctx), "MT");
+        assert_eq!(render_template("{{ title | snake }}", &ctx), "my_title");
     }
 }

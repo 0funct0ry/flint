@@ -1,12 +1,12 @@
 import { Completion, CompletionContext, CompletionResult } from '@codemirror/autocomplete';
 import { EditorView } from '@codemirror/view';
 
-/** The fixed set of pipe transforms `render_template` understands (M10.27 follow-up) — kept in
- * sync with `flint_core::template`'s transform table by hand, the same way this file's sibling
- * completion source (`linkCompletionSource` in `CenterPane.tsx`) mirrors backend behavior rather
- * than importing it (there is no shared TS/Rust schema in this codebase). */
-const PIPE_FUNCTIONS = [
-  'slug',
+/** Filters `render_template` (Tera, M10.29) understands — the built-ins Flint keeps plus the ones
+ * it registers from `flint_core::template_gen`. Kept in sync with Rust by hand, the same way this
+ * file's sibling completion source (`linkCompletionSource` in `CenterPane.tsx`) mirrors backend
+ * behavior rather than importing it (there is no shared TS/Rust schema in this codebase). */
+const FILTERS = [
+  'slugify',
   'upper',
   'lower',
   'trim',
@@ -19,8 +19,24 @@ const PIPE_FUNCTIONS = [
   'charcount',
 ];
 
-/** Pipes that take arguments: accepting one leaves the cursor after the `:` ready for the value. */
-const PIPE_FUNCTIONS_WITH_ARGS = ['truncate:', 'pad:', 'replace:', 'default:'];
+/** Filters that take keyword arguments: accepting one leaves the cursor inside the parentheses. */
+const FILTERS_WITH_ARGS: { label: string; apply: string; cursorOffsetFromEnd: number }[] = [
+  { label: 'truncate(length=N)', apply: 'truncate(length=)', cursorOffsetFromEnd: 1 },
+  { label: 'pad(width=N)', apply: 'pad(width=)', cursorOffsetFromEnd: 1 },
+  { label: 'replace(from, to)', apply: 'replace(from="", to="")', cursorOffsetFromEnd: 9 },
+  { label: 'default(value)', apply: 'default(value="")', cursorOffsetFromEnd: 2 },
+];
+
+/** Statement keywords offered after `{%`. */
+const STATEMENTS: { label: string; apply: string; detail: string }[] = [
+  { label: 'for', apply: 'for i in range(end=3) %}', detail: 'loop' },
+  { label: 'endfor', apply: 'endfor %}', detail: 'close a loop' },
+  { label: 'if', apply: 'if  %}', detail: 'conditional' },
+  { label: 'elif', apply: 'elif  %}', detail: 'else-if branch' },
+  { label: 'else', apply: 'else %}', detail: 'else branch' },
+  { label: 'endif', apply: 'endif %}', detail: 'close a conditional' },
+  { label: 'set', apply: 'set  = ', detail: 'assign a local' },
+];
 
 /** Insert `text` in place of the completed range, then move the cursor to `text.length -
  * cursorOffsetFromEnd`. Used for `date:FORMAT`, where accepting the completion should leave the
@@ -35,112 +51,95 @@ function applyAndPlaceCursor(text: string, cursorOffsetFromEnd: number) {
 }
 
 /**
- * Autocomplete for template placeholders, following the exact structural pattern
+ * Autocomplete for Tera template syntax (M10.29), following the structural pattern
  * `linkCompletionSource` (`CenterPane.tsx`) uses: a manual regex match against the text before the
- * cursor rather than `autocompletion`'s built-in trigger-char config, so multiple distinct trigger
- * shapes can be checked in one source with an explicit priority order.
- *
- * Two trigger shapes, both scoped to *inside* an unclosed `{{...}}` span (checked via `openBrace`
- * below so this never fires on ordinary `{`/`|` text elsewhere in the body):
- * - `{{` (optionally with a partially-typed name) → `date`/`date:FORMAT`/`time`/`title`/`path`/
- *   `var:<declared variable>`, each closing the span with `}}` on accept (except `date:FORMAT`,
- *   which leaves the cursor positioned to type the format).
- * - `|` right after a placeholder name inside `{{...}}` → the fixed pipe-function list, left open
- *   (no forced `}}`) so a chained `|anotherFn` or a manually-typed `}}` both stay easy.
+ * cursor. Three trigger shapes, each scoped to *inside* an unclosed span on the current line:
+ * - `{{ ` → variables (`title`, `path`, `folder`, `var.<declared>`) and functions (`date()`, `seq()`, …)
+ * - `|` inside `{{ … }}` → filters
+ * - `{%` → statements (`for`/`if`/`set`/`end…`)
  */
 export function createTemplatePlaceholderCompletionSource(getVariableNames: () => string[]) {
   return (context: CompletionContext): CompletionResult | null => {
     const line = context.state.doc.lineAt(context.pos);
     const lineBefore = line.text.slice(0, context.pos - line.from);
 
-    // Is the cursor inside an unclosed `{{...}}` span on this line? (A `}}` after the last `{{`
-    // would mean the span already closed before the cursor.)
+    // `{% keyword` — open statement (no closing `%}` yet).
+    const stmtOpen = lineBefore.lastIndexOf('{%');
+    if (stmtOpen !== -1 && !lineBefore.slice(stmtOpen).includes('%}')) {
+      const m = /^\{%-?\s*(\w*)$/.exec(lineBefore.slice(stmtOpen));
+      if (!m) return null;
+      const from = context.pos - m[1].length;
+      return {
+        from,
+        options: STATEMENTS.map((st) => ({
+          label: st.label,
+          detail: st.detail,
+          type: 'keyword',
+          apply: st.apply,
+        })),
+      };
+    }
+
     const openBrace = lineBefore.lastIndexOf('{{');
     if (openBrace === -1) return null;
     const insideSpan = lineBefore.slice(openBrace + 2);
     if (insideSpan.includes('}}')) return null;
 
-    const pipeMatch = /\|(\w*)$/.exec(insideSpan);
+    const pipeMatch = /\|\s*(\w*)$/.exec(insideSpan);
     if (pipeMatch) {
-      const typed = pipeMatch[1];
-      const from = context.pos - typed.length;
+      const from = context.pos - pipeMatch[1].length;
       return {
         from,
         options: [
-          ...PIPE_FUNCTIONS.map((fn) => ({
-            label: fn,
+          ...FILTERS.map((fn) => ({ label: fn, type: 'function', apply: fn })),
+          ...FILTERS_WITH_ARGS.map((f) => ({
+            label: f.label,
             type: 'function',
-            apply: fn,
-          })),
-          ...PIPE_FUNCTIONS_WITH_ARGS.map((fn) => ({
-            label: `${fn}ARG`,
-            type: 'function',
-            apply: fn,
+            apply: applyAndPlaceCursor(f.apply, f.cursorOffsetFromEnd),
           })),
         ],
       };
     }
 
-    // Only offer the placeholder-name list when nothing but the name itself has been typed so far
-    // (no `|` or `:` yet) — once a modifier/pipe has started, name completion no longer applies.
-    const nameMatch = /^(\w*)$/.exec(insideSpan);
+    // Name completion only while the identifier itself is being typed (`var.pri` included).
+    const nameMatch = /^\s*([\w.]*)$/.exec(insideSpan);
     if (!nameMatch) return null;
-    const typed = nameMatch[1];
-    const from = context.pos - typed.length;
+    const from = context.pos - nameMatch[1].length;
 
     const variableOptions = getVariableNames().map((name) => ({
-      label: `var:${name}`,
+      label: `var.${name}`,
       detail: 'declared variable',
       type: 'variable',
-      apply: `var:${name}}}`,
+      apply: `var.${name} }}`,
     }));
+    const fn = (label: string, detail: string, args: string, cursorBack: number) => ({
+      label: `${label}()`,
+      detail,
+      type: 'function',
+      apply: applyAndPlaceCursor(`${label}(${args}) }}`, cursorBack),
+    });
 
     return {
       from,
       options: [
-        { label: 'title', detail: "the note's title", type: 'keyword', apply: 'title}}' },
-        { label: 'path', detail: "the note's workspace-relative path", type: 'keyword', apply: 'path}}' },
-        { label: 'date', detail: 'today, YYYY-MM-DD', type: 'keyword', apply: 'date}}' },
-        {
-          label: 'date:FORMAT',
-          detail: 'e.g. DD/MM/YYYY',
-          type: 'keyword',
-          apply: applyAndPlaceCursor('date:}}', 2),
-        },
-        { label: 'time', detail: 'HH:mm', type: 'keyword', apply: 'time}}' },
-        { label: 'weekday', detail: 'e.g. Monday', type: 'keyword', apply: 'weekday}}' },
-        { label: 'quarter', detail: 'e.g. Q3', type: 'keyword', apply: 'quarter}}' },
-        { label: 'isoweek', detail: 'e.g. W40', type: 'keyword', apply: 'isoweek}}' },
-        { label: 'uuid', detail: 'random UUID', type: 'keyword', apply: 'uuid}}' },
-        { label: 'parentfolder', detail: "the note's folder name", type: 'keyword', apply: 'parentfolder}}' },
-        { label: 'workspacename', detail: 'workspace directory name', type: 'keyword', apply: 'workspacename}}' },
-        {
-          label: 'seq:PREFIX:WIDTH',
-          detail: 'auto-increment, e.g. T0001',
-          type: 'keyword',
-          apply: applyAndPlaceCursor('seq::4}}', 5),
-        },
-        {
-          label: 'nestseq:LEVELS',
-          detail: 'nested counter, e.g. 01.01.02',
-          type: 'keyword',
-          apply: applyAndPlaceCursor('nestseq:3}}', 3),
-        },
-        {
-          label: 'regex:PATTERN',
-          detail: 'random ID, e.g. [A-Z]{2}\\d{3}',
-          type: 'keyword',
-          apply: applyAndPlaceCursor('regex:}}', 2),
-        },
-        {
-          label: 'regexseq:PATTERN',
-          detail: 'sequential ID, e.g. REQ-\\d{3}',
-          type: 'keyword',
-          apply: applyAndPlaceCursor('regexseq:}}', 2),
-        },
-        { label: 'linkto:PATH', detail: 'link to another note', type: 'keyword', apply: applyAndPlaceCursor('linkto:}}', 2) },
-        { label: 'relativepath:PATH', detail: 'relative path to a note', type: 'keyword', apply: applyAndPlaceCursor('relativepath:}}', 2) },
-        { label: 'frontmatter:PATH#KEY', detail: "another note's field", type: 'keyword', apply: applyAndPlaceCursor('frontmatter:}}', 2) },
+        { label: 'title', detail: "the note's title", type: 'keyword', apply: 'title }}' },
+        { label: 'path', detail: "the note's workspace-relative path", type: 'keyword', apply: 'path }}' },
+        { label: 'folder', detail: "the note's folder path", type: 'keyword', apply: 'folder }}' },
+        fn('date', 'today; offset="+2w", fmt="YYYY-MM-DD"', '', 4),
+        fn('time', 'HH:mm', '', 4),
+        fn('weekday', 'e.g. Monday', '', 4),
+        fn('quarter', 'e.g. Q3', '', 4),
+        fn('isoweek', 'e.g. W40', '', 4),
+        fn('uuid', 'random UUID', '', 4),
+        fn('parentfolder', "the note's folder name", '', 4),
+        fn('workspacename', 'workspace directory name', '', 4),
+        fn('seq', 'auto-increment, e.g. T0001', 'prefix="", width=4', 14),
+        fn('nestseq', 'nested counter, e.g. 01.01.02', 'levels=3', 5),
+        fn('regex', 'random ID, e.g. [A-Z]{2}\\d{3}', 'pattern=""', 5),
+        fn('regexseq', 'sequential ID, e.g. REQ-\\d{3}', 'pattern=""', 5),
+        fn('linkto', 'link to another note', 'path=""', 5),
+        fn('relativepath', 'relative path to a note', 'to=""', 5),
+        fn('frontmatter', "another note's field", 'path="", key=""', 13),
         ...variableOptions,
       ],
     };

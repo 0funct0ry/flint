@@ -31,9 +31,9 @@ export interface TemplatesScreenProps {
 }
 
 /** A brand-new template starts with just a title heading — no per-variable placeholder lines are
- * auto-generated into the body anymore; the user adds `{{var:...}}` references themselves, with
+ * auto-generated into the body anymore; the user adds `{{ var.name }}` references themselves, with
  * the body editor's completion helping them do it. */
-const DEFAULT_NEW_TEMPLATE_BODY = '# {{title}}\n\n';
+const DEFAULT_NEW_TEMPLATE_BODY = '# {{ title }}\n\n';
 
 type EditorState =
   | { mode: 'create' }

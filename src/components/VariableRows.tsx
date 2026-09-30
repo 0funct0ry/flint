@@ -17,6 +17,47 @@ function emptyVariable(): TemplateVariableDef {
   return { name: '', kind: 'text', default: '', required: false, options: [] };
 }
 
+const parseOptions = (text: string): string[] =>
+  text
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+
+/** Comma-separated options field. Keeps the raw text locally so typing `,` or a space isn't
+ * stripped by re-deriving the value from the parsed list on every keystroke. */
+const OptionsInput: React.FC<{
+  ariaLabel: string;
+  options: string[];
+  onChange: (options: string[]) => void;
+}> = ({ ariaLabel, options, onChange }) => {
+  const [text, setText] = React.useState(options.join(', '));
+  // Re-sync only when the options changed from outside (not from our own typing).
+  React.useEffect(() => {
+    const current = parseOptions(text);
+    if (current.length !== options.length || current.some((o, i) => o !== options[i])) {
+      setText(options.join(', '));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [options]);
+
+  return (
+    <input
+      aria-label={ariaLabel}
+      value={text}
+      placeholder="option a, option b"
+      onChange={(e) => {
+        setText(e.target.value);
+        onChange(parseOptions(e.target.value));
+      }}
+      autoComplete="off"
+      autoCorrect="off"
+      autoCapitalize="off"
+      spellCheck={false}
+      className="flex-1 min-w-[120px] text-[12px] px-2 py-1 text-[var(--text)] bg-[var(--canvas)] border border-[var(--border)] rounded-[4px]"
+    />
+  );
+};
+
 /**
  * Repeatable name/type/default/required row list for a template's variable schema (M10.27
  * Journey A) — shared by `TemplateEditorModal` and reused, visually, by folder/global scope
@@ -63,23 +104,10 @@ export const VariableRows: React.FC<VariableRowsProps> = ({ variables, onChange 
             ))}
           </select>
           {v.kind === 'choice' ? (
-            <input
-              aria-label={`Variable ${i + 1} options`}
-              value={v.options.join(', ')}
-              placeholder="option a, option b"
-              onChange={(e) =>
-                update(i, {
-                  options: e.target.value
-                    .split(',')
-                    .map((o) => o.trim())
-                    .filter(Boolean),
-                })
-              }
-              autoComplete="off"
-              autoCorrect="off"
-              autoCapitalize="off"
-              spellCheck={false}
-              className="flex-1 min-w-[120px] text-[12px] px-2 py-1 text-[var(--text)] bg-[var(--canvas)] border border-[var(--border)] rounded-[4px]"
+            <OptionsInput
+              ariaLabel={`Variable ${i + 1} options`}
+              options={v.options}
+              onChange={(options) => update(i, { options })}
             />
           ) : v.kind === 'bool' ? (
             <label className="flex items-center gap-1 text-[12px] text-[var(--muted)]">

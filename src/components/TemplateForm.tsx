@@ -98,10 +98,12 @@ export const TemplateForm: React.FC<TemplateFormProps> = ({
 
       <div className="flex-1 min-h-0 flex flex-col gap-1.5 px-4 pt-1 pb-3">
         <span className="text-[11.5px] text-[var(--muted)]">
-          Body — type <code>{'{{'}</code> for placeholders (
-          <code>title</code>, <code>path</code>, <code>date</code>, <code>date:FORMAT</code>,{' '}
-          <code>time</code>, declared variables) and <code>|</code> inside one for a transform (
-          <code>slug</code>, <code>upper</code>, <code>lower</code>, <code>trim</code>).
+          Body — type <code>{'{{'}</code> for variables (<code>title</code>, <code>path</code>,{' '}
+          <code>var.name</code>) and functions (<code>date()</code>, <code>time()</code>,{' '}
+          <code>seq()</code>), <code>|</code> for filters (<code>kebab</code>, <code>upper</code>,{' '}
+          <code>slugify</code>), and <code>{'{%'}</code> for <code>for</code>/<code>if</code>/
+          <code>set</code> blocks. If a template has an error, it is used as written and you are
+          warned.
         </span>
         <TemplateBodyEditor
           initialValue={initialBody}

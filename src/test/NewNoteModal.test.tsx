@@ -9,7 +9,7 @@ describe('NewNoteModal (M10.27 Journey B)', () => {
     await api.templateCreate(
       'Client Note',
       [{ name: 'client', kind: 'text', default: '', required: true, options: [] }],
-      '# {{title}}\n\n## {{var:client}}\n\n'
+      '# {{ title }}\n\n## {{ var.client }}\n\n'
     );
   });
 

@@ -13,9 +13,9 @@ pub use config::{
 pub use render::{render_note_markdown, RenderResult};
 pub use template::{
     list_templates, missing_required_variables, parse_template_variables, render_template,
-    resolve_variables, serialize_template_variables, NoteLookup, SequenceStore, TemplateContext,
-    TemplateMeta, TemplateVariableDef, TemplateVariableKind, TEMPLATES_DIR,
-    TEMPLATE_VARIABLES_FIELD,
+    render_template_checked, resolve_variables, serialize_template_variables, NoteLookup,
+    RenderOutcome, SequenceStore, TemplateContext, TemplateMeta, TemplateVariableDef,
+    TemplateVariableKind, TEMPLATES_DIR, TEMPLATE_VARIABLES_FIELD,
 };
 
 use serde::{Deserialize, Serialize};

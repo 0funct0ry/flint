@@ -11,6 +11,7 @@ import {
   NameHit,
   NoteContent,
   NoteMeta,
+  CreatedNote,
   RenameResult,
   TagRenameResult,
   RenderResult,
@@ -26,7 +27,7 @@ import {
 } from "../types";
 import { FIXTURE_NOTES } from "../fixtures/workspace";
 import { renderMarkdownToHtml, slugify, dedupSlug } from "./markdown";
-import { parseFrontMatter, setFrontMatterFields, setBody } from "./frontmatter";
+import { parseFrontMatter, setFrontMatterFields } from "./frontmatter";
 
 export const isTauriEnvironment = (): boolean => {
   return typeof window !== "undefined" && Boolean((window as any).__TAURI_INTERNALS__);
@@ -79,12 +80,12 @@ const DEFAULT_CONFIG: FlintConfig = {
   },
   newNote: {
     targetFolder: null,
-    filenamePattern: "{{title}}",
+    filenamePattern: "{{ title }}",
     insertHeading: false,
   },
   dailyNotes: {
     enabled: false,
-    pathPattern: "daily/{{date:YYYY-MM-DD}}.md",
+    pathPattern: "daily/{{ date(fmt=\"YYYY-MM-DD\") }}.md",
     template: null,
   },
   ignore: ["node_modules/**", ".obsidian/**"],
@@ -94,22 +95,44 @@ const DEFAULT_CONFIG: FlintConfig = {
 // Browser dev/test mock for `.flint/templates/` (M10.26) — mirrors the `flint init` seed so the
 // picker and settings dropdowns have something non-empty to show outside the real Tauri app.
 const browserMockTemplates: Record<string, string> = {
-  "daily.md": "# {{date}}\n\n## Notes\n\n## Tasks\n\n- [ ] \n",
+  "daily.md": "# {{ date() }}\n\n## Notes\n\n## Tasks\n\n- [ ] \n",
 };
 
 // Browser dev/test mock for folder-scoped template variables (M10.27 Journey C), keyed by
 // workspace-relative folder path (`""` for the workspace root).
 const browserMockFolderVariables: Record<string, Record<string, string>> = {};
 
+/** Mirror of `compose_template` in flint-app: merge the editor text's own front matter with the
+ * hidden `templateVariables` schema (kept first) instead of dropping or duplicating it. */
+function composeMockTemplate(schema: string | undefined, editorText: string): string {
+  const parsed = parseFrontMatter(editorText);
+  const fields: [string, string][] = [];
+  if (schema !== undefined) fields.push(["templateVariables", schema]);
+  fields.push(...parsed.fields.filter(([k]) => k !== "templateVariables"));
+  return fields.length > 0 ? setFrontMatterFields(parsed.body, fields) : parsed.body;
+}
+
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : `${String(n)}`;
 }
 
-/** Minimal mirror of `flint_core::render_template` for the browser mock path — only the default
- * `YYYY-MM-DD`/`HH:mm` formats are supported here; the real formatting lives in Rust. */
-function mockApplyTransform(fn: string, value: string): string {
+/** Minimal mirror of the Tera-based `flint_core::render_template` for the browser mock path —
+ * only `{{ title|path|folder|var.x|date(fmt=…)|time() }}` with the `slugify`/`upper`/`lower`/`trim`
+ * filters; `{% … %}` blocks, sequences and lookups exist only in the Rust engine. Anything the
+ * mock can't evaluate is left as written, like the real engine's fallback. */
+function mockFormatDate(now: Date, fmt: string): string {
+  return fmt
+    .replace(/YYYY/g, String(now.getFullYear()))
+    .replace(/MM/g, pad2(now.getMonth() + 1))
+    .replace(/DD/g, pad2(now.getDate()))
+    .replace(/HH/g, pad2(now.getHours()))
+    .replace(/mm/g, pad2(now.getMinutes()))
+    .replace(/ss/g, pad2(now.getSeconds()));
+}
+
+function mockApplyFilter(fn: string, value: string): string | undefined {
   switch (fn) {
-    case "slug":
+    case "slugify":
       return value
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "-")
@@ -121,7 +144,7 @@ function mockApplyTransform(fn: string, value: string): string {
     case "trim":
       return value.trim();
     default:
-      return value;
+      return undefined;
   }
 }
 
@@ -129,36 +152,29 @@ function mockRenderTemplate(
   body: string,
   ctx: { title: string; path: string; now: Date; variables?: Record<string, string> }
 ): string {
-  const date = `${ctx.now.getFullYear()}-${pad2(ctx.now.getMonth() + 1)}-${pad2(ctx.now.getDate())}`;
-  const time = `${pad2(ctx.now.getHours())}:${pad2(ctx.now.getMinutes())}`;
-  return body.replace(
-    /\{\{\s*([A-Za-z]+)(?::([^}|]*))?((?:\|[A-Za-z]+)*)\s*\}\}/g,
-    (whole, name, modifier, pipes) => {
-      let value: string | undefined;
-      switch (name) {
-        case "date":
-          value = date;
-          break;
-        case "time":
-          value = time;
-          break;
-        case "title":
-          value = ctx.title;
-          break;
-        case "path":
-          value = ctx.path;
-          break;
-        case "var":
-          value = modifier ? ctx.variables?.[modifier] : undefined;
-          break;
-        default:
-          value = undefined;
-      }
-      if (value === undefined) return whole;
-      const fns: string[] = pipes ? pipes.split("|").filter(Boolean) : [];
-      return fns.reduce((v: string, fn: string) => mockApplyTransform(fn, v), value);
+  return body.replace(/\{\{\s*([^{}]+?)\s*\}\}/g, (whole, inner: string) => {
+    const [head, ...filters] = inner.split("|").map((part) => part.trim());
+    let value: string | undefined;
+    const call = /^(date|time)\(\s*(?:fmt\s*=\s*"([^"]*)")?\s*\)$/.exec(head);
+    if (call) {
+      value = mockFormatDate(ctx.now, call[2] ?? (call[1] === "date" ? "YYYY-MM-DD" : "HH:mm"));
+    } else if (head === "title") {
+      value = ctx.title;
+    } else if (head === "path") {
+      value = ctx.path;
+    } else if (head === "folder") {
+      value = ctx.path.includes("/") ? ctx.path.slice(0, ctx.path.lastIndexOf("/")) : "";
+    } else if (head.startsWith("var.")) {
+      value = ctx.variables?.[head.slice(4)];
     }
-  );
+    if (value === undefined) return whole;
+    for (const fn of filters) {
+      const next = mockApplyFilter(fn, value);
+      if (next === undefined) return whole;
+      value = next;
+    }
+    return value;
+  });
 }
 
 const browserMockConfig: FlintConfig = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
@@ -386,11 +402,11 @@ export const api = {
 
   /**
    * `template`, when given, is a path relative to `.flint/templates/` (M10.26) — rendered with
-   * `{{date}}`/`{{time}}`/`{{title}}`/`{{path}}` — not literal content.
+   * Tera syntax (`{{ date() }}`, `{{ title }}`, …) — not literal content.
    */
-  async noteCreate(path: string, template?: string, variables?: Record<string, string>): Promise<NoteMeta> {
+  async noteCreate(path: string, template?: string, variables?: Record<string, string>): Promise<CreatedNote> {
     if (isTauriEnvironment()) {
-      return await invoke<NoteMeta>("note_create", { path, template, variables });
+      return await invoke<CreatedNote>("note_create", { path, template, variables });
     }
 
     const title = path.split("/").pop()?.replace(/\.md$/, "") || "Untitled";
@@ -406,7 +422,7 @@ export const api = {
         .map(([k, v]) => [k, mockRenderTemplate(v, ctx)] as [string, string]);
       if (fields.length > 0) content = setFrontMatterFields(content, fields);
     } else if (browserMockConfig.newNote.insertHeading) {
-      content = mockRenderTemplate("# {{title}}\n", ctx);
+      content = mockRenderTemplate("# {{ title }}\n", ctx);
     } else {
       content = "";
     }
@@ -449,10 +465,7 @@ export const api = {
     }
     const slug = slugify(name);
     const path = `${slug}.md`;
-    const content = setFrontMatterFields(body, [
-      ["templateVariables", JSON.stringify(variables)],
-    ]);
-    browserMockTemplates[path] = content;
+    browserMockTemplates[path] = composeMockTemplate(JSON.stringify(variables), body);
     return { name, path };
   },
 
@@ -494,7 +507,9 @@ export const api = {
       return await invoke<string>("template_body_get", { templatePath });
     }
     const raw = browserMockTemplates[templatePath] ?? "";
-    return parseFrontMatter(raw).body;
+    const parsed = parseFrontMatter(raw);
+    const visible = parsed.fields.filter(([k]) => k !== "templateVariables");
+    return visible.length > 0 ? setFrontMatterFields(parsed.body, visible) : parsed.body;
   },
 
   /** Rewrite only a template file's body, leaving its `templateVariables` front-matter field
@@ -505,7 +520,8 @@ export const api = {
       return;
     }
     const current = browserMockTemplates[templatePath] ?? "";
-    browserMockTemplates[templatePath] = setBody(current, body);
+    const schema = parseFrontMatter(current).fields.find(([k]) => k === "templateVariables")?.[1];
+    browserMockTemplates[templatePath] = composeMockTemplate(schema, body);
   },
 
   /** Server-side precedence resolution for the New Note modal's variable fields (M10.27 Journey
@@ -556,9 +572,9 @@ export const api = {
     offsetDays?: number,
     date?: string,
     variables?: Record<string, string>
-  ): Promise<NoteMeta> {
+  ): Promise<CreatedNote> {
     if (isTauriEnvironment()) {
-      return await invoke<NoteMeta>("daily_note_open", { offsetDays, date, variables });
+      return await invoke<CreatedNote>("daily_note_open", { offsetDays, date, variables });
     }
 
     const target = date ? new Date(`${date}T00:00:00`) : new Date();

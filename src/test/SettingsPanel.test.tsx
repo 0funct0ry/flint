@@ -14,8 +14,8 @@ const baseConfig: FlintConfig = {
   ui: { leftSidebar: 'tree', rightSidebarVisible: true, showNonNoteFiles: false },
   mcp: { enabled: false, port: null, requireAuth: false },
   templates: { defaultTemplate: null },
-  newNote: { targetFolder: null, filenamePattern: '{{title}}', insertHeading: false },
-  dailyNotes: { enabled: false, pathPattern: 'daily/{{date:YYYY-MM-DD}}.md', template: null },
+  newNote: { targetFolder: null, filenamePattern: '{{ title }}', insertHeading: false },
+  dailyNotes: { enabled: false, pathPattern: 'daily/{{ date(fmt="YYYY-MM-DD") }}.md', template: null },
   ignore: ['node_modules/**'],
 };
 
@@ -265,9 +265,9 @@ describe('SettingsPanel', () => {
       renderPanel('Notes & templates');
 
       fireEvent.change(screen.getByLabelText('New note filename pattern'), {
-        target: { value: '{{date}}-{{title}}' },
+        target: { value: '{{ date() }}-{{ title }}' },
       });
-      expect(setField).toHaveBeenCalledWith('newNote.filenamePattern', '{{date}}-{{title}}');
+      expect(setField).toHaveBeenCalledWith('newNote.filenamePattern', '{{ date() }}-{{ title }}');
 
       fireEvent.click(screen.getByLabelText('Insert heading in new notes'));
       expect(setField).toHaveBeenCalledWith('newNote.insertHeading', true);
@@ -281,9 +281,9 @@ describe('SettingsPanel', () => {
       expect(setField).toHaveBeenCalledWith('dailyNotes.enabled', true);
 
       fireEvent.change(screen.getByLabelText('Daily note path pattern'), {
-        target: { value: 'journal/{{date:YYYY/MM/DD}}.md' },
+        target: { value: 'journal/{{ date(fmt="YYYY/MM/DD") }}.md' },
       });
-      expect(setField).toHaveBeenCalledWith('dailyNotes.pathPattern', 'journal/{{date:YYYY/MM/DD}}.md');
+      expect(setField).toHaveBeenCalledWith('dailyNotes.pathPattern', 'journal/{{ date(fmt="YYYY/MM/DD") }}.md');
     });
   });
 });

@@ -65,6 +65,12 @@ export interface NoteMeta {
   tags: string[];
 }
 
+/** A note created/opened from a template (M10.29); `templateWarning` is set when the template
+ * failed to render and the raw body was used instead. */
+export interface CreatedNote extends NoteMeta {
+  templateWarning?: string;
+}
+
 /** Ordered `[key, rawValue]` front-matter pair, preserving source order and raw scalar/flow/block value text. */
 export type FrontMatterField = [string, string];
 

@@ -308,8 +308,8 @@ pub struct NewNoteConfig {
     /// Workspace-relative folder new notes land in; `None` means "the currently open folder".
     #[serde(default)]
     pub target_folder: Option<String>,
-    /// Filename pattern for a new note created without an explicit name, e.g. `"{{title}}"` —
-    /// supports the same `{{date}}`/`{{date:FORMAT}}`/`{{time}}` placeholders as templates.
+    /// Filename pattern for a new note created without an explicit name, e.g. `"{{ title }}"` —
+    /// supports the same Tera syntax as templates (`{{ date() }}`, `{{ time() }}`, …).
     #[serde(default)]
     pub filename_pattern: String,
     /// Insert a `# <title>` heading when the new note's body would otherwise be empty (no
@@ -324,7 +324,7 @@ impl Default for NewNoteConfig {
     fn default() -> Self {
         Self {
             target_folder: None,
-            filename_pattern: "{{title}}".to_string(),
+            filename_pattern: "{{ title }}".to_string(),
             insert_heading: false,
             extra: serde_json::Map::new(),
         }
@@ -339,7 +339,7 @@ impl Default for NewNoteConfig {
 pub struct DailyNotesConfig {
     #[serde(default)]
     pub enabled: bool,
-    /// e.g. `"daily/{{date:YYYY-MM-DD}}.md"` — rendered the same way a template body is.
+    /// e.g. `"daily/{{ date(fmt=\"YYYY-MM-DD\") }}.md"` — rendered the same way a template body is.
     #[serde(default)]
     pub path_pattern: String,
     /// Path under `.flint/templates/`, workspace-relative.
@@ -353,7 +353,7 @@ impl Default for DailyNotesConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            path_pattern: "daily/{{date:YYYY-MM-DD}}.md".to_string(),
+            path_pattern: "daily/{{ date(fmt=\"YYYY-MM-DD\") }}.md".to_string(),
             template: None,
             extra: serde_json::Map::new(),
         }

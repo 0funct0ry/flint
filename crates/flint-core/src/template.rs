@@ -10,16 +10,37 @@
 //! templates travel with the notes. [`resolve_variables`] implements the explicit > folder >
 //! global > schema-default precedence chain (M10.27 Journey C) independent of any IPC/State.
 
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, Timelike};
-use regex::Regex;
+use crate::template_gen::{
+    apply_transform, format_path, iso_week_label, quarter_label, shift_date, uuid_v4, weekday_name,
+    Pattern,
+};
+use chrono::{DateTime, Datelike, Local, Timelike};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// The subdirectory (workspace-relative) that holds template files.
 pub const TEMPLATES_DIR: &str = ".flint/templates";
 
+/// Persistent counter state behind the sequence generators (M10.27). Implemented over `.flint.db`
+/// by [`crate::config::RedbSequenceStore`]; the renderer itself stays pure.
+pub trait SequenceStore: Send + Sync {
+    /// Atomically advance the counter-path stored under `key`: increment level `bump` (0-based)
+    /// and reset deeper levels to 1 (see [`crate::template_gen::advance_path`]). Returns the new
+    /// path, or `None` if the store could not be read/written.
+    fn advance(&self, key: &str, levels: usize, bump: usize) -> Option<Vec<u64>>;
+}
+
+/// Read-only cross-note lookups (M10.27), implemented by the host over its index and the existing
+/// title / front-matter readers. Paths are workspace-relative POSIX.
+pub trait NoteLookup: Send + Sync {
+    fn title(&self, path: &str) -> Option<String>;
+    fn frontmatter(&self, path: &str, key: &str) -> Option<String>;
+    fn workspace_name(&self) -> String;
+}
+
 /// Everything a template placeholder can reference when rendering a new note's initial content.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TemplateContext {
     /// The new note's title (derived from its filename stem unless overridden by the caller).
     pub title: String,
@@ -30,6 +51,24 @@ pub struct TemplateContext {
     /// Resolved `{{var:name}}` values (M10.27) — already precedence-resolved by
     /// [`resolve_variables`]; the renderer never itself consults folder/global scope.
     pub variables: HashMap<String, String>,
+    /// Template path (relative to `.flint/templates/`) — the scope of `seq`/`nestseq` counters.
+    pub template: Option<String>,
+    /// Counter store; `None` leaves `seq`/`nestseq`/`regexseq` placeholders verbatim.
+    pub sequences: Option<Arc<dyn SequenceStore>>,
+    /// Cross-note lookups; `None` leaves the lookup placeholders verbatim.
+    pub lookup: Option<Arc<dyn NoteLookup>>,
+}
+
+impl std::fmt::Debug for TemplateContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TemplateContext")
+            .field("title", &self.title)
+            .field("path", &self.path)
+            .field("now", &self.now)
+            .field("variables", &self.variables)
+            .field("template", &self.template)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TemplateContext {
@@ -39,12 +78,34 @@ impl TemplateContext {
             path: path.into(),
             now: Local::now(),
             variables: HashMap::new(),
+            template: None,
+            sequences: None,
+            lookup: None,
         }
     }
 
     pub fn with_variables(mut self, variables: HashMap<String, String>) -> Self {
         self.variables = variables;
         self
+    }
+
+    pub fn with_template(mut self, template: Option<String>) -> Self {
+        self.template = template;
+        self
+    }
+
+    pub fn with_sequences(mut self, store: Arc<dyn SequenceStore>) -> Self {
+        self.sequences = Some(store);
+        self
+    }
+
+    pub fn with_lookup(mut self, lookup: Arc<dyn NoteLookup>) -> Self {
+        self.lookup = Some(lookup);
+        self
+    }
+
+    fn folder(&self) -> &str {
+        self.path.rsplit_once('/').map(|(d, _)| d).unwrap_or("")
     }
 }
 
@@ -203,73 +264,204 @@ fn format_date_tokens(now: &DateTime<Local>, tokens: &str) -> String {
     out
 }
 
-/// Apply one fixed transform helper (M10.27: `slug`/`upper`/`lower`/`trim`) to `value`. An unknown
-/// helper name is a no-op — passes `value` through unchanged, matching the "unknown things never
-/// drop content" contract the rest of this module follows.
-fn apply_transform(fn_name: &str, value: &str) -> String {
-    match fn_name {
-        "slug" => {
-            let lower = value.to_lowercase();
-            let mut out = String::with_capacity(lower.len());
-            let mut last_was_dash = false;
-            for c in lower.chars() {
-                if c.is_alphanumeric() {
-                    out.push(c);
-                    last_was_dash = false;
-                } else if !last_was_dash && !out.is_empty() {
-                    out.push('-');
-                    last_was_dash = true;
-                }
-            }
-            out.trim_end_matches('-').to_string()
+/// Relative POSIX path from directory `from_dir` to file `to` (both workspace-relative).
+fn relative_path(from_dir: &str, to: &str) -> String {
+    let from: Vec<&str> = from_dir.split('/').filter(|s| !s.is_empty()).collect();
+    let target: Vec<&str> = to.split('/').filter(|s| !s.is_empty()).collect();
+    let common = from
+        .iter()
+        .zip(target.iter())
+        .take_while(|(a, b)| a == b)
+        .count()
+        .min(target.len().saturating_sub(1));
+    let mut parts: Vec<&str> = vec![".."; from.len() - common];
+    parts.extend(&target[common..]);
+    parts.join("/")
+}
+
+fn eval_placeholder(
+    name: &str,
+    offset: Option<&str>,
+    modifier: Option<&str>,
+    ctx: &TemplateContext,
+) -> Option<String> {
+    let dated = |ctx: &TemplateContext| -> Option<DateTime<Local>> {
+        match offset {
+            Some(o) => shift_date(ctx.now, o),
+            None => Some(ctx.now),
         }
-        "upper" => value.to_uppercase(),
-        "lower" => value.to_lowercase(),
-        "trim" => value.trim().to_string(),
-        _ => value.to_string(),
+    };
+    // Only the date-family names accept an offset.
+    if offset.is_some() && !matches!(name, "date" | "weekday" | "quarter" | "isoweek") {
+        return None;
+    }
+    let scope = ctx.template.as_deref().unwrap_or("");
+    match name {
+        "date" => Some(format_date_tokens(
+            &dated(ctx)?,
+            modifier.unwrap_or(DEFAULT_DATE_TOKENS),
+        )),
+        "time" => Some(format_date_tokens(&ctx.now, "HH:mm")),
+        "weekday" => Some(weekday_name(&dated(ctx)?).to_string()),
+        "quarter" => Some(quarter_label(&dated(ctx)?)),
+        "isoweek" => Some(iso_week_label(&dated(ctx)?)),
+        "title" => Some(ctx.title.clone()),
+        "path" => Some(ctx.path.clone()),
+        "var" => modifier.and_then(|v| ctx.variables.get(v).cloned()),
+        "uuid" => Some(uuid_v4()),
+        "parentfolder" => Some(ctx.folder().rsplit('/').next().unwrap_or("").to_string()),
+        "workspacename" => Some(ctx.lookup.as_ref()?.workspace_name()),
+        "relativepath" => Some(relative_path(ctx.folder(), modifier?.trim())),
+        "linkto" => {
+            let target = modifier?.trim();
+            let title = ctx.lookup.as_ref()?.title(target)?;
+            Some(format!(
+                "[{title}]({})",
+                relative_path(ctx.folder(), target)
+            ))
+        }
+        "frontmatter" => {
+            let (target, key) = modifier?.split_once('#')?;
+            ctx.lookup.as_ref()?.frontmatter(target.trim(), key.trim())
+        }
+        "regex" => Some(Pattern::parse(modifier?)?.generate()),
+        "regexseq" => {
+            let pattern = modifier?;
+            let parsed = Pattern::parse(pattern)?;
+            let store = ctx.sequences.as_ref()?;
+            let path = store.advance(&format!("regexseq:{scope}:{pattern}"), 1, 0)?;
+            parsed.sequence(*path.first()?)
+        }
+        // `{{seq:PREFIX[:WIDTH[:folder]]}}`
+        "seq" => {
+            let mut parts = modifier?.split(':');
+            let prefix = parts.next()?;
+            let width: usize = match parts.next() {
+                Some(w) if !w.is_empty() => w.parse().ok()?,
+                _ => 0,
+            };
+            let folder_scoped = match parts.next() {
+                None => false,
+                Some("folder") => true,
+                Some(_) => return None,
+            };
+            let key = if folder_scoped {
+                format!("seq:{scope}@{}:{prefix}", ctx.folder())
+            } else {
+                format!("seq:{scope}:{prefix}")
+            };
+            let n = *ctx.sequences.as_ref()?.advance(&key, 1, 0)?.first()?;
+            Some(format!("{prefix}{n:0width$}"))
+        }
+        // `{{nestseq:LEVELS[:BUMP]}}` — BUMP is the 1-based level to increment (default: last).
+        "nestseq" => {
+            let mut parts = modifier?.split(':');
+            let levels: usize = parts.next()?.trim().parse().ok()?;
+            if !(1..=8).contains(&levels) {
+                return None;
+            }
+            let bump: usize = match parts.next() {
+                Some(b) => b.trim().parse::<usize>().ok()?.checked_sub(1)?,
+                None => levels - 1,
+            };
+            if bump >= levels {
+                return None;
+            }
+            let path = ctx.sequences.as_ref()?.advance(
+                &format!("nestseq:{scope}:{levels}"),
+                levels,
+                bump,
+            )?;
+            Some(format_path(&path))
+        }
+        _ => None,
     }
 }
 
-/// Render `{{date}}`, `{{date:FORMAT}}`, `{{date+N:FORMAT}}`/`{{date-N:FORMAT}}` (date math),
-/// `{{time}}`, `{{title}}`, `{{path}}`, and `{{var:name}}` placeholders in `body` against `ctx`,
-/// each optionally chained through `|fn` pipe transforms (`{{title|slug}}`,
-/// `{{title|slug|upper}}`). Any other `{{...}}` span (unknown name, or malformed — unbalanced
-/// braces, empty name) is left in the output exactly as written: this function never panics and
-/// never drops content.
-pub fn render_template(body: &str, ctx: &TemplateContext) -> String {
-    let re = Regex::new(r"\{\{\s*([A-Za-z]+)([+-]\d+)?(?::([^}|]*))?((?:\|[A-Za-z]+)*)\s*\}\}")
-        .expect("static regex");
-    re.replace_all(body, |caps: &regex::Captures| {
-        let name = &caps[1];
-        let offset = caps.get(2).map(|m| m.as_str());
-        let modifier = caps.get(3).map(|m| m.as_str());
-        let pipes = caps.get(4).map(|m| m.as_str()).unwrap_or("");
-
-        let base: Option<String> = match name {
-            "date" => {
-                let tokens = modifier.unwrap_or(DEFAULT_DATE_TOKENS);
-                let offset_days: i64 = offset.and_then(|o| o.parse().ok()).unwrap_or(0);
-                let shifted = ctx.now + ChronoDuration::days(offset_days);
-                Some(format_date_tokens(&shifted, tokens))
-            }
-            "time" => Some(format_date_tokens(&ctx.now, "HH:mm")),
-            "title" => Some(ctx.title.clone()),
-            "path" => Some(ctx.path.clone()),
-            "var" => modifier.and_then(|var_name| ctx.variables.get(var_name).cloned()),
-            _ => None,
-        };
-
-        match base {
-            Some(mut value) => {
-                for fn_name in pipes.split('|').filter(|s| !s.is_empty()) {
-                    value = apply_transform(fn_name, &value);
-                }
-                value
-            }
-            None => caps[0].to_string(),
+/// Evaluate one `{{...}}` body (without the braces); `None` means "leave verbatim".
+fn eval_span(inner: &str, ctx: &TemplateContext) -> Option<String> {
+    let mut segments = inner.split('|');
+    let head = segments.next()?.trim();
+    let name_end = head
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(head.len());
+    let name = &head[..name_end];
+    if name.is_empty() {
+        return None;
+    }
+    let mut rest = &head[name_end..];
+    let mut offset = None;
+    if rest.starts_with(['+', '-']) {
+        let end = rest[1..]
+            .find(|c: char| !c.is_ascii_alphanumeric())
+            .map(|i| i + 1)
+            .unwrap_or(rest.len());
+        offset = Some(&rest[..end]);
+        rest = &rest[end..];
+    }
+    let modifier = match rest {
+        "" => None,
+        r if r.starts_with(':') => Some(&r[1..]),
+        _ => return None,
+    };
+    let mut value = eval_placeholder(name, offset, modifier, ctx)?;
+    for seg in segments {
+        let mut args = seg.split(':');
+        let fn_name = args.next().unwrap_or("").trim();
+        if fn_name.is_empty() || !fn_name.chars().all(|c| c.is_ascii_alphabetic()) {
+            return None;
         }
-    })
-    .into_owned()
+        let args: Vec<&str> = args.collect();
+        value = apply_transform(fn_name, &args, &value);
+    }
+    Some(value)
+}
+
+/// Render placeholders in `body` against `ctx`: `{{date}}`, `{{date:FORMAT}}`,
+/// `{{date+N[d|w|mo|y]:FORMAT}}`, `{{time}}`, `{{weekday}}`, `{{quarter}}`, `{{isoweek}}`,
+/// `{{title}}`, `{{path}}`, `{{var:name}}`, the sequence generators (`seq`, `nestseq`, `regex`,
+/// `regexseq`), and the lookups (`parentfolder`, `relativepath`, `linkto`, `frontmatter`,
+/// `workspacename`, `uuid`), each optionally chained through `|fn[:arg]` pipe transforms. Any other
+/// `{{...}}` span (unknown name, unusable arguments, missing store/lookup, or malformed syntax) is
+/// left in the output exactly as written: this function never panics and never drops content.
+pub fn render_template(body: &str, ctx: &TemplateContext) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        // Find the closing `}}`, tolerating balanced inner braces (`REQ-\d{3}`).
+        let mut depth = 0usize;
+        let mut close = None;
+        let bytes = after.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' if depth > 0 => depth -= 1,
+                b'}' if bytes.get(i + 1) == Some(&b'}') => {
+                    close = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        match close {
+            Some(i) => {
+                let inner = &after[..i];
+                match eval_span(inner, ctx) {
+                    Some(v) => out.push_str(&v),
+                    None => out.push_str(&rest[start..start + 2 + i + 2]),
+                }
+                rest = &after[i + 2..];
+            }
+            None => {
+                out.push_str("{{");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Enumerate every `.md`/`.markdown` file under `<workspace-root>/.flint/templates/`, recursively,
@@ -327,7 +519,7 @@ mod tests {
             title: "My Title".to_string(),
             path: "folder/note.md".to_string(),
             now: Local.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap(),
-            variables: HashMap::new(),
+            ..TemplateContext::new("", "")
         }
     }
 
@@ -572,5 +764,149 @@ mod tests {
         assert_eq!(found[0].path, "sub/alpha.md");
         assert_eq!(found[1].name, "zeta");
         assert_eq!(found[1].path, "zeta.md");
+    }
+
+    struct FakeLookup;
+    impl NoteLookup for FakeLookup {
+        fn title(&self, path: &str) -> Option<String> {
+            (path == "notes/a.md").then(|| "Alpha".to_string())
+        }
+        fn frontmatter(&self, path: &str, key: &str) -> Option<String> {
+            (path == "notes/a.md" && key == "status").then(|| "draft".to_string())
+        }
+        fn workspace_name(&self) -> String {
+            "ws".to_string()
+        }
+    }
+
+    fn seq_ctx(dir: &Path) -> TemplateContext {
+        ctx_at(2026, 9, 28, 8, 5, 0)
+            .with_template(Some("proj.md".to_string()))
+            .with_sequences(Arc::new(crate::config::RedbSequenceStore::new(dir)))
+            .with_lookup(Arc::new(FakeLookup))
+    }
+
+    #[test]
+    fn new_pipes_via_render() {
+        let ctx = ctx_at(2026, 9, 28, 8, 5, 0);
+        assert_eq!(render_template("{{title|truncate:2}}", &ctx), "My");
+        assert_eq!(
+            render_template("{{title|replace:My:Your}}", &ctx),
+            "Your Title"
+        );
+        assert_eq!(render_template("{{title|kebab|upper}}", &ctx), "MY-TITLE");
+        assert_eq!(
+            render_template("{{var:x|default:none}}", &ctx),
+            "{{var:x|default:none}}"
+        );
+    }
+
+    #[test]
+    fn date_units_and_calendar() {
+        let ctx = ctx_at(2026, 1, 31, 8, 5, 0);
+        assert_eq!(
+            render_template("{{date+2w:YYYY-MM-DD}}", &ctx),
+            "2026-02-14"
+        );
+        assert_eq!(
+            render_template("{{date-1mo:YYYY-MM-DD}}", &ctx),
+            "2025-12-31"
+        );
+        assert_eq!(
+            render_template("{{weekday}} {{quarter}} {{isoweek}}", &ctx),
+            "Saturday Q1 W05"
+        );
+        assert_eq!(render_template("{{date+1zz}}", &ctx), "{{date+1zz}}");
+    }
+
+    #[test]
+    fn seq_persists_across_restart_and_notes() {
+        let dir = tempdir().unwrap();
+        let body = "{{seq:T:4}}";
+        assert_eq!(render_template(body, &seq_ctx(dir.path())), "T0001");
+        assert_eq!(render_template(body, &seq_ctx(dir.path())), "T0002");
+        // "Restart": brand-new store/context over the same .flint.db.
+        assert_eq!(render_template(body, &seq_ctx(dir.path())), "T0003");
+        // Different template scope is independent.
+        let other = seq_ctx(dir.path()).with_template(Some("other.md".into()));
+        assert_eq!(render_template(body, &other), "T0001");
+    }
+
+    #[test]
+    fn seq_folder_scope_is_separate() {
+        let dir = tempdir().unwrap();
+        let mut a = seq_ctx(dir.path());
+        a.path = "one/x.md".into();
+        let mut b = seq_ctx(dir.path());
+        b.path = "two/x.md".into();
+        assert_eq!(render_template("{{seq:F:2:folder}}", &a), "F01");
+        assert_eq!(render_template("{{seq:F:2:folder}}", &a), "F02");
+        assert_eq!(render_template("{{seq:F:2:folder}}", &b), "F01");
+    }
+
+    #[test]
+    fn nestseq_resets_children_and_survives_restart() {
+        let dir = tempdir().unwrap();
+        let r = |b: &str| render_template(b, &seq_ctx(dir.path()));
+        assert_eq!(r("T{{nestseq:3}}"), "T01.01.01");
+        assert_eq!(r("T{{nestseq:3}}"), "T01.01.02");
+        assert_eq!(r("{{nestseq:3:2}}"), "01.02.01");
+        assert_eq!(r("{{nestseq:3}}"), "01.02.02");
+        assert_eq!(r("{{nestseq:3:1}}"), "02.01.01");
+        assert_eq!(r("{{nestseq:9}}"), "{{nestseq:9}}");
+    }
+
+    #[test]
+    fn regexseq_increments_and_regex_matches() {
+        let dir = tempdir().unwrap();
+        let r = |b: &str| render_template(b, &seq_ctx(dir.path()));
+        assert_eq!(r(r"{{regexseq:REQ-\d{3}}}"), "REQ-001");
+        assert_eq!(r(r"{{regexseq:REQ-\d{3}}}"), "REQ-002");
+        let out = r(r"{{regex:[A-Z]{2}-\d{3}}}");
+        assert!(
+            regex::Regex::new(r"^[A-Z]{2}-\d{3}$")
+                .unwrap()
+                .is_match(&out),
+            "{out}"
+        );
+        assert_eq!(r("{{regex:a+}}"), "{{regex:a+}}");
+    }
+
+    #[test]
+    fn sequences_without_store_left_verbatim() {
+        let ctx = ctx_at(2026, 9, 28, 8, 5, 0);
+        assert_eq!(render_template("{{seq:T:4}}", &ctx), "{{seq:T:4}}");
+        assert_eq!(render_template("{{nestseq:3}}", &ctx), "{{nestseq:3}}");
+    }
+
+    #[test]
+    fn lookups() {
+        let dir = tempdir().unwrap();
+        let mut ctx = seq_ctx(dir.path());
+        ctx.path = "projects/x/new.md".into();
+        assert_eq!(render_template("{{parentfolder}}", &ctx), "x");
+        assert_eq!(render_template("{{workspacename}}", &ctx), "ws");
+        assert_eq!(
+            render_template("{{relativepath:notes/a.md}}", &ctx),
+            "../../notes/a.md"
+        );
+        assert_eq!(
+            render_template("{{linkto:notes/a.md}}", &ctx),
+            "[Alpha](../../notes/a.md)"
+        );
+        assert_eq!(
+            render_template("{{linkto:nope.md}}", &ctx),
+            "{{linkto:nope.md}}"
+        );
+        assert_eq!(
+            render_template("{{frontmatter:notes/a.md#status}}", &ctx),
+            "draft"
+        );
+        assert_eq!(render_template("{{uuid}}", &ctx).len(), 36);
+        let bare = ctx_at(2026, 9, 28, 8, 5, 0);
+        assert_eq!(
+            render_template("{{workspacename}}", &bare),
+            "{{workspacename}}"
+        );
     }
 }

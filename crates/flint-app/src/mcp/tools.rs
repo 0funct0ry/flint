@@ -529,6 +529,7 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
                 path: String::new(),
                 now: target_dt,
                 variables: HashMap::new(),
+                ..flint_core::TemplateContext::new("", "")
             };
             let rendered_path = flint_core::render_template(&cfg.path_pattern, &path_ctx);
             let safe = resolve(ctx.root, &rendered_path)?;
@@ -545,7 +546,9 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
                 path: posix.clone(),
                 now: target_dt,
                 variables: HashMap::new(),
+                ..flint_core::TemplateContext::new("", "")
             };
+            let note_ctx = crate::with_generators(note_ctx, ctx.root, cfg.template.as_deref());
             let content = match cfg.template.as_deref() {
                 Some(name) => {
                     let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, name);

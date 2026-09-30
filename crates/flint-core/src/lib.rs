@@ -6,12 +6,16 @@ pub mod config;
 pub mod md_extensions;
 pub mod render;
 pub mod template;
-pub use config::{config_get, config_reset, config_set, validate_ignore_patterns};
+pub mod template_gen;
+pub use config::{
+    config_get, config_reset, config_set, validate_ignore_patterns, RedbSequenceStore,
+};
 pub use render::{render_note_markdown, RenderResult};
 pub use template::{
     list_templates, missing_required_variables, parse_template_variables, render_template,
-    resolve_variables, serialize_template_variables, TemplateContext, TemplateMeta,
-    TemplateVariableDef, TemplateVariableKind, TEMPLATES_DIR, TEMPLATE_VARIABLES_FIELD,
+    resolve_variables, serialize_template_variables, NoteLookup, SequenceStore, TemplateContext,
+    TemplateMeta, TemplateVariableDef, TemplateVariableKind, TEMPLATES_DIR,
+    TEMPLATE_VARIABLES_FIELD,
 };
 
 use serde::{Deserialize, Serialize};

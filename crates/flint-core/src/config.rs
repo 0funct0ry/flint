@@ -778,6 +778,46 @@ const CONFIG_TABLE: TableDefinition<&str, &str> = TableDefinition::new("config")
 const MCP_AUTH_TABLE: TableDefinition<&str, &str> = TableDefinition::new("mcp_auth");
 const MCP_AUTH_TOKEN_KEY: &str = "token";
 
+/// The `sequences` table (M10.27): one row per sequence key (`seq:<template>:<prefix>`,
+/// `nestseq:<template>:<levels>`, `regexseq:...`), value is the JSON counter-path (`[3]`,
+/// `[1,2,5]`). Kept apart from `config` so a config reset never rewinds a counter.
+const SEQ_TABLE: TableDefinition<&str, &str> = TableDefinition::new("sequences");
+
+/// [`crate::template::SequenceStore`] over a workspace's `.flint.db`. Each `advance` is one redb
+/// write transaction, so counters are monotonic across notes and survive restarts.
+pub struct RedbSequenceStore {
+    root: PathBuf,
+}
+
+impl RedbSequenceStore {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+}
+
+impl crate::template::SequenceStore for RedbSequenceStore {
+    fn advance(&self, key: &str, levels: usize, bump: usize) -> Option<Vec<u64>> {
+        let db = open_db(&self.root).ok()?;
+        let txn = db.begin_write().ok()?;
+        let next;
+        {
+            let mut table = txn.open_table(SEQ_TABLE).ok()?;
+            let current: Vec<u64> = table
+                .get(key)
+                .ok()?
+                .and_then(|v| serde_json::from_str(v.value()).ok())
+                .unwrap_or_default();
+            next = crate::template_gen::advance_path(&current, levels, bump);
+            let raw = serde_json::to_string(&next).ok()?;
+            table.insert(key, raw.as_str()).ok()?;
+        }
+        txn.commit().ok()?;
+        Some(next)
+    }
+}
+
 /// The local MCP server's persisted bearer-token state (M10.21). Generated/rotated only from the
 /// app's Settings UI — never automatically at launch — so it survives restarts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

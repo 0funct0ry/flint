@@ -156,6 +156,58 @@ pub(crate) fn read_daily_notes_config(root: &Path) -> flint_core::config::DailyN
         .unwrap_or_default()
 }
 
+/// Cross-note lookups for template placeholders (M10.27), reading straight from disk through the
+/// path guard and the existing title / front-matter readers.
+struct FsNoteLookup {
+    root: PathBuf,
+}
+
+impl FsNoteLookup {
+    fn read(&self, path: &str) -> Option<(SafePath, String)> {
+        let safe = SafePath::resolve(&self.root, path).ok()?;
+        let content = std::fs::read_to_string(safe.as_path()).ok()?;
+        Some((safe, content))
+    }
+}
+
+impl flint_core::NoteLookup for FsNoteLookup {
+    fn title(&self, path: &str) -> Option<String> {
+        let (safe, content) = self.read(path)?;
+        Some(flint_core::resolve_note_title(
+            &content,
+            safe.as_relative_path(),
+        ))
+    }
+
+    fn frontmatter(&self, path: &str, key: &str) -> Option<String> {
+        let (_, content) = self.read(path)?;
+        let (_, _, _, fields) = flint_core::parse_front_matter(&content);
+        fields.into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    fn workspace_name(&self) -> String {
+        self.root
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+}
+
+/// Attach the M10.27 generator backends (persistent counters in `.flint.db`, cross-note lookups)
+/// to a context used to render a note that is actually about to be created. Path-pattern and
+/// preview renders deliberately skip this so they never consume a sequence number.
+pub(crate) fn with_generators(
+    ctx: flint_core::TemplateContext,
+    root: &Path,
+    template: Option<&str>,
+) -> flint_core::TemplateContext {
+    ctx.with_template(template.map(str::to_string))
+        .with_sequences(Arc::new(flint_core::RedbSequenceStore::new(root)))
+        .with_lookup(Arc::new(FsNoteLookup {
+            root: root.to_path_buf(),
+        }))
+}
+
 /// Render a template file into note content. The template's own front-matter fields carry over
 /// to the note (with `{{...}}` placeholders resolved), except the `templateVariables` schema
 /// field, which describes the template itself and never belongs on a note.
@@ -204,7 +256,9 @@ pub(crate) fn resolve_new_note_content_with_variables(
         path: posix_path.to_string(),
         now: chrono::Local::now(),
         variables: variables.clone(),
+        ..flint_core::TemplateContext::new("", "")
     };
+    let ctx = with_generators(ctx, root, template);
     let content = match template {
         Some(name) => {
             let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, name);
@@ -1156,6 +1210,7 @@ fn daily_note_open(
         path: String::new(),
         now: target_dt,
         variables: HashMap::new(),
+        ..flint_core::TemplateContext::new("", "")
     };
     let rendered_path = flint_core::render_template(&cfg.path_pattern, &path_ctx);
     let safe_path = SafePath::resolve(&root, &rendered_path).map_err(|e| e.to_string())?;
@@ -1174,7 +1229,9 @@ fn daily_note_open(
         path: posix.clone(),
         now: target_dt,
         variables: variables.clone(),
+        ..flint_core::TemplateContext::new("", "")
     };
+    let note_ctx = with_generators(note_ctx, &root, cfg.template.as_deref());
     let content = match cfg.template.as_deref() {
         Some(name) => {
             let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, name);

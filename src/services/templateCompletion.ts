@@ -5,7 +5,22 @@ import { EditorView } from '@codemirror/view';
  * sync with `flint_core::template`'s transform table by hand, the same way this file's sibling
  * completion source (`linkCompletionSource` in `CenterPane.tsx`) mirrors backend behavior rather
  * than importing it (there is no shared TS/Rust schema in this codebase). */
-const PIPE_FUNCTIONS = ['slug', 'upper', 'lower', 'trim'];
+const PIPE_FUNCTIONS = [
+  'slug',
+  'upper',
+  'lower',
+  'trim',
+  'capitalize',
+  'titlecase',
+  'kebab',
+  'snake',
+  'initials',
+  'wordcount',
+  'charcount',
+];
+
+/** Pipes that take arguments: accepting one leaves the cursor after the `:` ready for the value. */
+const PIPE_FUNCTIONS_WITH_ARGS = ['truncate:', 'pad:', 'replace:', 'default:'];
 
 /** Insert `text` in place of the completed range, then move the cursor to `text.length -
  * cursorOffsetFromEnd`. Used for `date:FORMAT`, where accepting the completion should leave the
@@ -51,11 +66,18 @@ export function createTemplatePlaceholderCompletionSource(getVariableNames: () =
       const from = context.pos - typed.length;
       return {
         from,
-        options: PIPE_FUNCTIONS.map((fn) => ({
-          label: fn,
-          type: 'function',
-          apply: fn,
-        })),
+        options: [
+          ...PIPE_FUNCTIONS.map((fn) => ({
+            label: fn,
+            type: 'function',
+            apply: fn,
+          })),
+          ...PIPE_FUNCTIONS_WITH_ARGS.map((fn) => ({
+            label: `${fn}ARG`,
+            type: 'function',
+            apply: fn,
+          })),
+        ],
       };
     }
 
@@ -86,6 +108,39 @@ export function createTemplatePlaceholderCompletionSource(getVariableNames: () =
           apply: applyAndPlaceCursor('date:}}', 2),
         },
         { label: 'time', detail: 'HH:mm', type: 'keyword', apply: 'time}}' },
+        { label: 'weekday', detail: 'e.g. Monday', type: 'keyword', apply: 'weekday}}' },
+        { label: 'quarter', detail: 'e.g. Q3', type: 'keyword', apply: 'quarter}}' },
+        { label: 'isoweek', detail: 'e.g. W40', type: 'keyword', apply: 'isoweek}}' },
+        { label: 'uuid', detail: 'random UUID', type: 'keyword', apply: 'uuid}}' },
+        { label: 'parentfolder', detail: "the note's folder name", type: 'keyword', apply: 'parentfolder}}' },
+        { label: 'workspacename', detail: 'workspace directory name', type: 'keyword', apply: 'workspacename}}' },
+        {
+          label: 'seq:PREFIX:WIDTH',
+          detail: 'auto-increment, e.g. T0001',
+          type: 'keyword',
+          apply: applyAndPlaceCursor('seq::4}}', 5),
+        },
+        {
+          label: 'nestseq:LEVELS',
+          detail: 'nested counter, e.g. 01.01.02',
+          type: 'keyword',
+          apply: applyAndPlaceCursor('nestseq:3}}', 3),
+        },
+        {
+          label: 'regex:PATTERN',
+          detail: 'random ID, e.g. [A-Z]{2}\\d{3}',
+          type: 'keyword',
+          apply: applyAndPlaceCursor('regex:}}', 2),
+        },
+        {
+          label: 'regexseq:PATTERN',
+          detail: 'sequential ID, e.g. REQ-\\d{3}',
+          type: 'keyword',
+          apply: applyAndPlaceCursor('regexseq:}}', 2),
+        },
+        { label: 'linkto:PATH', detail: 'link to another note', type: 'keyword', apply: applyAndPlaceCursor('linkto:}}', 2) },
+        { label: 'relativepath:PATH', detail: 'relative path to a note', type: 'keyword', apply: applyAndPlaceCursor('relativepath:}}', 2) },
+        { label: 'frontmatter:PATH#KEY', detail: "another note's field", type: 'keyword', apply: applyAndPlaceCursor('frontmatter:}}', 2) },
         ...variableOptions,
       ],
     };

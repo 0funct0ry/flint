@@ -12,6 +12,9 @@ export type CommandMetadata = Omit<Command, 'handler'>;
 export const APP_COMMANDS: CommandMetadata[] = [
   { id: 'file.new_note', title: 'New note', shortcut: '⌘N', shortcutDisplay: '⌘N' },
   { id: 'file.new_folder', title: 'New folder', shortcut: '⌘⇧N', shortcutDisplay: '⌘⇧N' },
+  // M10.27 Journey A: author a template without leaving Flint.
+  { id: 'file.new_template', title: 'New template…' },
+  { id: 'view.manage_templates', title: 'Manage templates…' },
   { id: 'file.close', title: 'Close active note', shortcut: '⌘W', shortcutDisplay: '⌘W' },
   { id: 'palette.notes', title: 'Search notes by name', shortcut: '⌘P', shortcutDisplay: '⌘P' },
   { id: 'palette.commands', title: 'Show all commands', shortcut: '⌘⇧P', shortcutDisplay: '⌘⇧P' },

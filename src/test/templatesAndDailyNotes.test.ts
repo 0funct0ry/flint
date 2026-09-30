@@ -26,6 +26,20 @@ describe('noteCreate with a template path (browser mock)', () => {
     const note = await api.noteRead('journal/blank.md');
     expect(note.content).toBe('');
   });
+
+  it("never leaks the template's own templateVariables front matter into the created note", async () => {
+    await api.templateCreate(
+      'Meeting',
+      [{ name: 'project', kind: 'text', default: '', required: false, options: [] }],
+      '# {{title}}\n\n{{var:project}}\n'
+    );
+    const meta = await api.noteCreate('journal/meeting-1.md', 'meeting.md');
+    const note = await api.noteRead(meta.path);
+
+    expect(note.content).not.toContain('templateVariables');
+    expect(note.content).not.toContain('---');
+    expect(note.content).toMatch(/^# meeting-1/);
+  });
 });
 
 describe('dailyNoteOpen (browser mock)', () => {

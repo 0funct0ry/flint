@@ -228,6 +228,11 @@ pub struct TemplatesConfig {
     /// Path under `.flint/templates/`, workspace-relative, matching a [`crate::TemplateMeta::path`].
     #[serde(default)]
     pub default_template: Option<String>,
+    /// Global-scope template variable defaults (M10.27 Journey C) — available to any template
+    /// anywhere in the workspace unless overridden by a nearer folder scope or an explicit value
+    /// typed into the New Note modal. Edited from Settings → Templates → Variables.
+    #[serde(default)]
+    pub global_variables: HashMap<String, String>,
     #[serde(flatten)]
     pub extra: serde_json::Map<String, Value>,
 }
@@ -236,9 +241,63 @@ impl Default for TemplatesConfig {
     fn default() -> Self {
         Self {
             default_template: None,
+            global_variables: HashMap::new(),
             extra: serde_json::Map::new(),
         }
     }
+}
+
+/// Dotted-config-key prefix under which one folder's variable scope (M10.27 Journey C) is stored,
+/// one key per folder: `templates.folderVariables."<workspace-relative-folder-path>"`. No new
+/// `.flint.db` table — this reuses the existing `config_set`/`config_get` dotted-path machinery,
+/// same pattern as every other per-path config row.
+pub const FOLDER_VARIABLES_KEY_PREFIX: &str = "templates.folderVariables";
+
+/// Sentinel substituted for a literal `.` inside a folder path before it becomes one segment of a
+/// dotted config key — `set_dotted_path`/`get_dotted_path` split on `.`, so a folder name
+/// containing a dot (e.g. `clients/acme.co`) would otherwise be mis-parsed as nested segments.
+const FOLDER_KEY_DOT_ESCAPE: &str = "\u{2024}";
+
+/// Encode a workspace-relative folder path as one dotted-config-key segment (escaping `.`).
+fn encode_folder_key_segment(folder_path: &str) -> String {
+    folder_path.replace('.', FOLDER_KEY_DOT_ESCAPE)
+}
+
+/// Reverse [`encode_folder_key_segment`].
+pub fn decode_folder_key_segment(segment: &str) -> String {
+    segment.replace(FOLDER_KEY_DOT_ESCAPE, ".")
+}
+
+/// Build the dotted config key for one folder's variable scope. `folder_path` is the workspace-
+/// relative POSIX folder path (`""` — encoded as a single space-free sentinel segment — for the
+/// workspace root).
+pub fn folder_variables_key(folder_path: &str) -> String {
+    let segment = if folder_path.is_empty() {
+        "__root__".to_string()
+    } else {
+        encode_folder_key_segment(folder_path)
+    };
+    format!("{FOLDER_VARIABLES_KEY_PREFIX}.{segment}")
+}
+
+/// List every folder path that currently has a variable scope row, from the merged config's
+/// `templates.folderVariables` object (as returned by `config_get(root, None)`), decoded back to
+/// real folder paths.
+pub fn list_folder_variable_paths(merged_config: &Value) -> Vec<String> {
+    let Some(obj) =
+        get_dotted_path(merged_config, FOLDER_VARIABLES_KEY_PREFIX).and_then(|v| v.as_object())
+    else {
+        return Vec::new();
+    };
+    obj.keys()
+        .map(|k| {
+            if k == "__root__" {
+                String::new()
+            } else {
+                decode_folder_key_segment(k)
+            }
+        })
+        .collect()
 }
 
 /// New-note rules (M10.26): where a brand-new note lands and what its filename/body look like
@@ -1083,6 +1142,41 @@ pub fn config_get_with_global_override(
     }
 }
 
+/// Resolve the nearest-ancestor folder variable scope for `target_folder` (workspace-relative
+/// POSIX path, `""` for the root) out of the merged config's `templates.folderVariables` rows —
+/// M10.27 Journey C: "nearest ancestor wins if nested folders both define the same name". Walks
+/// from `target_folder` up to the root, returning the first folder's variables found (a folder's
+/// own row fully replaces a farther ancestor's, it is not merged key-by-key across levels).
+pub fn nearest_ancestor_folder_variables(
+    merged_config: &Value,
+    target_folder: &str,
+) -> HashMap<String, String> {
+    let mut candidates: Vec<&str> = Vec::new();
+    let mut rest = target_folder.trim_matches('/');
+    loop {
+        candidates.push(rest);
+        match rest.rfind('/') {
+            Some(idx) => rest = &rest[..idx],
+            None => break,
+        }
+    }
+    if candidates.last() != Some(&"") {
+        candidates.push("");
+    }
+
+    for folder in candidates {
+        let key = folder_variables_key(folder);
+        if let Some(value) = get_dotted_path(merged_config, &key) {
+            if let Ok(map) = serde_json::from_value::<HashMap<String, String>>(value.clone()) {
+                if !map.is_empty() {
+                    return map;
+                }
+            }
+        }
+    }
+    HashMap::new()
+}
+
 /// Validate a set of ignore-glob lines, one result per input line: `None` if valid (or
 /// blank/whitespace-only, which is skipped), `Some(message)` if `globset::Glob::new` rejects it.
 pub fn validate_ignore_patterns(lines: &[String]) -> Vec<Option<String>> {
@@ -1323,6 +1417,48 @@ mod tests {
         let dir = tempdir().unwrap();
         // No prior override at all — should not error.
         config_reset(dir.path(), "theme").unwrap();
+    }
+
+    #[test]
+    fn folder_variables_key_escapes_dots_and_round_trips() {
+        let key = folder_variables_key("clients/acme.co");
+        assert!(!key.contains(".acme.co"));
+        let dir = tempdir().unwrap();
+        config_set(dir.path(), &key, serde_json::json!({"client": "Acme Co"})).unwrap();
+        let result = config_get_with_global_override(dir.path(), None, None).unwrap();
+        let paths = list_folder_variable_paths(&result.config);
+        assert_eq!(paths, vec!["clients/acme.co".to_string()]);
+    }
+
+    #[test]
+    fn nearest_ancestor_folder_variables_prefers_closer_folder() {
+        let dir = tempdir().unwrap();
+        config_set(
+            dir.path(),
+            &folder_variables_key(""),
+            serde_json::json!({"scope": "root"}),
+        )
+        .unwrap();
+        config_set(
+            dir.path(),
+            &folder_variables_key("clients/acme"),
+            serde_json::json!({"scope": "acme"}),
+        )
+        .unwrap();
+
+        let result = config_get_with_global_override(dir.path(), None, None).unwrap();
+        let resolved = nearest_ancestor_folder_variables(&result.config, "clients/acme/notes");
+        assert_eq!(resolved.get("scope").unwrap(), "acme");
+
+        let resolved_root = nearest_ancestor_folder_variables(&result.config, "other/dir");
+        assert_eq!(resolved_root.get("scope").unwrap(), "root");
+    }
+
+    #[test]
+    fn nearest_ancestor_folder_variables_none_defined_returns_empty() {
+        let dir = tempdir().unwrap();
+        let result = config_get_with_global_override(dir.path(), None, None).unwrap();
+        assert!(nearest_ancestor_folder_variables(&result.config, "any/folder").is_empty());
     }
 
     #[test]

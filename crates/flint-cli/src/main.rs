@@ -44,6 +44,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_open: bool,
 
+    /// Create the workspace directory if it doesn't exist, then open it
+    #[arg(short = 'c', long, global = true)]
+    pub create: bool,
+
     /// Machine-readable JSON output
     #[arg(long, global = true)]
     pub json: bool,
@@ -450,6 +454,14 @@ fn run() -> Result<u8, (u8, String)> {
             // focus when the PATH argument was a Markdown file rather than a directory (M10.06).
             let mut initial_note_opt: Option<String> = None;
             let ws_root_opt: Option<PathBuf> = if has_path_signal {
+                if cli.create {
+                    create_workspace_dir_if_missing(
+                        cli.path.as_deref(),
+                        cli.workspace.as_deref(),
+                        env_var.as_deref(),
+                        &current_dir,
+                    )?;
+                }
                 // Explicit signal: resolve strictly (fail fast on bad path)
                 let resolved = resolve_workspace_target(
                     cli.path.as_deref(),
@@ -715,6 +727,52 @@ fn spawn_detached_gui(
 
         Ok(())
     }
+}
+
+/// If the resolved target (same precedence as `resolve_workspace_target`) doesn't exist yet,
+/// create it as a directory so `--create` can hand off to strict resolution afterward. Only
+/// creates when the path is missing entirely; an existing file/dir mismatch is left for
+/// `resolve_workspace_target` to reject with its normal error.
+fn create_workspace_dir_if_missing(
+    explicit: Option<&Path>,
+    workspace_flag: Option<&Path>,
+    env_var: Option<&str>,
+    current_dir: &Path,
+) -> Result<(), (u8, String)> {
+    let target = if let Some(p) = explicit {
+        p.to_path_buf()
+    } else if let Some(p) = workspace_flag {
+        p.to_path_buf()
+    } else if let Some(env) = env_var {
+        if !env.trim().is_empty() {
+            PathBuf::from(env)
+        } else {
+            current_dir.to_path_buf()
+        }
+    } else {
+        current_dir.to_path_buf()
+    };
+
+    let target_abs = if target.is_relative() {
+        current_dir.join(&target)
+    } else {
+        target
+    };
+
+    if !target_abs.exists() {
+        fs::create_dir_all(&target_abs).map_err(|e| {
+            (
+                exit_codes::PERMISSION_DENIED,
+                format!(
+                    "Failed to create workspace directory {}: {}",
+                    target_abs.display(),
+                    e
+                ),
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 fn map_ws_error(err: WorkspaceError) -> (u8, String) {

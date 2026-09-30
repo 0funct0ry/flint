@@ -14,6 +14,7 @@ export interface TitleBarProps {
   rightSidebarVisible?: boolean;
   onToggleRightSidebar?: () => void;
   onOpenSettings?: () => void;
+  onOpenTemplates?: () => void;
 }
 
 export const TitleBar: React.FC<TitleBarProps> = ({
@@ -28,6 +29,7 @@ export const TitleBar: React.FC<TitleBarProps> = ({
   rightSidebarVisible = true,
   onToggleRightSidebar,
   onOpenSettings,
+  onOpenTemplates,
 }) => {
   const parts = breadcrumb.split('/');
   const root = parts[0] || 'projects';
@@ -137,6 +139,23 @@ export const TitleBar: React.FC<TitleBarProps> = ({
         >
           {theme === 'dark' ? '☼' : '◐'}
         </button>
+
+        {/* Templates Button — direct entry point to the Templates management screen (M10.27) */}
+        {onOpenTemplates && (
+          <button
+            onClick={onOpenTemplates}
+            className="w-[26px] h-[24px] grid place-items-center rounded-[5px] text-[var(--muted)] hover:bg-[var(--panel)] hover:text-[var(--text)] transition-colors text-xs"
+            title="Manage templates…"
+            aria-label="Manage templates"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+              <path d="M14 2v6h6" />
+              <line x1="9" x2="15" y1="13" y2="13" />
+              <line x1="9" x2="15" y1="17" y2="17" />
+            </svg>
+          </button>
+        )}
 
         {/* Settings Button */}
         <button

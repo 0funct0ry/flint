@@ -55,6 +55,9 @@ export interface LeftSidebarProps {
   selectedFolderPath?: string;
   onSelectFolder?: (path: string) => void;
   onCreateNote: (parentFolder?: string) => void;
+  /** "New Note from Template…" — opens the template-picker/variable-form modal, as opposed to
+   * `onCreateNote`'s fast inline-rename flow for a blank/default-template note. */
+  onCreateNoteFromTemplate?: (parentFolder?: string) => void;
   onCreateFolder: (parentFolder?: string) => void;
   onRenameItem: (itemPath: string, currentName: string) => void;
   onDuplicateNote: (itemPath: string) => Promise<void>;
@@ -83,6 +86,13 @@ export interface LeftSidebarProps {
   onFilterByTag?: (tag: string) => void;
   onClearTagFilter?: () => void;
   onTagRename?: (oldTag: string, newTag: string) => void;
+  /** "New Template…" (M10.27 Journey A) — from the workspace root or any folder in the tree. */
+  onCreateTemplate?: (parentFolder?: string) => void;
+  /** "Edit template variables…" (M10.27 Journey A) — only offered for files under
+   * `.flint/templates/`. */
+  onEditTemplateVariables?: (templatePath: string) => void;
+  /** "Folder variables…" (M10.27 Journey C) — only offered for folders. */
+  onEditFolderVariables?: (folderPath: string) => void;
 }
 
 export const LeftSidebar: React.FC<LeftSidebarProps> = ({
@@ -96,6 +106,7 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   selectedFolderPath = '',
   onSelectFolder,
   onCreateNote,
+  onCreateNoteFromTemplate,
   onCreateFolder,
   onRenameItem,
   onDuplicateNote,
@@ -118,6 +129,9 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
   onFilterByTag,
   onClearTagFilter,
   onTagRename,
+  onCreateTemplate,
+  onEditTemplateVariables,
+  onEditFolderVariables,
 }) => {
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set(['projects', 'projects/payments', 'archive', 'reading', 'guides'])
@@ -443,17 +457,36 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
           shortcut: '⌘N',
           onClick: () => onCreateNote(''),
         },
+        ...(onCreateNoteFromTemplate
+          ? [
+              {
+                id: 'new-note-from-template',
+                label: 'New Note from Template…',
+                onClick: () => onCreateNoteFromTemplate(''),
+              },
+            ]
+          : []),
         {
           id: 'new-folder',
           label: 'New Folder',
           shortcut: '⌘⇧N',
           onClick: () => onCreateFolder(''),
         },
+        ...(onCreateTemplate
+          ? [
+              {
+                id: 'new-template',
+                label: 'New Template…',
+                onClick: () => onCreateTemplate(''),
+              },
+            ]
+          : []),
       ];
     }
 
     const isFolder = item.is_folder;
     const parentFolder = isFolder ? item.path : item.path.split('/').slice(0, -1).join('/');
+    const isTemplateFile = !isFolder && item.path.startsWith('.flint/templates/');
 
     return [
       {
@@ -462,12 +495,49 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
         shortcut: '⌘N',
         onClick: () => onCreateNote(parentFolder),
       },
+      ...(onCreateNoteFromTemplate
+        ? [
+            {
+              id: 'new-note-from-template',
+              label: 'New Note from Template…',
+              onClick: () => onCreateNoteFromTemplate(parentFolder),
+            },
+          ]
+        : []),
       {
         id: 'new-folder',
         label: 'New Folder',
         shortcut: '⌘⇧N',
         onClick: () => onCreateFolder(parentFolder),
       },
+      ...(onCreateTemplate
+        ? [
+            {
+              id: 'new-template',
+              label: 'New Template…',
+              onClick: () => onCreateTemplate(parentFolder),
+            },
+          ]
+        : []),
+      ...(isTemplateFile && onEditTemplateVariables
+        ? [
+            {
+              id: 'edit-template-variables',
+              label: 'Edit template variables…',
+              onClick: () =>
+                onEditTemplateVariables(item.path.replace(/^\.flint\/templates\//, '')),
+            },
+          ]
+        : []),
+      ...(isFolder && onEditFolderVariables
+        ? [
+            {
+              id: 'folder-variables',
+              label: 'Folder variables…',
+              onClick: () => onEditFolderVariables(item.path),
+            },
+          ]
+        : []),
       { id: 'sep1', label: '', separator: true, onClick: () => {} },
       {
         id: 'rename',
@@ -1091,49 +1161,68 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
           role="tab"
           aria-selected={activeTab === 'tree'}
           onClick={() => onTabChange('tree')}
-          className={`px-3 text-[11.5px] tracking-wide transition-colors ${
+          title="Workspace"
+          aria-label="Workspace"
+          className={`w-9 flex items-center justify-center transition-colors ${
             activeTab === 'tree'
-              ? 'text-[var(--text)] font-medium shadow-[inset_0_-2px_0_var(--accent)]'
+              ? 'text-[var(--text)] shadow-[inset_0_-2px_0_var(--accent)]'
               : 'text-[var(--muted)] hover:text-[var(--text)]'
           }`}
         >
-          Workspace
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z" />
+          </svg>
         </button>
         <button
           role="tab"
           aria-selected={activeTab === 'search'}
           onClick={() => onTabChange('search')}
-          className={`px-3 text-[11.5px] tracking-wide transition-colors ${
+          title="Search"
+          aria-label="Search"
+          className={`w-9 flex items-center justify-center transition-colors ${
             activeTab === 'search'
-              ? 'text-[var(--text)] font-medium shadow-[inset_0_-2px_0_var(--accent)]'
+              ? 'text-[var(--text)] shadow-[inset_0_-2px_0_var(--accent)]'
               : 'text-[var(--muted)] hover:text-[var(--text)]'
           }`}
         >
-          Search
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="11" cy="11" r="7" />
+            <path d="m20 20-3.5-3.5" />
+          </svg>
         </button>
         <button
           role="tab"
           aria-selected={activeTab === 'outline'}
           onClick={() => onTabChange('outline')}
-          className={`px-3 text-[11.5px] tracking-wide transition-colors ${
+          title="Outline"
+          aria-label="Outline"
+          className={`w-9 flex items-center justify-center transition-colors ${
             activeTab === 'outline'
-              ? 'text-[var(--text)] font-medium shadow-[inset_0_-2px_0_var(--accent)]'
+              ? 'text-[var(--text)] shadow-[inset_0_-2px_0_var(--accent)]'
               : 'text-[var(--muted)] hover:text-[var(--text)]'
           }`}
         >
-          Outline
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M8 6h13M8 12h13M8 18h13" />
+            <path d="M3 6h.01M3 12h.01M3 18h.01" />
+          </svg>
         </button>
         <button
           role="tab"
           aria-selected={activeTab === 'tags'}
           onClick={() => onTabChange('tags')}
-          className={`px-3 text-[11.5px] tracking-wide transition-colors ${
+          title="Tags"
+          aria-label="Tags"
+          className={`w-9 flex items-center justify-center transition-colors ${
             activeTab === 'tags'
-              ? 'text-[var(--text)] font-medium shadow-[inset_0_-2px_0_var(--accent)]'
+              ? 'text-[var(--text)] shadow-[inset_0_-2px_0_var(--accent)]'
               : 'text-[var(--muted)] hover:text-[var(--text)]'
           }`}
         >
-          Tags
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M20.59 13.41 12 21.99a2 2 0 0 1-2.83 0L2.59 14.4a2 2 0 0 1 0-2.83l8.58-8.58A2 2 0 0 1 12.58 2H19a2 2 0 0 1 2 2v6.41a2 2 0 0 1-.41 1Z" />
+            <circle cx="7.5" cy="7.5" r="1" fill="currentColor" stroke="none" />
+          </svg>
         </button>
 
         {onClose && (

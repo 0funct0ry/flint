@@ -10,6 +10,9 @@ import { DiffViewer } from './components/DiffViewer';
 import { Toast, ToastMessage } from './components/Toast';
 import { DeleteConfirmModal } from './components/DeleteConfirmModal';
 import { UnresolvedLinksModal } from './components/UnresolvedLinksModal';
+import { NewNoteModal } from './components/NewNoteModal';
+import { TemplatesScreen } from './components/TemplatesScreen';
+import { FolderVariablesModal } from './components/FolderVariablesModal';
 import { SettingsPanel } from './components/SettingsPanel';
 import { useSettings } from './context/SettingsContext';
 import {
@@ -45,7 +48,26 @@ interface HistoryEntry {
 
 export const App: React.FC = () => {
   const { config, loaded: settingsLoaded, refresh: refreshSettings, setField: setSettingsField } = useSettings();
-  const [theme, setTheme] = useState<'light' | 'dark'>('dark');
+  // Effective theme derives from `config.theme` ('system' follows the OS preference), so the
+  // Settings screen and the title-bar toggle share one source of truth that also persists.
+  const [systemDark, setSystemDark] = useState(() =>
+    typeof window !== 'undefined' && window.matchMedia
+      ? window.matchMedia('(prefers-color-scheme: dark)').matches
+      : true
+  );
+  const theme: 'light' | 'dark' =
+    config.theme === 'system' ? (systemDark ? 'dark' : 'light') : config.theme === 'light' ? 'light' : 'dark';
+  const toggleTheme = useCallback(
+    () => setSettingsField('theme', theme === 'dark' ? 'light' : 'dark'),
+    [theme, setSettingsField]
+  );
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+    mq.addEventListener?.('change', onChange);
+    return () => mq.removeEventListener?.('change', onChange);
+  }, []);
   const [viewMode, setViewMode] = useState<ViewMode>('split');
   const [leftTab, setLeftTab] = useState<LeftTab>('tree');
   const [leftSidebarVisible, setLeftSidebarVisible] = useState(true);
@@ -114,6 +136,20 @@ export const App: React.FC = () => {
 
   // Inline tree action state (create-note, create-folder, rename)
   const [inlineAction, setInlineAction] = useState<InlineActionState | null>(null);
+
+  // M10.27 Journey B/C modal state.
+  const [newNoteModal, setNewNoteModal] = useState<{ targetFolder: string } | null>(null);
+  const [folderVariablesModal, setFolderVariablesModal] = useState<{
+    folderPath: string;
+    initialVariables: Record<string, string>;
+  } | null>(null);
+
+  // Templates management is a first-class screen (not a floating dialog): every entry point
+  // (Settings, the tree's context menu, the command palette) navigates here, optionally with an
+  // intent so the screen lands directly in create/edit mode instead of the plain list.
+  const [templatesScreen, setTemplatesScreen] = useState<
+    { open: false } | { open: true; initialCreate?: boolean; initialEditPath?: string }
+  >({ open: false });
 
   // Tag click-to-filter state (M10.25) — no precedent among the note-navigation callbacks above,
   // since a tag click filters the tree rather than navigating to a single note.
@@ -190,13 +226,13 @@ export const App: React.FC = () => {
   // Refresh workspace tree helper
   const refreshTree = useCallback(async () => {
     try {
-      const tree = await api.workspaceTree(false);
+      const tree = await api.workspaceTree(config.ui.showNonNoteFiles);
       setTreeData(tree);
       setTreeError(null);
     } catch (err: any) {
       setTreeError(err?.message || String(err));
     }
-  }, []);
+  }, [config.ui.showNonNoteFiles]);
 
   // Refresh workspace stats helper (SPEC §6.1, M7)
   const refreshStats = useCallback(async () => {
@@ -447,7 +483,7 @@ export const App: React.FC = () => {
           }
           void refreshSettings();
         }
-        const tree = await api.workspaceTree(false);
+        const tree = await api.workspaceTree(config.ui.showNonNoteFiles);
         if (mounted) {
           setTreeData(tree);
           setTreeError(null);
@@ -626,6 +662,10 @@ export const App: React.FC = () => {
   useEffect(() => {
     if (!settingsLoaded || layoutSeededRef.current) return;
     layoutSeededRef.current = true;
+    setViewMode(config.behaviour.defaultMode as ViewMode);
+    // Fresh workspaces have no saved layout yet — fall back to the configured UI defaults.
+    setLeftTab(config.ui.leftSidebar as LeftTab);
+    setRightSidebarVisible(config.ui.rightSidebarVisible);
     const layout = config.layout;
     if (!layout) return;
     if (typeof layout.leftSidebarCollapsed === 'boolean') {
@@ -642,6 +682,60 @@ export const App: React.FC = () => {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settingsLoaded]);
+
+  // Apply changes to the default-mode / sidebar settings immediately (the initial values are
+  // applied by the seeding effect above; these only fire when the setting itself changes).
+  const prevUiDefaultsRef = useRef({
+    mode: config.behaviour.defaultMode,
+    left: config.ui.leftSidebar,
+    right: config.ui.rightSidebarVisible,
+  });
+  useEffect(() => {
+    if (!layoutSeededRef.current) return;
+    const prev = prevUiDefaultsRef.current;
+    if (prev.mode !== config.behaviour.defaultMode) {
+      setViewMode(config.behaviour.defaultMode as ViewMode);
+    }
+    if (prev.left !== config.ui.leftSidebar) setLeftTab(config.ui.leftSidebar as LeftTab);
+    if (prev.right !== config.ui.rightSidebarVisible) {
+      setRightSidebarVisible(config.ui.rightSidebarVisible);
+    }
+    prevUiDefaultsRef.current = {
+      mode: config.behaviour.defaultMode,
+      left: config.ui.leftSidebar,
+      right: config.ui.rightSidebarVisible,
+    };
+  }, [config.behaviour.defaultMode, config.ui.leftSidebar, config.ui.rightSidebarVisible]);
+
+  // Re-fetch the tree when non-note-file visibility changes.
+  useEffect(() => {
+    if (!layoutSeededRef.current) return;
+    void refreshTree();
+  }, [config.ui.showNonNoteFiles, refreshTree]);
+
+  // Re-render the open note when the theme or a Markdown extension toggle changes, using the
+  // in-memory buffer so unsaved edits are not lost.
+  const { math: mdMath, tables: mdTables, footnotes: mdFootnotes, smartPunctuation: mdSmart } =
+    config.markdown;
+  useEffect(() => {
+    const { path, content } = currentNoteRef.current;
+    if (!path) return;
+    let cancelled = false;
+    api
+      .noteRender(path, content, theme)
+      .then((renderRes) => {
+        if (cancelled) return;
+        setNoteState((prev) => {
+          const cur = prev[path];
+          if (!cur) return prev;
+          return { ...prev, [path]: { ...cur, renderedHtml: renderRes.html } };
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [theme, mdMath, mdTables, mdFootnotes, mdSmart]);
 
   // Persist sidebar-visibility / active-tab layout changes, debounced (400-500ms) like the
   // existing autosave pattern, so rapid toggles don't fire a config_set per event.
@@ -770,7 +864,7 @@ export const App: React.FC = () => {
         if (info.start_collapsed) {
           setLeftSidebarVisible(false);
         }
-        const tree = await api.workspaceTree(false);
+        const tree = await api.workspaceTree(config.ui.showNonNoteFiles);
         setTreeData(tree);
         setTreeError(null);
         await refreshStats();
@@ -781,7 +875,7 @@ export const App: React.FC = () => {
         console.error('Failed to open workspace:', err);
       }
     },
-    [handleSelectNote, refreshStats]
+    [handleSelectNote, refreshStats, config.ui.showNonNoteFiles]
   );
 
   // Open a folder via native picker and load it as workspace (M10.04 onboarding)
@@ -972,17 +1066,92 @@ export const App: React.FC = () => {
     }
   }, [history, historyIndex, isDirty, loadNote, saveNote]);
 
-  // Action handlers for tree
+  /** Render `newNote.filenamePattern`'s `{{title}}` placeholder against a filler title, used as
+   * both the inline-create field's initial value and the New Note modal's initial name field —
+   * the real render (with the user's chosen name as `{{title}}`) happens once, in Rust, inside
+   * `note_create`. */
+  const newNoteInitialName = useMemo(() => {
+    const pattern = config.newNote.filenamePattern || '{{title}}';
+    const rendered = pattern.replace(/\{\{\s*title\s*\}\}/gi, 'Untitled');
+    return rendered.endsWith('.md') || rendered.endsWith('.markdown') ? rendered : `${rendered}.md`;
+  }, [config.newNote.filenamePattern]);
+
+  // Action handlers for tree. M10.27 originally routed all note creation through `NewNoteModal`;
+  // per follow-up feedback, "New Note" is back to the pre-M10.27 fast inline-rename flow (blank or
+  // `templates.defaultTemplate`, no dialog), and the modal (with its template picker + variable
+  // form) is now a separate "New Note from Template…" entry point. Both still honor the
+  // M10.26-deferred `newNote.targetFolder` override.
   const handleStartCreateNote = useCallback((parentFolder?: string) => {
     setLeftSidebarVisible(true);
     setLeftTab('tree');
-    const folder = parentFolder !== undefined ? parentFolder : selectedFolderPath;
+    const clicked = parentFolder !== undefined ? parentFolder : selectedFolderPath;
+    const folder = config.newNote.targetFolder || config.behaviour.newNoteFolder || clicked;
     setInlineAction({
       type: 'create-note',
       targetPath: folder,
-      initialValue: 'Untitled.md',
+      initialValue: newNoteInitialName,
     });
-  }, [selectedFolderPath]);
+  }, [selectedFolderPath, config.newNote.targetFolder, config.behaviour.newNoteFolder, newNoteInitialName]);
+
+  const handleStartCreateNoteFromTemplate = useCallback((parentFolder?: string) => {
+    setLeftSidebarVisible(true);
+    setLeftTab('tree');
+    const clicked = parentFolder !== undefined ? parentFolder : selectedFolderPath;
+    const folder = config.newNote.targetFolder || config.behaviour.newNoteFolder || clicked;
+    setNewNoteModal({ targetFolder: folder });
+  }, [selectedFolderPath, config.newNote.targetFolder, config.behaviour.newNoteFolder]);
+
+  const handleCreateNoteFromModal = useCallback(
+    async (name: string, templatePath: string | undefined, variables: Record<string, string>) => {
+      if (!newNoteModal) return;
+      const noteFileName = name.endsWith('.md') || name.endsWith('.markdown') ? name : `${name}.md`;
+      const folder = newNoteModal.targetFolder;
+      const relativePath = folder ? `${folder}/${noteFileName}` : noteFileName;
+      const hasVariables = Object.keys(variables).length > 0;
+      try {
+        await api.noteCreate(relativePath, templatePath, hasVariables ? variables : undefined);
+        await refreshTree();
+        setNewNoteModal(null);
+        await handleSelectNote(relativePath);
+        showToast(`Created note "${noteFileName}"`);
+      } catch (e) {
+        showToast(`Could not create note: ${e}`);
+      }
+    },
+    [newNoteModal, refreshTree, handleSelectNote, showToast]
+  );
+
+  const handleSaveFolderVariables = useCallback(
+    async (variables: Record<string, string>) => {
+      if (!folderVariablesModal) return;
+      try {
+        await api.folderVariablesSet(folderVariablesModal.folderPath, variables);
+        setFolderVariablesModal(null);
+        showToast('Updated folder variables');
+      } catch (e) {
+        showToast(`Could not update folder variables: ${e}`);
+      }
+    },
+    [folderVariablesModal, showToast]
+  );
+
+  // Templates management is one first-class screen (`TemplatesScreen`); every entry point just
+  // navigates there, optionally with an intent so it lands directly in create/edit mode.
+  const handleOpenTemplatesScreen = useCallback(
+    (intent?: { initialCreate?: boolean; initialEditPath?: string }) => {
+      setTemplatesScreen({ open: true, ...intent });
+    },
+    []
+  );
+
+  const handleOpenFolderVariables = useCallback(async (folderPath: string) => {
+    try {
+      const variables = await api.folderVariablesGet(folderPath);
+      setFolderVariablesModal({ folderPath, initialVariables: variables });
+    } catch (e) {
+      showToast(`Could not load folder variables: ${e}`);
+    }
+  }, [showToast]);
 
   const handleStartCreateFolder = useCallback((parentFolder?: string) => {
     setLeftSidebarVisible(true);
@@ -1011,10 +1180,9 @@ export const App: React.FC = () => {
     try {
       if (inlineAction.type === 'create-note') {
         const noteFileName = name.endsWith('.md') || name.endsWith('.markdown') ? name : `${name}.md`;
-        const relativePath = inlineAction.targetPath ? `${inlineAction.targetPath}/${noteFileName}` : noteFileName;
-
-        // `template` is a path under .flint/templates/ (M10.26); the configured default (if
-        // any) is what the new-note picker would have pre-selected.
+        const relativePath = inlineAction.targetPath
+          ? `${inlineAction.targetPath}/${noteFileName}`
+          : noteFileName;
         await api.noteCreate(relativePath, config.templates.defaultTemplate ?? undefined);
         await refreshTree();
         setInlineAction(null);
@@ -1062,7 +1230,16 @@ export const App: React.FC = () => {
     } catch (err: any) {
       showToast(`Error: ${err?.message || String(err)}`);
     }
-  }, [config.templates.defaultTemplate, currentNotePath, handleSelectNote, inlineAction, loadNote, refreshStats, refreshTree, showToast]);
+  }, [
+    config.templates.defaultTemplate,
+    currentNotePath,
+    handleSelectNote,
+    inlineAction,
+    loadNote,
+    refreshStats,
+    refreshTree,
+    showToast,
+  ]);
 
   const handleDuplicateNote = useCallback(async (itemPath: string) => {
     try {
@@ -1076,7 +1253,8 @@ export const App: React.FC = () => {
   }, [handleSelectNote, refreshTree, showToast]);
 
   const handleDeleteItem = useCallback(async (itemPath: string, isFolder: boolean, permanent: boolean) => {
-    if (permanent) {
+    // `behaviour.deleteToTrash` off: every delete is permanent, so it always asks first.
+    if (permanent || !config.behaviour.deleteToTrash) {
       setDeleteModalState({
         isOpen: true,
         itemPath,
@@ -1101,7 +1279,7 @@ export const App: React.FC = () => {
     } catch (err: any) {
       showToast(`Delete failed: ${err?.message || String(err)}`);
     }
-  }, [currentNotePath, refreshTree, showToast]);
+  }, [currentNotePath, refreshTree, showToast, config.behaviour.deleteToTrash]);
 
   const handleConfirmPermanentDelete = useCallback(async () => {
     const { itemPath, isFolder } = deleteModalState;
@@ -1202,6 +1380,8 @@ export const App: React.FC = () => {
     const handlers: Partial<Record<string, () => void>> = {
       'file.new_note': () => handleStartCreateNote(),
       'file.new_folder': () => handleStartCreateFolder(),
+      'file.new_template': () => handleOpenTemplatesScreen({ initialCreate: true }),
+      'view.manage_templates': () => handleOpenTemplatesScreen(),
       'file.close': () => handleCloseNote(),
       'palette.notes': () => {
         setPaletteMode('notes');
@@ -1219,7 +1399,7 @@ export const App: React.FC = () => {
       'view.cycle_mode': cycleViewMode,
       'view.toggle_left_sidebar': () => setLeftSidebarVisible((prev) => !prev),
       'view.toggle_right_sidebar': () => setRightSidebarVisible((prev) => !prev),
-      'theme.toggle': () => setTheme((prev) => (prev === 'dark' ? 'light' : 'dark')),
+      'theme.toggle': toggleTheme,
       'view.open_settings': () => setSettingsOpen((prev) => !prev),
     };
 
@@ -1248,7 +1428,9 @@ export const App: React.FC = () => {
     handleDailyNotePickDate,
     handleStartCreateFolder,
     handleStartCreateNote,
+    handleOpenTemplatesScreen,
     saveNote,
+    toggleTheme,
   ]);
 
   // Global keydown listeners
@@ -1500,7 +1682,8 @@ export const App: React.FC = () => {
       {/* Main app shell — hidden until a workspace is open */}
       {!noWorkspace && (
     <div className="flex flex-col h-screen w-screen bg-[var(--canvas)] text-[var(--text)] overflow-hidden font-ui">
-      {/* Title bar */}
+      {/* Title bar — hidden while a full-pane modal screen (Settings, Templates) is open */}
+      {!settingsOpen && !templatesScreen.open && (
       <TitleBar
         breadcrumb={breadcrumb}
         viewMode={viewMode}
@@ -1509,21 +1692,33 @@ export const App: React.FC = () => {
           setPaletteMode('notes');
           setPaletteOpen(true);
         }}
-        onToggleTheme={() =>
-          setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))
-        }
+        onToggleTheme={toggleTheme}
         theme={theme}
         leftSidebarVisible={leftSidebarVisible}
         onToggleLeftSidebar={() => setLeftSidebarVisible((prev) => !prev)}
         rightSidebarVisible={rightSidebarVisible}
         onToggleRightSidebar={() => setRightSidebarVisible((prev) => !prev)}
         onOpenSettings={() => setSettingsOpen((prev) => !prev)}
+        onOpenTemplates={() => handleOpenTemplatesScreen()}
       />
+      )}
 
-      {/* Main body with sidebars & editor/reader, or the full-pane Settings panel (M10.1) */}
+      {/* Main body with sidebars & editor/reader, or a full-pane screen (Settings, Templates) */}
       <div className="flex-1 flex min-h-0">
         {settingsOpen ? (
-          <SettingsPanel onClose={() => setSettingsOpen(false)} />
+          <SettingsPanel
+            onClose={() => setSettingsOpen(false)}
+            onOpenTemplates={() => {
+              setSettingsOpen(false);
+              handleOpenTemplatesScreen();
+            }}
+          />
+        ) : templatesScreen.open ? (
+          <TemplatesScreen
+            onClose={() => setTemplatesScreen({ open: false })}
+            initialCreate={templatesScreen.initialCreate}
+            initialEditPath={templatesScreen.initialEditPath}
+          />
         ) : (
         <>
         {leftSidebarVisible && (
@@ -1538,6 +1733,7 @@ export const App: React.FC = () => {
             selectedFolderPath={selectedFolderPath}
             onSelectFolder={setSelectedFolderPath}
             onCreateNote={handleStartCreateNote}
+            onCreateNoteFromTemplate={handleStartCreateNoteFromTemplate}
             onCreateFolder={handleStartCreateFolder}
             onRenameItem={handleStartRename}
             onDuplicateNote={handleDuplicateNote}
@@ -1545,6 +1741,11 @@ export const App: React.FC = () => {
             onMoveItem={handleMoveItem}
             onRevealInFileManager={handleRevealInFileManager}
             onCopyRelativePath={handleCopyRelativePath}
+            onCreateTemplate={() => handleOpenTemplatesScreen({ initialCreate: true })}
+            onEditTemplateVariables={(templatePath) =>
+              handleOpenTemplatesScreen({ initialEditPath: templatePath })
+            }
+            onEditFolderVariables={handleOpenFolderVariables}
             inlineAction={inlineAction}
             onCommitInlineAction={handleCommitInlineAction}
             onCancelInlineAction={() => setInlineAction(null)}
@@ -1698,6 +1899,25 @@ export const App: React.FC = () => {
         message={`Are you sure you want to permanently delete this ${deleteModalState.isFolder ? 'folder' : 'note'}? This action cannot be undone.`}
         onConfirm={handleConfirmPermanentDelete}
         onCancel={() => setDeleteModalState({ isOpen: false, itemPath: '', isFolder: false })}
+      />
+
+      {/* New Note modal (M10.27 Journey B) */}
+      <NewNoteModal
+        isOpen={!!newNoteModal}
+        targetFolder={newNoteModal?.targetFolder ?? ''}
+        initialName={newNoteInitialName}
+        defaultTemplatePath={config.templates.defaultTemplate ?? undefined}
+        onCreate={handleCreateNoteFromModal}
+        onCancel={() => setNewNoteModal(null)}
+      />
+
+      {/* Folder variables modal (M10.27 Journey C) */}
+      <FolderVariablesModal
+        isOpen={!!folderVariablesModal}
+        folderPath={folderVariablesModal?.folderPath ?? ''}
+        initialVariables={folderVariablesModal?.initialVariables ?? {}}
+        onSave={handleSaveFolderVariables}
+        onCancel={() => setFolderVariablesModal(null)}
       />
 
       {/* Toast Notification Container with Undo */}

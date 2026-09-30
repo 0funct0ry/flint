@@ -12,12 +12,12 @@ import { autocompletion, CompletionContext, CompletionResult } from '@codemirror
 import { ViewMode } from './TitleBar';
 import { NoteFixture, NoteMeta, TreeNodeItem } from '../types';
 import { ConflictBanner } from './ConflictBanner';
-import { ContextMenu, ContextMenuItem } from './ContextMenu';
+import { ContextMenu } from './ContextMenu';
 import { TableBuilderModal, TableBuilderInitial } from './TableBuilderModal';
 import { commandRegistry } from '../commands/registry';
-import * as ec from '../commands/editorCommands';
 import { parseDelimitedSelection, ColumnAlignment } from '../commands/tableBuilder';
 import { setOutlineEditDispatcher } from '../services/outlineEditBridge';
+import { EDITOR_COMMANDS, buildEditorContextMenuItems, setOpenTableBuilder } from '../services/editorContextMenu';
 import { findTaskMarkers } from '../services/taskList';
 import { useSettings } from '../context/SettingsContext';
 
@@ -180,72 +180,9 @@ function getAllNotePaths(tree: TreeNodeItem[]): Array<{ path: string; title?: st
   return result;
 }
 
-/**
- * Bridge from the module-level `EDITOR_COMMANDS` table (shared across the palette, keymap, and
- * context menu) into the single mounted `CenterPane` instance's React state — the only command
- * that needs to open a modal rather than dispatch straight into CodeMirror. Set on mount, cleared
- * on unmount.
- */
-let openTableBuilder: ((view: EditorView) => void) | null = null;
-
-interface EditorCommandDef {
-  id: string;
-  title: string;
-  /** CodeMirror keymap key string, e.g. `'Mod-b'`. Omit when an existing default binding
-   *  (e.g. Select All's Mod-a from `defaultKeymap`) already covers it. */
-  key?: string;
-  shortcutDisplay: string;
-  section: 'insert' | 'format' | 'paragraph' | 'link' | 'clipboard';
-  run: ec.EditorCommand;
-  isEnabled?: (state: EditorState) => boolean;
-}
-
-/**
- * Every Insert/Format/Paragraph/link/clipboard action, defined once and shared across the
- * command palette, the CodeMirror keymap, and the editor context menu (M10.05, SPEC §9.3).
- */
-const EDITOR_COMMANDS: EditorCommandDef[] = [
-  // Insert — always available.
-  { id: 'editor.insert_footnote', title: 'Footnote', key: 'Mod-Alt-f', shortcutDisplay: '⌘⌥F', section: 'insert', run: ec.insertFootnote },
-  { id: 'editor.insert_table', title: 'Table', key: 'Mod-Alt-t', shortcutDisplay: '⌘⌥T', section: 'insert', run: ec.insertTable },
-  { id: 'editor.insert_table_builder', title: 'Table Builder', key: 'Mod-Alt-Shift-t', shortcutDisplay: '⌘⌥⇧T', section: 'insert', run: (view) => { openTableBuilder?.(view); return true; } },
-  { id: 'editor.insert_callout', title: 'Callout', key: 'Mod-Alt-q', shortcutDisplay: '⌘⌥Q', section: 'insert', run: ec.insertCallout() },
-  { id: 'editor.insert_hr', title: 'Horizontal Rule', key: 'Mod-Alt-h', shortcutDisplay: '⌘⌥H', section: 'insert', run: ec.insertHorizontalRule },
-  { id: 'editor.insert_code_block', title: 'Code Block', key: 'Mod-Alt-c', shortcutDisplay: '⌘⌥C', section: 'insert', run: ec.insertCodeBlock },
-  { id: 'editor.insert_math_block', title: 'Math Block', key: 'Mod-Alt-m', shortcutDisplay: '⌘⌥M', section: 'insert', run: ec.insertMathBlock },
-
-  // Format — enabled only with a non-empty selection.
-  { id: 'editor.format_bold', title: 'Bold', key: 'Mod-b', shortcutDisplay: '⌘B', section: 'format', run: ec.formatBold, isEnabled: ec.isFormatEnabled },
-  { id: 'editor.format_italic', title: 'Italic', key: 'Mod-i', shortcutDisplay: '⌘I', section: 'format', run: ec.formatItalic, isEnabled: ec.isFormatEnabled },
-  { id: 'editor.format_strikethrough', title: 'Strikethrough', key: 'Mod-Shift-x', shortcutDisplay: '⌘⇧X', section: 'format', run: ec.formatStrikethrough, isEnabled: ec.isFormatEnabled },
-  { id: 'editor.format_inline_code', title: 'Inline Code', key: 'Mod-Shift-c', shortcutDisplay: '⌘⇧C', section: 'format', run: ec.formatInlineCode, isEnabled: ec.isFormatEnabled },
-  { id: 'editor.format_comment', title: 'Comment', key: 'Mod-/', shortcutDisplay: '⌘/', section: 'format', run: ec.formatComment, isEnabled: ec.isFormatEnabled },
-
-  // Paragraph — enabled only when the cursor/selection is inside a block-level element.
-  { id: 'editor.paragraph_bullet_list', title: 'Bullet List', key: 'Mod-Shift-8', shortcutDisplay: '⌘⇧8', section: 'paragraph', run: ec.paragraphBulletList, isEnabled: ec.isParagraphEnabled },
-  { id: 'editor.paragraph_numbered_list', title: 'Numbered List', key: 'Mod-Shift-7', shortcutDisplay: '⌘⇧7', section: 'paragraph', run: ec.paragraphNumberedList, isEnabled: ec.isParagraphEnabled },
-  { id: 'editor.paragraph_task_list', title: 'Task List', key: 'Mod-Shift-9', shortcutDisplay: '⌘⇧9', section: 'paragraph', run: ec.paragraphTaskList, isEnabled: ec.isParagraphEnabled },
-  { id: 'editor.paragraph_h1', title: 'Heading 1', key: 'Mod-Alt-1', shortcutDisplay: '⌘⌥1', section: 'paragraph', run: ec.paragraphHeading(1), isEnabled: ec.isParagraphEnabled },
-  { id: 'editor.paragraph_h2', title: 'Heading 2', key: 'Mod-Alt-2', shortcutDisplay: '⌘⌥2', section: 'paragraph', run: ec.paragraphHeading(2), isEnabled: ec.isParagraphEnabled },
-  { id: 'editor.paragraph_h3', title: 'Heading 3', key: 'Mod-Alt-3', shortcutDisplay: '⌘⌥3', section: 'paragraph', run: ec.paragraphHeading(3), isEnabled: ec.isParagraphEnabled },
-  { id: 'editor.paragraph_h4', title: 'Heading 4', key: 'Mod-Alt-4', shortcutDisplay: '⌘⌥4', section: 'paragraph', run: ec.paragraphHeading(4), isEnabled: ec.isParagraphEnabled },
-  { id: 'editor.paragraph_h5', title: 'Heading 5', key: 'Mod-Alt-5', shortcutDisplay: '⌘⌥5', section: 'paragraph', run: ec.paragraphHeading(5), isEnabled: ec.isParagraphEnabled },
-  { id: 'editor.paragraph_h6', title: 'Heading 6', key: 'Mod-Alt-6', shortcutDisplay: '⌘⌥6', section: 'paragraph', run: ec.paragraphHeading(6), isEnabled: ec.isParagraphEnabled },
-  { id: 'editor.paragraph_body', title: 'Body', key: 'Mod-Alt-0', shortcutDisplay: '⌘⌥0', section: 'paragraph', run: ec.paragraphBody, isEnabled: ec.isParagraphEnabled },
-  { id: 'editor.paragraph_quote', title: 'Quote', key: 'Mod-Shift-.', shortcutDisplay: '⌘⇧.', section: 'paragraph', run: ec.paragraphQuote, isEnabled: ec.isParagraphEnabled },
-
-  // Links — the first reuses the M6 note-path autocomplete flow, the second is a bare skeleton.
-  { id: 'editor.insert_link', title: 'Add a link', key: 'Mod-Shift-k', shortcutDisplay: '⌘⇧K', section: 'link', run: ec.insertLinkWithAutocomplete },
-  { id: 'editor.insert_external_link', title: 'Add external link', key: 'Mod-k', shortcutDisplay: '⌘K', section: 'link', run: ec.insertExternalLink },
-
-  // Clipboard — via the Tauri clipboard API (SPEC §10.2 CSP), not `navigator.clipboard`.
-  { id: 'editor.cut', title: 'Cut', key: 'Mod-x', shortcutDisplay: '⌘X', section: 'clipboard', run: ec.clipboardCut, isEnabled: ec.isClipboardCutCopyEnabled },
-  { id: 'editor.copy', title: 'Copy', key: 'Mod-c', shortcutDisplay: '⌘C', section: 'clipboard', run: ec.clipboardCopy, isEnabled: ec.isClipboardCutCopyEnabled },
-  { id: 'editor.paste', title: 'Paste', key: 'Mod-v', shortcutDisplay: '⌘V', section: 'clipboard', run: ec.clipboardPaste },
-  // Select All already has its default keybinding (Mod-a) via `defaultKeymap`; listed here so
-  // it also gets a palette entry and a context-menu entry per SPEC §9.3.
-  { id: 'editor.select_all', title: 'Select all', shortcutDisplay: '⌘A', section: 'clipboard', run: ec.selectAllCommand },
-];
+// `EDITOR_COMMANDS`, `openTableBuilder`, and the context-menu builder all moved to
+// `services/editorContextMenu.ts` (M10.27 follow-up) so the Templates screen's body editor can
+// share the exact same command table, keymap, and context menu instead of a parallel copy.
 
 /**
  * Style `%%comment%%` spans in the editor with a muted/dashed treatment (M10.05) — the comment
@@ -428,7 +365,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   // Bridge `editor.insert_table_builder`'s `run` (defined once, module-level, in
   // `EDITOR_COMMANDS`) into this instance's modal state — see `openTableBuilder`'s doc comment.
   useEffect(() => {
-    openTableBuilder = (view) => {
+    setOpenTableBuilder((view) => {
       const { state } = view;
       const range = state.selection.main;
       const selectedText = state.sliceDoc(range.from, range.to);
@@ -451,9 +388,9 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
         initial,
         selectionRange: parsed ? { from: range.from, to: range.to } : null,
       });
-    };
+    });
     return () => {
-      openTableBuilder = null;
+      setOpenTableBuilder(null);
     };
   }, []);
 
@@ -809,81 +746,6 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       if (scrollResetTimer) clearTimeout(scrollResetTimer);
     };
   }, [viewMode, note.path, note.headings]);
-
-  // Build the context-menu item list fresh on each open, so enabled/disabled reflects the
-  // selection/cursor at open time: the two link items, then Format/Paragraph/Insert as flyout
-  // submenus (keeps the top level short), then clipboard actions.
-  const buildMenuItems = (): ContextMenuItem[] => {
-    const view = editorViewRef.current;
-    if (!view) return [];
-    const { state } = view;
-
-    const sep = (id: string): ContextMenuItem => ({ id, label: '', separator: true, onClick: () => {} });
-
-    const toItem = (cmd: EditorCommandDef): ContextMenuItem => {
-      const enabled = cmd.isEnabled ? cmd.isEnabled(state) : true;
-      return {
-        id: cmd.id,
-        label: cmd.title,
-        shortcut: cmd.shortcutDisplay,
-        disabled: !enabled,
-        disabledReason: !enabled
-          ? cmd.section === 'format' || cmd.section === 'clipboard'
-            ? 'Select some text first'
-            : cmd.section === 'paragraph'
-            ? 'Place the cursor in a paragraph, list, or heading first'
-            : undefined
-          : undefined,
-        onClick: () => {
-          view.focus();
-          cmd.run(view);
-        },
-      };
-    };
-
-    const byIds = (...ids: string[]) =>
-      ids
-        .map((id) => EDITOR_COMMANDS.find((c) => c.id === id))
-        .filter((c): c is EditorCommandDef => !!c)
-        .map(toItem);
-
-    const formatSubmenu: ContextMenuItem[] = [
-      ...byIds('editor.format_bold', 'editor.format_italic', 'editor.format_strikethrough', 'editor.format_inline_code'),
-      sep('format-sep-1'),
-      ...byIds('editor.format_comment'),
-    ];
-
-    const paragraphSubmenu: ContextMenuItem[] = [
-      ...byIds('editor.paragraph_bullet_list', 'editor.paragraph_numbered_list', 'editor.paragraph_task_list'),
-      sep('paragraph-sep-1'),
-      ...byIds(
-        'editor.paragraph_h1',
-        'editor.paragraph_h2',
-        'editor.paragraph_h3',
-        'editor.paragraph_h4',
-        'editor.paragraph_h5',
-        'editor.paragraph_h6',
-        'editor.paragraph_body',
-        'editor.paragraph_quote'
-      ),
-    ];
-
-    const insertSubmenu: ContextMenuItem[] = [
-      ...byIds('editor.insert_footnote', 'editor.insert_table', 'editor.insert_table_builder', 'editor.insert_callout', 'editor.insert_hr'),
-      sep('insert-sep-1'),
-      ...byIds('editor.insert_code_block', 'editor.insert_math_block'),
-    ];
-
-    return [
-      ...byIds('editor.insert_link', 'editor.insert_external_link'),
-      sep('sep-1'),
-      { id: 'group-format', label: 'Format', submenu: formatSubmenu, onClick: () => {} },
-      { id: 'group-paragraph', label: 'Paragraph', submenu: paragraphSubmenu, onClick: () => {} },
-      { id: 'group-insert', label: 'Insert', submenu: insertSubmenu, onClick: () => {} },
-      sep('sep-2'),
-      ...byIds('editor.cut', 'editor.copy', 'editor.paste', 'editor.select_all'),
-    ];
-  };
 
   // Navigate to link target helper
   const navigateToLink = (rawTarget: string) => {
@@ -1451,7 +1313,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
             <ContextMenu
               x={contextMenuState.x}
               y={contextMenuState.y}
-              items={buildMenuItems()}
+              items={editorViewRef.current ? buildEditorContextMenuItems(editorViewRef.current) : []}
               onClose={() => setContextMenuState(null)}
             />
           )}

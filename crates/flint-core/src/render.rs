@@ -428,6 +428,7 @@ fn render_embed(
     workspace_root: Option<&Path>,
     note_relative_path: Option<&str>,
     wikilinks_enabled: bool,
+    features: MarkdownFeatures,
     filename_stems: &HashMap<String, Vec<NotePath>>,
     visited: &mut Vec<NotePath>,
     depth: usize,
@@ -485,6 +486,7 @@ fn render_embed(
                 Some(root),
                 Some(&path),
                 wikilinks_enabled,
+                features,
                 Some(filename_stems),
                 visited,
                 depth + 1,
@@ -532,6 +534,48 @@ pub fn render_note_markdown_with_config(
     wikilinks_enabled: bool,
     filename_stems: Option<&HashMap<String, Vec<NotePath>>>,
 ) -> RenderResult {
+    render_note_markdown_with_features(
+        raw_content,
+        theme,
+        workspace_root,
+        note_relative_path,
+        wikilinks_enabled,
+        MarkdownFeatures::default(),
+        filename_stems,
+    )
+}
+
+/// Which optional Markdown extensions the renderer enables (`markdown.math`/`tables`/
+/// `footnotes`/`smartPunctuation`). Defaults to everything on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkdownFeatures {
+    pub math: bool,
+    pub tables: bool,
+    pub footnotes: bool,
+    pub smart_punctuation: bool,
+}
+
+impl Default for MarkdownFeatures {
+    fn default() -> Self {
+        Self {
+            math: true,
+            tables: true,
+            footnotes: true,
+            smart_punctuation: true,
+        }
+    }
+}
+
+/// Same as [`render_note_markdown_with_config`], with explicit [`MarkdownFeatures`].
+pub fn render_note_markdown_with_features(
+    raw_content: &str,
+    theme: &str,
+    workspace_root: Option<&Path>,
+    note_relative_path: Option<&str>,
+    wikilinks_enabled: bool,
+    features: MarkdownFeatures,
+    filename_stems: Option<&HashMap<String, Vec<NotePath>>>,
+) -> RenderResult {
     // Seed the cycle-detection set with the top-level note's own path so a note that (directly or
     // indirectly) embeds itself is caught rather than recursing forever (M10.24).
     let mut visited: Vec<NotePath> = Vec::new();
@@ -544,6 +588,7 @@ pub fn render_note_markdown_with_config(
         workspace_root,
         note_relative_path,
         wikilinks_enabled,
+        features,
         filename_stems,
         &mut visited,
         0,
@@ -561,6 +606,7 @@ fn render_note_markdown_recursive(
     workspace_root: Option<&Path>,
     note_relative_path: Option<&str>,
     wikilinks_enabled: bool,
+    features: MarkdownFeatures,
     filename_stems: Option<&HashMap<String, Vec<NotePath>>>,
     visited: &mut Vec<NotePath>,
     depth: usize,
@@ -580,14 +626,24 @@ fn render_note_markdown_recursive(
 
     let body_without_comments = strip_comments(body);
     let body_with_wikilinks = rewrite_wikilinks(&body_without_comments, wikilinks_enabled);
-    let (protected_body, math_spans) = protect_math(&body_with_wikilinks);
+    let (protected_body, math_spans) = if features.math {
+        protect_math(&body_with_wikilinks)
+    } else {
+        (body_with_wikilinks.clone(), Vec::new())
+    };
 
     let mut options = Options::empty();
-    options.insert(Options::ENABLE_TABLES);
-    options.insert(Options::ENABLE_FOOTNOTES);
+    if features.tables {
+        options.insert(Options::ENABLE_TABLES);
+    }
+    if features.footnotes {
+        options.insert(Options::ENABLE_FOOTNOTES);
+    }
     options.insert(Options::ENABLE_STRIKETHROUGH);
     options.insert(Options::ENABLE_TASKLISTS);
-    options.insert(Options::ENABLE_SMART_PUNCTUATION);
+    if features.smart_punctuation {
+        options.insert(Options::ENABLE_SMART_PUNCTUATION);
+    }
     options.insert(Options::ENABLE_HEADING_ATTRIBUTES);
 
     let mut parser = Parser::new_ext(&protected_body, options).peekable();
@@ -849,6 +905,7 @@ fn render_note_markdown_recursive(
                         workspace_root,
                         note_relative_path,
                         wikilinks_enabled,
+                        features,
                         filename_stems,
                         visited,
                         depth,

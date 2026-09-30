@@ -8,7 +8,11 @@ pub mod render;
 pub mod template;
 pub use config::{config_get, config_reset, config_set, validate_ignore_patterns};
 pub use render::{render_note_markdown, RenderResult};
-pub use template::{list_templates, render_template, TemplateContext, TemplateMeta, TEMPLATES_DIR};
+pub use template::{
+    list_templates, missing_required_variables, parse_template_variables, render_template,
+    resolve_variables, serialize_template_variables, TemplateContext, TemplateMeta,
+    TemplateVariableDef, TemplateVariableKind, TEMPLATES_DIR, TEMPLATE_VARIABLES_FIELD,
+};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -594,6 +598,17 @@ pub fn set_front_matter_fields(content: &str, fields: &[(String, String)]) -> St
         body.to_string()
     } else {
         format!("{fm}{body}")
+    }
+}
+
+/// Replace a note's body while leaving its front-matter block (if any) byte-for-byte unchanged —
+/// the inverse counterpart of [`set_front_matter_fields`], needed wherever only the body is being
+/// edited (M10.27 template body editor) without touching declared front-matter fields.
+pub fn set_note_body(content: &str, new_body: &str) -> String {
+    let (raw_fm, _, _, _) = parse_front_matter(content);
+    match raw_fm {
+        Some(fm) => format!("---\n{fm}\n---\n{new_body}"),
+        None => new_body.to_string(),
     }
 }
 
@@ -3946,6 +3961,35 @@ mod tests {
         let content = "---\ntitle: Safe Note\n---\nBody.\n";
         let updated = set_front_matter_fields(content, &[]);
         assert_eq!(updated, "Body.\n");
+    }
+
+    #[test]
+    fn test_set_note_body_preserves_front_matter_replaces_body() {
+        let content = "---\ntitle: Safe Note\ncustom: keep_me\n---\nOld body.\n";
+        let updated = set_note_body(content, "New body.\n");
+        assert_eq!(
+            updated,
+            "---\ntitle: Safe Note\ncustom: keep_me\n---\nNew body.\n"
+        );
+    }
+
+    #[test]
+    fn test_set_note_body_with_no_front_matter_is_just_the_new_body() {
+        let content = "Old body.\n";
+        let updated = set_note_body(content, "New body.\n");
+        assert_eq!(updated, "New body.\n");
+    }
+
+    #[test]
+    fn test_set_note_body_round_trips_through_parse_front_matter() {
+        let content = "---\ntemplateVariables: '[]'\n---\n# {{title}}\n\nSome text.\n";
+        let updated = set_note_body(content, "# {{title}}\n\nEdited text.\n");
+        let (_, body, _, fields) = parse_front_matter(&updated);
+        assert_eq!(body, "# {{title}}\n\nEdited text.\n");
+        assert_eq!(
+            fields,
+            vec![("templateVariables".to_string(), "'[]'".to_string())]
+        );
     }
 
     #[test]

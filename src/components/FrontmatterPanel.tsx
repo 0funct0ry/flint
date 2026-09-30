@@ -15,6 +15,9 @@ export const FrontmatterPanel: React.FC<FrontmatterPanelProps> = ({ fields, onSa
   const [draftValue, setDraftValue] = useState('');
   const [confirmingDeleteRow, setConfirmingDeleteRow] = useState<number | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  // Set right before a Tab-driven key→value handoff replaces `editing` in the same tick, so the
+  // outgoing input's blur (fired by React unmounting it) doesn't re-commit stale state on top.
+  const suppressNextBlurRef = useRef(false);
 
   // Reflect fresh data from the backend (e.g. after external reload / another edit).
   useEffect(() => {
@@ -42,19 +45,33 @@ export const FrontmatterPanel: React.FC<FrontmatterPanelProps> = ({ fields, onSa
     setDraftValue(column === 'key' ? rows[row][0] : rows[row][1]);
   };
 
-  const commitEdit = () => {
-    if (!editing) return;
+  /** Applies the current draft into `rows`/persists it, without touching `editing` state. */
+  const applyDraft = (): FrontMatterField[] => {
+    if (!editing) return rows;
     const { row, column } = editing;
     const next = rows.map((field, idx) => {
       if (idx !== row) return field;
       return column === 'key' ? ([draftValue, field[1]] as FrontMatterField) : ([field[0], draftValue] as FrontMatterField);
     });
-    setEditing(null);
     commitRows(next);
+    return next;
+  };
+
+  const commitEdit = () => {
+    applyDraft();
+    setEditing(null);
   };
 
   const cancelEdit = () => {
     setEditing(null);
+  };
+
+  const handleBlur = () => {
+    if (suppressNextBlurRef.current) {
+      suppressNextBlurRef.current = false;
+      return;
+    }
+    commitEdit();
   };
 
   const handleCellKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
@@ -64,6 +81,22 @@ export const FrontmatterPanel: React.FC<FrontmatterPanelProps> = ({ fields, onSa
     } else if (e.key === 'Escape') {
       e.preventDefault();
       cancelEdit();
+    } else if (e.key === 'Tab' && !e.shiftKey && editing?.column === 'key') {
+      // Hand off from key -> value in the same row instead of tabbing out of the table.
+      e.preventDefault();
+      const row = editing.row;
+      const next = applyDraft();
+      suppressNextBlurRef.current = true;
+      setDraftValue(next[row][1]);
+      setEditing({ row, column: 'value' });
+    } else if (e.key === 'Tab' && e.shiftKey && editing?.column === 'value') {
+      // Symmetric handoff back from value -> key.
+      e.preventDefault();
+      const row = editing.row;
+      const next = applyDraft();
+      suppressNextBlurRef.current = true;
+      setDraftValue(next[row][0]);
+      setEditing({ row, column: 'key' });
     }
   };
 
@@ -116,7 +149,11 @@ export const FrontmatterPanel: React.FC<FrontmatterPanelProps> = ({ fields, onSa
                     value={draftValue}
                     onChange={(e) => setDraftValue(e.target.value)}
                     onKeyDown={handleCellKeyDown}
-                    onBlur={commitEdit}
+                    onBlur={handleBlur}
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
                     className="w-full bg-[var(--panel)] border border-[var(--accent)] rounded-sm px-1 py-0.5 text-[var(--text)] outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent)]"
                     aria-label={`Key for row ${row + 1}`}
                   />
@@ -136,7 +173,11 @@ export const FrontmatterPanel: React.FC<FrontmatterPanelProps> = ({ fields, onSa
                     value={draftValue}
                     onChange={(e) => setDraftValue(e.target.value)}
                     onKeyDown={handleCellKeyDown}
-                    onBlur={commitEdit}
+                    onBlur={handleBlur}
+                    autoComplete="off"
+                    autoCorrect="off"
+                    autoCapitalize="off"
+                    spellCheck={false}
                     className="w-full bg-[var(--panel)] border border-[var(--accent)] rounded-sm px-1 py-0.5 text-[var(--text)] outline-none focus-visible:ring-1 focus-visible:ring-[var(--accent)]"
                     aria-label={`Value for row ${row + 1}`}
                   />

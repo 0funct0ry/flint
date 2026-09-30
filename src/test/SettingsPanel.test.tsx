@@ -40,6 +40,11 @@ function mockUseSettings(overrides?: Partial<{
   return { setField, resetField };
 }
 
+function renderPanel(tabName?: string) {
+  render(<SettingsPanel onClose={vi.fn()} onOpenTemplates={vi.fn()} />);
+  if (tabName) fireEvent.click(screen.getByRole('tab', { name: tabName }));
+}
+
 describe('SettingsPanel', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -47,19 +52,16 @@ describe('SettingsPanel', () => {
 
   it('renders all sections', () => {
     mockUseSettings();
-    render(<SettingsPanel onClose={vi.fn()} />);
+    render(<SettingsPanel onClose={vi.fn()} onOpenTemplates={vi.fn()} />);
 
-    expect(screen.getByText('General')).toBeInTheDocument();
-    expect(screen.getByText('Editor')).toBeInTheDocument();
-    expect(screen.getByText('Markdown')).toBeInTheDocument();
-    expect(screen.getByText('Behaviour')).toBeInTheDocument();
-    expect(screen.getByText('UI')).toBeInTheDocument();
-    expect(screen.getByText('Ignore')).toBeInTheDocument();
+    for (const name of ['General', 'Editor', 'Markdown', 'Behaviour', 'Notes & templates', 'MCP server', 'Ignore']) {
+      expect(screen.getByRole('tab', { name })).toBeInTheDocument();
+    }
   });
 
   it('calls setField with the correct dotted path and value when a field changes', () => {
     const { setField } = mockUseSettings();
-    render(<SettingsPanel onClose={vi.fn()} />);
+    renderPanel('Editor');
 
     const fontSizeInput = screen.getByLabelText('Editor font size') as HTMLInputElement;
     fireEvent.change(fontSizeInput, { target: { value: '18' } });
@@ -69,16 +71,16 @@ describe('SettingsPanel', () => {
 
   it('calls resetField when reset is clicked on an overridden field, and disables reset otherwise', () => {
     const { resetField } = mockUseSettings({ origins: { 'editor.fontSize': 'workspace' } });
-    render(<SettingsPanel onClose={vi.fn()} />);
+    renderPanel('Editor');
 
     const resetButtons = screen.getAllByRole('button', { name: 'Reset to default' });
-    // The first FieldRow is theme (default, disabled); editor.fontSize is the second row.
-    const fontSizeResetButton = resetButtons[1];
+    // editor.fontSize is the first FieldRow on the Editor tab; font family (default) is second.
+    const fontSizeResetButton = resetButtons[0];
     expect(fontSizeResetButton).not.toBeDisabled();
     fireEvent.click(fontSizeResetButton);
     expect(resetField).toHaveBeenCalledWith('editor.fontSize');
 
-    const themeResetButton = resetButtons[0];
+    const themeResetButton = resetButtons[1];
     expect(themeResetButton).toBeDisabled();
   });
 
@@ -87,7 +89,7 @@ describe('SettingsPanel', () => {
     vi.spyOn(api, 'configValidateIgnore').mockResolvedValue([null, 'Unbalanced [ ] in glob pattern']);
     vi.useFakeTimers();
 
-    render(<SettingsPanel onClose={vi.fn()} />);
+    renderPanel('Ignore');
 
     const textarea = screen.getByLabelText('Ignore glob patterns, one per line') as HTMLTextAreaElement;
     fireEvent.change(textarea, { target: { value: 'node_modules/**\n[bad' } });
@@ -113,7 +115,7 @@ describe('SettingsPanel', () => {
       hasToken: false,
     });
 
-    render(<SettingsPanel onClose={vi.fn()} />);
+    renderPanel('MCP server');
 
     expect(await screen.findByText(/listening on http:\/\/127\.0\.0\.1:4870\/mcp/)).toBeInTheDocument();
     expect(screen.queryByText('rotate token')).not.toBeInTheDocument();
@@ -130,7 +132,7 @@ describe('SettingsPanel', () => {
     });
     const rotateSpy = vi.spyOn(api, 'mcpRotateToken').mockResolvedValue('new-token');
 
-    render(<SettingsPanel onClose={vi.fn()} />);
+    renderPanel('MCP server');
 
     const generateButton = await screen.findByText('generate token');
     expect(screen.getByText(/rejected until a token is generated/)).toBeInTheDocument();
@@ -155,7 +157,7 @@ describe('SettingsPanel', () => {
     vi.spyOn(api, 'mcpGetToken').mockResolvedValue('existing-token');
     const rotateSpy = vi.spyOn(api, 'mcpRotateToken').mockResolvedValue('rotated-token');
 
-    render(<SettingsPanel onClose={vi.fn()} />);
+    renderPanel('MCP server');
 
     expect(await screen.findByText('existing-token')).toBeInTheDocument();
     const rotateButton = screen.getByText('rotate token');
@@ -176,7 +178,7 @@ describe('SettingsPanel', () => {
       requiresAuth: false,
       hasToken: false,
     });
-    render(<SettingsPanel onClose={vi.fn()} />);
+    renderPanel('MCP server');
 
     fireEvent.click(screen.getByLabelText('MCP server enabled'));
     expect(setField).toHaveBeenCalledWith('mcp.enabled', true);
@@ -189,7 +191,7 @@ describe('SettingsPanel', () => {
       requiresAuth: false,
       hasToken: false,
     });
-    render(<SettingsPanel onClose={vi.fn()} />);
+    renderPanel('MCP server');
 
     fireEvent.click(screen.getByLabelText('Require bearer token for MCP server'));
     expect(setField).toHaveBeenCalledWith('mcp.requireAuth', true);
@@ -197,7 +199,7 @@ describe('SettingsPanel', () => {
 
   it('toggles markdown.wikilinks through setField', () => {
     const { setField } = mockUseSettings();
-    render(<SettingsPanel onClose={vi.fn()} />);
+    renderPanel('Markdown');
 
     fireEvent.click(screen.getByLabelText('Wikilinks'));
     expect(setField).toHaveBeenCalledWith('markdown.wikilinks', true);
@@ -210,7 +212,7 @@ describe('SettingsPanel', () => {
         markdown: { ...baseConfig.markdown, wikilinks: true, newLinkSyntax: 'wikilink' },
       },
     });
-    render(<SettingsPanel onClose={vi.fn()} />);
+    renderPanel('Markdown');
 
     fireEvent.click(screen.getByLabelText('Wikilinks'));
     expect(setField).toHaveBeenCalledWith('markdown.wikilinks', false);
@@ -219,7 +221,7 @@ describe('SettingsPanel', () => {
 
   it('disables the new link syntax selector while wikilinks is off', () => {
     mockUseSettings();
-    render(<SettingsPanel onClose={vi.fn()} />);
+    renderPanel('Markdown');
 
     expect(screen.getByLabelText('New link syntax')).toBeDisabled();
   });
@@ -227,7 +229,7 @@ describe('SettingsPanel', () => {
   describe('Templates / New notes / Daily notes (M10.26)', () => {
     it('renders all three new sections', () => {
       mockUseSettings();
-      render(<SettingsPanel onClose={vi.fn()} />);
+      renderPanel('Notes & templates');
 
       expect(screen.getByText('Templates')).toBeInTheDocument();
       expect(screen.getByText('New notes')).toBeInTheDocument();
@@ -237,9 +239,11 @@ describe('SettingsPanel', () => {
     it('shows the empty-templates hint and disables the pickers when there are no templates', async () => {
       mockUseSettings();
       vi.spyOn(api, 'templatesList').mockResolvedValue([]);
-      render(<SettingsPanel onClose={vi.fn()} />);
+      renderPanel('Notes & templates');
 
-      expect(await screen.findAllByText('No templates yet — add one in .flint/templates/')).toHaveLength(2);
+      expect(
+        await screen.findAllByText('No templates yet — create one from Manage templates above.')
+      ).toHaveLength(2);
       expect(screen.getByLabelText('Default template')).toBeDisabled();
       expect(screen.getByLabelText('Daily note template')).toBeDisabled();
     });
@@ -250,7 +254,7 @@ describe('SettingsPanel', () => {
         { name: 'daily', path: 'daily.md' },
         { name: 'meeting', path: 'meeting.md' },
       ]);
-      render(<SettingsPanel onClose={vi.fn()} />);
+      renderPanel('Notes & templates');
 
       expect(await screen.findByLabelText('Default template')).not.toBeDisabled();
       expect(screen.getAllByRole('option', { name: 'meeting' })).toHaveLength(2);
@@ -258,7 +262,7 @@ describe('SettingsPanel', () => {
 
     it('sets newNote.filenamePattern and newNote.insertHeading through setField', () => {
       const { setField } = mockUseSettings();
-      render(<SettingsPanel onClose={vi.fn()} />);
+      renderPanel('Notes & templates');
 
       fireEvent.change(screen.getByLabelText('New note filename pattern'), {
         target: { value: '{{date}}-{{title}}' },
@@ -271,7 +275,7 @@ describe('SettingsPanel', () => {
 
     it('toggles dailyNotes.enabled and edits the path pattern through setField', () => {
       const { setField } = mockUseSettings();
-      render(<SettingsPanel onClose={vi.fn()} />);
+      renderPanel('Notes & templates');
 
       fireEvent.click(screen.getByLabelText('Daily notes enabled'));
       expect(setField).toHaveBeenCalledWith('dailyNotes.enabled', true);

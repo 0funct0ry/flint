@@ -2,9 +2,14 @@ import React, { useEffect, useRef, useState } from 'react';
 import { useSettings } from '../context/SettingsContext';
 import { api } from '../services/ipc';
 import { McpStatus, TemplateMeta } from '../types';
+import { KeyValueRows } from './KeyValueRows';
 
 export interface SettingsPanelProps {
   onClose: () => void;
+  /** Opens the full-screen Templates management view (create/edit/list/delete) — M10.27
+   * follow-up: authoring/editing templates moved out of Settings and the New Note modal into its
+   * own screen. */
+  onOpenTemplates: () => void;
 }
 
 /** A small pill showing whether a field is at its default or overridden at workspace scope. */
@@ -70,7 +75,19 @@ const inputClass =
   'text-[12.5px] bg-[var(--panel)] border border-[var(--border)] rounded-[4px] px-1.5 py-[3px] text-[var(--text)] w-20 focus-visible:outline-none';
 const checkboxClass = 'w-3.5 h-3.5 accent-[var(--accent)]';
 
-export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
+const TABS = [
+  { id: 'general', label: 'General' },
+  { id: 'editor', label: 'Editor' },
+  { id: 'markdown', label: 'Markdown' },
+  { id: 'behaviour', label: 'Behaviour' },
+  { id: 'notes', label: 'Notes & templates' },
+  { id: 'mcp', label: 'MCP server' },
+  { id: 'ignore', label: 'Ignore' },
+] as const;
+type TabId = (typeof TABS)[number]['id'];
+
+export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose, onOpenTemplates }) => {
+  const [tab, setTab] = useState<TabId>('general');
   const { config, origins, notice, setField, resetField, dismissNotice } = useSettings();
   const [ignoreText, setIgnoreText] = useState(config.ignore.join('\n'));
   const [ignoreErrors, setIgnoreErrors] = useState<Record<number, string>>({});
@@ -180,7 +197,44 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
         </div>
       )}
 
-      <div className="flex-1 overflow-auto min-h-0">
+      <div className="shrink-0 border-b border-[var(--border)]">
+      <div
+        role="tablist"
+        aria-label="Settings sections"
+        className="flex items-center gap-0.5 w-full max-w-[720px] mx-auto px-6 pt-4 overflow-x-auto overflow-y-hidden"
+        onKeyDown={(e) => {
+          if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+          const idx = TABS.findIndex((t) => t.id === tab);
+          const next = TABS[(idx + (e.key === 'ArrowRight' ? 1 : TABS.length - 1)) % TABS.length];
+          setTab(next.id);
+          e.preventDefault();
+          document.getElementById(`settings-tab-${next.id}`)?.focus();
+        }}
+      >
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            id={`settings-tab-${t.id}`}
+            role="tab"
+            aria-selected={tab === t.id}
+            tabIndex={tab === t.id ? 0 : -1}
+            onClick={() => setTab(t.id)}
+            className={`text-[12px] px-2.5 py-1.5 -mb-px border-b-2 whitespace-nowrap transition-colors ${
+              tab === t.id
+                ? 'border-[var(--accent)] text-[var(--text)]'
+                : 'border-transparent text-[var(--muted)] hover:text-[var(--text)]'
+            }`}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+      </div>
+
+      <div className="flex-1 overflow-auto min-h-0" role="tabpanel" aria-labelledby={`settings-tab-${tab}`}>
+      <div className="w-full max-w-[720px] mx-auto px-6 py-4">
+        {tab === 'general' && (
+        <>
         <SectionHeader title="General" />
         <FieldRow label="Theme" path="theme" origins={origins} onReset={resetField}>
           <select
@@ -195,6 +249,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           </select>
         </FieldRow>
 
+        </>
+        )}
+        {tab === 'editor' && (
+        <>
         <SectionHeader title="Editor" />
         <FieldRow label="Font size" path="editor.fontSize" origins={origins} onReset={resetField}>
           <input
@@ -257,6 +315,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           />
         </FieldRow>
 
+        </>
+        )}
+        {tab === 'markdown' && (
+        <>
         <SectionHeader title="Markdown" />
         <FieldRow label="Math" path="markdown.math" origins={origins} onReset={resetField}>
           <input
@@ -329,6 +391,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           </select>
         </FieldRow>
 
+        </>
+        )}
+        {tab === 'behaviour' && (
+        <>
         <SectionHeader title="Behaviour" />
         <FieldRow label="Autosave (ms)" path="behaviour.autosaveMs" origins={origins} onReset={resetField}>
           <input
@@ -379,6 +445,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           </select>
         </FieldRow>
 
+        </>
+        )}
+        {tab === 'general' && (
+        <>
         <SectionHeader title="UI" />
         <FieldRow label="Left sidebar" path="ui.leftSidebar" origins={origins} onReset={resetField}>
           <select
@@ -411,6 +481,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           />
         </FieldRow>
 
+        </>
+        )}
+        {tab === 'mcp' && (
+        <>
         <SectionHeader title="MCP Server" />
         <FieldRow
           label="Enabled"
@@ -498,7 +572,22 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           </div>
         )}
 
+        </>
+        )}
+        {tab === 'notes' && (
+        <>
         <SectionHeader title="Templates" />
+        <div className="flex items-center justify-between px-3 pb-2">
+          <span className="text-[11.5px] text-[var(--muted)]">
+            Create, edit, and delete templates from their own screen.
+          </span>
+          <button
+            onClick={onOpenTemplates}
+            className="text-[11.5px] px-2.5 py-[4px] rounded-[5px] border border-[var(--border)] text-[var(--text)] hover:bg-[var(--panel-2)] transition-colors shrink-0"
+          >
+            Manage templates…
+          </button>
+        </div>
         <FieldRow
           label="Default template"
           path="templates.defaultTemplate"
@@ -506,7 +595,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           onReset={resetField}
           hint={
             templates.length === 0
-              ? 'No templates yet — add one in .flint/templates/'
+              ? 'No templates yet — create one from Manage templates above.'
               : 'Pre-selected option in the new-note template picker.'
           }
         >
@@ -526,6 +615,27 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           </select>
         </FieldRow>
 
+        <div className="px-3 pb-3 flex flex-col gap-1.5">
+          <span className="text-[11.5px] text-[var(--muted)]">
+            Variables — defaults available to any template, anywhere in the workspace, unless
+            overridden by a folder scope or a value typed into the New Note modal.
+          </span>
+          <KeyValueRows
+            entries={Object.entries(config.templates.globalVariables ?? {})}
+            onChange={(entries) => {
+              const map: Record<string, string> = {};
+              for (const [k, v] of entries) {
+                if (k.trim()) map[k.trim()] = v;
+              }
+              setField('templates.globalVariables', map);
+            }}
+          />
+        </div>
+
+        </>
+        )}
+        {tab === 'notes' && (
+        <>
         <SectionHeader title="New notes" />
         <FieldRow
           label="Target folder"
@@ -575,6 +685,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           />
         </FieldRow>
 
+        </>
+        )}
+        {tab === 'notes' && (
+        <>
         <SectionHeader title="Daily notes" />
         <FieldRow
           label="Enabled"
@@ -612,7 +726,7 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           path="dailyNotes.template"
           origins={origins}
           onReset={resetField}
-          hint={templates.length === 0 ? 'No templates yet — add one in .flint/templates/' : undefined}
+          hint={templates.length === 0 ? 'No templates yet — create one from Manage templates above.' : undefined}
         >
           <select
             className={selectClass}
@@ -630,6 +744,10 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
           </select>
         </FieldRow>
 
+        </>
+        )}
+        {tab === 'ignore' && (
+        <>
         <SectionHeader title="Ignore" />
         <div className="px-3 pb-3">
           <textarea
@@ -650,6 +768,9 @@ export const SettingsPanel: React.FC<SettingsPanelProps> = ({ onClose }) => {
             </div>
           )}
         </div>
+        </>
+        )}
+      </div>
       </div>
     </div>
   );

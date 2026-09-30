@@ -254,6 +254,93 @@ pub fn list_tools() -> Vec<Value> {
             }),
         ),
         tool_def(
+            "template_create",
+            "Author a new template under .flint/templates/ with a declared variable schema and an authored Markdown body. Placeholders: {{date}}, {{date:FORMAT}}, {{time}}, {{title}}, {{path}}, {{var:name}}, and pipe transforms like {{title|slug}}.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "variables": { "type": "array" },
+                    "body": { "type": "string" }
+                },
+                "required": ["name", "body"]
+            }),
+        ),
+        tool_def(
+            "template_variables_get",
+            "Read a template file's declared variable schema (templateVariables front-matter field).",
+            json!({
+                "type": "object",
+                "properties": { "template_path": { "type": "string" } },
+                "required": ["template_path"]
+            }),
+        ),
+        tool_def(
+            "template_variables_set",
+            "Rewrite a template file's templateVariables front-matter field, leaving its body untouched.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "template_path": { "type": "string" },
+                    "variables": { "type": "array" }
+                },
+                "required": ["template_path", "variables"]
+            }),
+        ),
+        tool_def(
+            "template_body_get",
+            "Read a template file's body (everything after its front-matter block, if any).",
+            json!({
+                "type": "object",
+                "properties": { "template_path": { "type": "string" } },
+                "required": ["template_path"]
+            }),
+        ),
+        tool_def(
+            "template_body_set",
+            "Rewrite only a template file's body, leaving its templateVariables front-matter field untouched.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "template_path": { "type": "string" },
+                    "body": { "type": "string" }
+                },
+                "required": ["template_path", "body"]
+            }),
+        ),
+        tool_def(
+            "resolve_new_note_variables",
+            "Resolve a template's declared variables against folder/global scope precedence (explicit > folder > global > schema default).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "template_path": { "type": "string" },
+                    "target_folder": { "type": "string" }
+                }
+            }),
+        ),
+        tool_def(
+            "folder_variables_get",
+            "Read one folder's variable scope (name/value defaults for templates created under it).",
+            json!({
+                "type": "object",
+                "properties": { "folder_path": { "type": "string" } },
+                "required": ["folder_path"]
+            }),
+        ),
+        tool_def(
+            "folder_variables_set",
+            "Write one folder's variable scope.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "folder_path": { "type": "string" },
+                    "variables": { "type": "object" }
+                },
+                "required": ["folder_path", "variables"]
+            }),
+        ),
+        tool_def(
             "note_insert_link",
             "Insert a Markdown inline link to another note, either at a given line or appended to a 'Related' section (created if absent).",
             json!({
@@ -386,6 +473,8 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
             struct Args {
                 path: String,
                 template: Option<String>,
+                #[serde(default)]
+                variables: HashMap<String, String>,
             }
             let args: Args = parse_args(arguments)?;
             let safe = resolve(ctx.root, &args.path)?;
@@ -393,9 +482,14 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
             // Same template-file-path semantics as the `note_create` IPC command (M10.26) —
             // MCP writes must never diverge from what the GUI's "+" flow produces.
             let title = flint_core::resolve_note_title("", safe.as_relative_path());
-            let content =
-                crate::resolve_new_note_content(ctx.root, &posix, &title, args.template.as_deref())
-                    .map_err(plain_error)?;
+            let content = crate::resolve_new_note_content_with_variables(
+                ctx.root,
+                &posix,
+                &title,
+                args.template.as_deref(),
+                &args.variables,
+            )
+            .map_err(plain_error)?;
             let meta = create_note(ctx.root, &safe, Some(&content)).map_err(map_note_error)?;
             crate::record_suppressed_write(
                 ctx.suppressed_writes,
@@ -434,6 +528,7 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
                 title: target_date.format("%Y-%m-%d").to_string(),
                 path: String::new(),
                 now: target_dt,
+                variables: HashMap::new(),
             };
             let rendered_path = flint_core::render_template(&cfg.path_pattern, &path_ctx);
             let safe = resolve(ctx.root, &rendered_path)?;
@@ -449,6 +544,7 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
                 title: title.clone(),
                 path: posix.clone(),
                 now: target_dt,
+                variables: HashMap::new(),
             };
             let content = match cfg.template.as_deref() {
                 Some(name) => {
@@ -456,7 +552,10 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
                     let tpl_safe = resolve(ctx.root, &template_rel)?;
                     let raw = std::fs::read_to_string(tpl_safe.as_path())
                         .map_err(|e| plain_error(e.to_string()))?;
-                    flint_core::render_template(&raw, &note_ctx)
+                    // Strip the template's own front matter before rendering — its
+                    // `templateVariables` schema field describes the template, not the note.
+                    let (_, template_body, _, _) = flint_core::parse_front_matter(&raw);
+                    flint_core::render_template(template_body, &note_ctx)
                 }
                 None => String::new(),
             };
@@ -603,6 +702,185 @@ pub fn call_tool(name: &str, arguments: Value, ctx: &ToolCtx) -> Result<Value, T
             }
             emit_note_event(ctx, "note:changed", &safe.to_posix_string());
             Ok(json!(fp))
+        }
+        "template_create" => {
+            #[derive(Deserialize)]
+            struct Args {
+                name: String,
+                #[serde(default)]
+                variables: Vec<flint_core::TemplateVariableDef>,
+                #[serde(default)]
+                body: String,
+            }
+            let args: Args = parse_args(arguments)?;
+            let (safe, content, meta) =
+                crate::create_template_file(ctx.root, &args.name, &args.variables, &args.body)
+                    .map_err(plain_error)?;
+            let _meta = create_note(ctx.root, &safe, Some(&content)).map_err(map_note_error)?;
+            crate::record_suppressed_write(
+                ctx.suppressed_writes,
+                &safe.to_posix_string(),
+                Some(flint_core::hash_bytes(content.as_bytes())),
+            );
+            if let Ok(mut lock) = ctx.index.write() {
+                lock.insert_or_update_note(ctx.root, &safe, &content);
+            }
+            emit_note_event(ctx, "note:created", &safe.to_posix_string());
+            Ok(json!(meta))
+        }
+        "template_variables_get" => {
+            #[derive(Deserialize)]
+            struct Args {
+                template_path: String,
+            }
+            let args: Args = parse_args(arguments)?;
+            let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, args.template_path);
+            let safe = resolve(ctx.root, &template_rel)?;
+            let raw =
+                std::fs::read_to_string(safe.as_path()).map_err(|e| plain_error(e.to_string()))?;
+            let (_, _, _, fields) = flint_core::parse_front_matter(&raw);
+            let raw_vars = fields
+                .into_iter()
+                .find(|(k, _)| k == flint_core::TEMPLATE_VARIABLES_FIELD)
+                .map(|(_, v)| v)
+                .unwrap_or_default();
+            Ok(json!(flint_core::parse_template_variables(&raw_vars)))
+        }
+        "template_variables_set" => {
+            #[derive(Deserialize)]
+            struct Args {
+                template_path: String,
+                variables: Vec<flint_core::TemplateVariableDef>,
+            }
+            let args: Args = parse_args(arguments)?;
+            let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, args.template_path);
+            let safe = resolve(ctx.root, &template_rel)?;
+            let current =
+                std::fs::read_to_string(safe.as_path()).map_err(|e| plain_error(e.to_string()))?;
+            let new_content = set_front_matter_fields(
+                &current,
+                &[(
+                    flint_core::TEMPLATE_VARIABLES_FIELD.to_string(),
+                    flint_core::serialize_template_variables(&args.variables),
+                )],
+            );
+            let fp =
+                write_note_atomic(ctx.root, &safe, &new_content, None).map_err(map_note_error)?;
+            crate::record_suppressed_write(
+                ctx.suppressed_writes,
+                &safe.to_posix_string(),
+                Some(fp.content_hash.clone()),
+            );
+            if let Ok(mut lock) = ctx.index.write() {
+                lock.insert_or_update_note(ctx.root, &safe, &new_content);
+            }
+            emit_note_event(ctx, "note:changed", &safe.to_posix_string());
+            Ok(json!({ "ok": true }))
+        }
+        "template_body_get" => {
+            #[derive(Deserialize)]
+            struct Args {
+                template_path: String,
+            }
+            let args: Args = parse_args(arguments)?;
+            let body =
+                crate::load_template_body(ctx.root, &args.template_path).map_err(plain_error)?;
+            Ok(json!(body))
+        }
+        "template_body_set" => {
+            #[derive(Deserialize)]
+            struct Args {
+                template_path: String,
+                body: String,
+            }
+            let args: Args = parse_args(arguments)?;
+            let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, args.template_path);
+            let safe = resolve(ctx.root, &template_rel)?;
+            let current =
+                std::fs::read_to_string(safe.as_path()).map_err(|e| plain_error(e.to_string()))?;
+            let new_content = flint_core::set_note_body(&current, &args.body);
+            let fp =
+                write_note_atomic(ctx.root, &safe, &new_content, None).map_err(map_note_error)?;
+            crate::record_suppressed_write(
+                ctx.suppressed_writes,
+                &safe.to_posix_string(),
+                Some(fp.content_hash.clone()),
+            );
+            if let Ok(mut lock) = ctx.index.write() {
+                lock.insert_or_update_note(ctx.root, &safe, &new_content);
+            }
+            emit_note_event(ctx, "note:changed", &safe.to_posix_string());
+            Ok(json!({ "ok": true }))
+        }
+        "resolve_new_note_variables" => {
+            #[derive(Deserialize)]
+            struct Args {
+                template_path: Option<String>,
+                target_folder: Option<String>,
+            }
+            let args: Args = parse_args(arguments)?;
+            let Some(template_path) = args.template_path else {
+                return Ok(json!(Vec::<Value>::new()));
+            };
+            let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, template_path);
+            let safe = resolve(ctx.root, &template_rel)?;
+            let raw =
+                std::fs::read_to_string(safe.as_path()).map_err(|e| plain_error(e.to_string()))?;
+            let (_, _, _, fields) = flint_core::parse_front_matter(&raw);
+            let raw_vars = fields
+                .into_iter()
+                .find(|(k, _)| k == flint_core::TEMPLATE_VARIABLES_FIELD)
+                .map(|(_, v)| v)
+                .unwrap_or_default();
+            let vars = flint_core::parse_template_variables(&raw_vars);
+
+            let config = config_get(ctx.root, None)
+                .map_err(|e| plain_error(e.to_string()))?
+                .config;
+            let folder_scope = flint_core::config::nearest_ancestor_folder_variables(
+                &config,
+                args.target_folder.as_deref().unwrap_or(""),
+            );
+            let global_scope = serde_json::from_value::<flint_core::config::FlintConfig>(config)
+                .map(|c| c.templates.global_variables)
+                .unwrap_or_default();
+            let resolved =
+                flint_core::resolve_variables(&vars, &HashMap::new(), &folder_scope, &global_scope);
+            let out: Vec<Value> = vars
+                .into_iter()
+                .map(|def| {
+                    let resolved_default = resolved.get(&def.name).cloned().unwrap_or_default();
+                    json!({ "def": def, "resolvedDefault": resolved_default })
+                })
+                .collect();
+            Ok(json!(out))
+        }
+        "folder_variables_get" => {
+            #[derive(Deserialize)]
+            struct Args {
+                folder_path: String,
+            }
+            let args: Args = parse_args(arguments)?;
+            let key = flint_core::config::folder_variables_key(&args.folder_path);
+            let result =
+                config_get(ctx.root, Some(&key)).map_err(|e| plain_error(e.to_string()))?;
+            let map: HashMap<String, String> =
+                serde_json::from_value(result.config).unwrap_or_default();
+            Ok(json!(map))
+        }
+        "folder_variables_set" => {
+            #[derive(Deserialize)]
+            struct Args {
+                folder_path: String,
+                variables: HashMap<String, String>,
+            }
+            let args: Args = parse_args(arguments)?;
+            let key = flint_core::config::folder_variables_key(&args.folder_path);
+            let value =
+                serde_json::to_value(&args.variables).map_err(|e| plain_error(e.to_string()))?;
+            flint_core::config_set(ctx.root, &key, value)
+                .map_err(|e| plain_error(e.to_string()))?;
+            Ok(json!({ "ok": true }))
         }
         "note_insert_link" => {
             #[derive(Deserialize)]

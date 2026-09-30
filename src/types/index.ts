@@ -254,9 +254,31 @@ export interface McpConfig {
   requireAuth: boolean;
 }
 
-/** M10.26: which `.flint/templates/` file the new-note picker pre-selects. */
+/** M10.26: which `.flint/templates/` file the new-note picker pre-selects. M10.27 adds
+ * `globalVariables`: Settings → Templates → Variables defaults available to any template. */
 export interface TemplatesConfig {
   defaultTemplate?: string | null;
+  globalVariables?: Record<string, string>;
+}
+
+/** One declared template variable (M10.27) — (de)serialized as the `templateVariables`
+ * front-matter JSON-string field. */
+export type TemplateVariableKind = 'text' | 'date' | 'choice' | 'bool';
+
+export interface TemplateVariableDef {
+  name: string;
+  kind: TemplateVariableKind;
+  default: string;
+  required: boolean;
+  options: string[];
+}
+
+/** One variable's schema plus its precedence-resolved effective value, as returned by
+ * `resolve_new_note_variables` (M10.27) — the frontend renders this rather than reimplementing
+ * the explicit > folder > global > schema-default scope chain. */
+export interface ResolvedTemplateVariable {
+  def: TemplateVariableDef;
+  resolvedDefault: string;
 }
 
 /** M10.26: rules applied to a new note created without an explicit template. */

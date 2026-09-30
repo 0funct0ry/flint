@@ -21,10 +21,12 @@ import {
   FlintConfig,
   McpStatus,
   TemplateMeta,
+  TemplateVariableDef,
+  ResolvedTemplateVariable,
 } from "../types";
 import { FIXTURE_NOTES } from "../fixtures/workspace";
 import { renderMarkdownToHtml, slugify, dedupSlug } from "./markdown";
-import { parseFrontMatter, setFrontMatterFields } from "./frontmatter";
+import { parseFrontMatter, setFrontMatterFields, setBody } from "./frontmatter";
 
 export const isTauriEnvironment = (): boolean => {
   return typeof window !== "undefined" && Boolean((window as any).__TAURI_INTERNALS__);
@@ -73,6 +75,7 @@ const DEFAULT_CONFIG: FlintConfig = {
   },
   templates: {
     defaultTemplate: null,
+    globalVariables: {},
   },
   newNote: {
     targetFolder: null,
@@ -94,29 +97,68 @@ const browserMockTemplates: Record<string, string> = {
   "daily.md": "# {{date}}\n\n## Notes\n\n## Tasks\n\n- [ ] \n",
 };
 
+// Browser dev/test mock for folder-scoped template variables (M10.27 Journey C), keyed by
+// workspace-relative folder path (`""` for the workspace root).
+const browserMockFolderVariables: Record<string, Record<string, string>> = {};
+
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : `${String(n)}`;
 }
 
 /** Minimal mirror of `flint_core::render_template` for the browser mock path — only the default
  * `YYYY-MM-DD`/`HH:mm` formats are supported here; the real formatting lives in Rust. */
-function mockRenderTemplate(body: string, ctx: { title: string; path: string; now: Date }): string {
+function mockApplyTransform(fn: string, value: string): string {
+  switch (fn) {
+    case "slug":
+      return value
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "");
+    case "upper":
+      return value.toUpperCase();
+    case "lower":
+      return value.toLowerCase();
+    case "trim":
+      return value.trim();
+    default:
+      return value;
+  }
+}
+
+function mockRenderTemplate(
+  body: string,
+  ctx: { title: string; path: string; now: Date; variables?: Record<string, string> }
+): string {
   const date = `${ctx.now.getFullYear()}-${pad2(ctx.now.getMonth() + 1)}-${pad2(ctx.now.getDate())}`;
   const time = `${pad2(ctx.now.getHours())}:${pad2(ctx.now.getMinutes())}`;
-  return body.replace(/\{\{\s*([A-Za-z]+)(?::([^}]*))?\s*\}\}/g, (whole, name) => {
-    switch (name) {
-      case "date":
-        return date;
-      case "time":
-        return time;
-      case "title":
-        return ctx.title;
-      case "path":
-        return ctx.path;
-      default:
-        return whole;
+  return body.replace(
+    /\{\{\s*([A-Za-z]+)(?::([^}|]*))?((?:\|[A-Za-z]+)*)\s*\}\}/g,
+    (whole, name, modifier, pipes) => {
+      let value: string | undefined;
+      switch (name) {
+        case "date":
+          value = date;
+          break;
+        case "time":
+          value = time;
+          break;
+        case "title":
+          value = ctx.title;
+          break;
+        case "path":
+          value = ctx.path;
+          break;
+        case "var":
+          value = modifier ? ctx.variables?.[modifier] : undefined;
+          break;
+        default:
+          value = undefined;
+      }
+      if (value === undefined) return whole;
+      const fns: string[] = pipes ? pipes.split("|").filter(Boolean) : [];
+      return fns.reduce((v: string, fn: string) => mockApplyTransform(fn, v), value);
     }
-  });
+  );
 }
 
 const browserMockConfig: FlintConfig = JSON.parse(JSON.stringify(DEFAULT_CONFIG));
@@ -346,16 +388,23 @@ export const api = {
    * `template`, when given, is a path relative to `.flint/templates/` (M10.26) — rendered with
    * `{{date}}`/`{{time}}`/`{{title}}`/`{{path}}` — not literal content.
    */
-  async noteCreate(path: string, template?: string): Promise<NoteMeta> {
+  async noteCreate(path: string, template?: string, variables?: Record<string, string>): Promise<NoteMeta> {
     if (isTauriEnvironment()) {
-      return await invoke<NoteMeta>("note_create", { path, template });
+      return await invoke<NoteMeta>("note_create", { path, template, variables });
     }
 
     const title = path.split("/").pop()?.replace(/\.md$/, "") || "Untitled";
-    const ctx = { title, path, now: new Date() };
+    const ctx = { title, path, now: new Date(), variables };
     let content: string;
     if (template) {
-      content = mockRenderTemplate(browserMockTemplates[template] ?? "", ctx);
+      // The template's own front-matter fields carry over to the note, except the
+      // `templateVariables` schema field (mirrors `render_template_file` on the Rust side).
+      const parsed = parseFrontMatter(browserMockTemplates[template] ?? "");
+      content = mockRenderTemplate(parsed.body, ctx);
+      const fields = parsed.fields
+        .filter(([k]) => k !== "templateVariables")
+        .map(([k, v]) => [k, mockRenderTemplate(v, ctx)] as [string, string]);
+      if (fields.length > 0) content = setFrontMatterFields(content, fields);
     } else if (browserMockConfig.newNote.insertHeading) {
       content = mockRenderTemplate("# {{title}}\n", ctx);
     } else {
@@ -387,14 +436,129 @@ export const api = {
     }));
   },
 
+  /** Author a new `.flint/templates/<slug>.md` file with a declared variable schema and an
+   * authored Markdown body (M10.27 Journey A / follow-up body editor). Returns the created
+   * template's metadata so callers can select it directly. */
+  async templateCreate(
+    name: string,
+    variables: TemplateVariableDef[],
+    body: string
+  ): Promise<TemplateMeta> {
+    if (isTauriEnvironment()) {
+      return await invoke<TemplateMeta>("template_create", { name, variables, body });
+    }
+    const slug = slugify(name);
+    const path = `${slug}.md`;
+    const content = setFrontMatterFields(body, [
+      ["templateVariables", JSON.stringify(variables)],
+    ]);
+    browserMockTemplates[path] = content;
+    return { name, path };
+  },
+
+  /** Read a template file's declared variable schema (M10.27 Journey A, "Edit template
+   * variables…"). */
+  async templateVariablesGet(templatePath: string): Promise<TemplateVariableDef[]> {
+    if (isTauriEnvironment()) {
+      return await invoke<TemplateVariableDef[]>("template_variables_get", {
+        templatePath,
+      });
+    }
+    const raw = browserMockTemplates[templatePath] ?? "";
+    const { fields } = parseFrontMatter(raw);
+    const field = fields.find(([k]) => k === "templateVariables");
+    if (!field) return [];
+    try {
+      return JSON.parse(field[1].replace(/^"|"$/g, "").replace(/\\"/g, '"'));
+    } catch {
+      return [];
+    }
+  },
+
+  /** Rewrite only a template file's `templateVariables` front-matter field (M10.27). */
+  async templateVariablesSet(templatePath: string, variables: TemplateVariableDef[]): Promise<void> {
+    if (isTauriEnvironment()) {
+      await invoke("template_variables_set", { templatePath, variables });
+      return;
+    }
+    const current = browserMockTemplates[templatePath] ?? "";
+    browserMockTemplates[templatePath] = setFrontMatterFields(current, [
+      ["templateVariables", JSON.stringify(variables)],
+    ]);
+  },
+
+  /** Read a template file's body (everything after its front-matter block, if any) for the
+   * Templates screen's CodeMirror body editor (M10.27 follow-up). */
+  async templateBodyGet(templatePath: string): Promise<string> {
+    if (isTauriEnvironment()) {
+      return await invoke<string>("template_body_get", { templatePath });
+    }
+    const raw = browserMockTemplates[templatePath] ?? "";
+    return parseFrontMatter(raw).body;
+  },
+
+  /** Rewrite only a template file's body, leaving its `templateVariables` front-matter field
+   * untouched (M10.27 follow-up). */
+  async templateBodySet(templatePath: string, body: string): Promise<void> {
+    if (isTauriEnvironment()) {
+      await invoke("template_body_set", { templatePath, body });
+      return;
+    }
+    const current = browserMockTemplates[templatePath] ?? "";
+    browserMockTemplates[templatePath] = setBody(current, body);
+  },
+
+  /** Server-side precedence resolution for the New Note modal's variable fields (M10.27 Journey
+   * B/C): explicit > nearest-ancestor folder scope > global scope > schema default. */
+  async resolveNewNoteVariables(
+    templatePath: string | undefined,
+    targetFolder: string | undefined
+  ): Promise<ResolvedTemplateVariable[]> {
+    if (isTauriEnvironment()) {
+      return await invoke<ResolvedTemplateVariable[]>("resolve_new_note_variables", {
+        templatePath,
+        targetFolder,
+      });
+    }
+    if (!templatePath) return [];
+    const defs = await api.templateVariablesGet(templatePath);
+    const globalScope = browserMockConfig.templates.globalVariables ?? {};
+    const folderScope = browserMockFolderVariables[targetFolder ?? ""] ?? {};
+    return defs.map((def) => ({
+      def,
+      resolvedDefault: folderScope[def.name] ?? globalScope[def.name] ?? def.default,
+    }));
+  },
+
+  /** Read one folder's variable scope (M10.27 Journey C). */
+  async folderVariablesGet(folderPath: string): Promise<Record<string, string>> {
+    if (isTauriEnvironment()) {
+      return await invoke<Record<string, string>>("folder_variables_get", { folderPath });
+    }
+    return { ...(browserMockFolderVariables[folderPath] ?? {}) };
+  },
+
+  /** Write one folder's variable scope (M10.27 Journey C, "Folder variables…" modal). */
+  async folderVariablesSet(folderPath: string, variables: Record<string, string>): Promise<void> {
+    if (isTauriEnvironment()) {
+      await invoke("folder_variables_set", { folderPath, variables });
+      return;
+    }
+    browserMockFolderVariables[folderPath] = { ...variables };
+  },
+
   /**
    * Open (creating on first use) the daily note for a day. `offsetDays` is relative to today
    * (`-1` yesterday, `0`/undefined today, `1` tomorrow); `date` (`YYYY-MM-DD`) picks an explicit
    * day and wins over `offsetDays`. Never called automatically — only from an explicit command.
    */
-  async dailyNoteOpen(offsetDays?: number, date?: string): Promise<NoteMeta> {
+  async dailyNoteOpen(
+    offsetDays?: number,
+    date?: string,
+    variables?: Record<string, string>
+  ): Promise<NoteMeta> {
     if (isTauriEnvironment()) {
-      return await invoke<NoteMeta>("daily_note_open", { offsetDays, date });
+      return await invoke<NoteMeta>("daily_note_open", { offsetDays, date, variables });
     }
 
     const target = date ? new Date(`${date}T00:00:00`) : new Date();
@@ -429,6 +593,18 @@ export const api = {
     if (browserMockStorage[from]) {
       browserMockStorage[to] = browserMockStorage[from];
       delete browserMockStorage[from];
+    }
+
+    // `.flint/templates/*.md` files are plain notes too (M10.27) but live in a separate mock
+    // store; renaming one (e.g. the Templates screen's rename affordance) must move it there too.
+    const templatesPrefix = ".flint/templates/";
+    if (from.startsWith(templatesPrefix) && to.startsWith(templatesPrefix)) {
+      const fromKey = from.slice(templatesPrefix.length);
+      const toKey = to.slice(templatesPrefix.length);
+      if (browserMockTemplates[fromKey] !== undefined) {
+        browserMockTemplates[toKey] = browserMockTemplates[fromKey];
+        delete browserMockTemplates[fromKey];
+      }
     }
 
     return {
@@ -478,6 +654,12 @@ export const api = {
       return await invoke<void>("note_delete", { path, permanent });
     }
     delete browserMockStorage[path];
+    // `.flint/templates/*.md` files are plain notes too (M10.27) but live in a separate mock
+    // store (see `noteRename` above for the same distinction).
+    const templatesPrefix = ".flint/templates/";
+    if (path.startsWith(templatesPrefix)) {
+      delete browserMockTemplates[path.slice(templatesPrefix.length)];
+    }
   },
 
   async folderCreate(path: string): Promise<void> {

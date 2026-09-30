@@ -156,38 +156,73 @@ pub(crate) fn read_daily_notes_config(root: &Path) -> flint_core::config::DailyN
         .unwrap_or_default()
 }
 
+/// Render a template file into note content. The template's own front-matter fields carry over
+/// to the note (with `{{...}}` placeholders resolved), except the `templateVariables` schema
+/// field, which describes the template itself and never belongs on a note.
+fn render_template_file(raw: &str, ctx: &flint_core::TemplateContext) -> String {
+    let (_, template_body, _, fields) = flint_core::parse_front_matter(raw);
+    let body = flint_core::render_template(template_body, ctx);
+    let note_fields: Vec<(String, String)> = fields
+        .into_iter()
+        .filter(|(k, _)| k != flint_core::TEMPLATE_VARIABLES_FIELD)
+        .map(|(k, v)| (k, flint_core::render_template(&v, ctx)))
+        .collect();
+    if note_fields.is_empty() {
+        body
+    } else {
+        set_front_matter_fields(&body, &note_fields)
+    }
+}
+
 /// Resolve a `template` argument (a path relative to `.flint/templates/`, per M10.26) to its
 /// rendered content, or fall back to `NewNoteConfig.insert_heading` when no template was picked.
 /// `posix_path`/`title` seed the `{{path}}`/`{{title}}` placeholders. Every path here — including
 /// the template file itself — still crosses [`SafePath::resolve`], the same guard every other
 /// filesystem-touching command uses; `.flint/templates/` is not a special case.
+#[allow(dead_code)]
 pub(crate) fn resolve_new_note_content(
     root: &Path,
     posix_path: &str,
     title: &str,
     template: Option<&str>,
 ) -> Result<String, String> {
+    resolve_new_note_content_with_variables(root, posix_path, title, template, &HashMap::new())
+}
+
+/// Same as [`resolve_new_note_content`], plus (M10.27) resolved `{{var:name}}` values. Variable
+/// values are only substituted into the template text — they are never recorded on the note as
+/// front matter.
+pub(crate) fn resolve_new_note_content_with_variables(
+    root: &Path,
+    posix_path: &str,
+    title: &str,
+    template: Option<&str>,
+    variables: &HashMap<String, String>,
+) -> Result<String, String> {
     let ctx = flint_core::TemplateContext {
         title: title.to_string(),
         path: posix_path.to_string(),
         now: chrono::Local::now(),
+        variables: variables.clone(),
     };
-    match template {
+    let content = match template {
         Some(name) => {
             let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, name);
             let safe = SafePath::resolve(root, &template_rel).map_err(|e| e.to_string())?;
             let raw = std::fs::read_to_string(safe.as_path()).map_err(|e| e.to_string())?;
-            Ok(flint_core::render_template(&raw, &ctx))
+            render_template_file(&raw, &ctx)
         }
         None => {
             let cfg = read_new_note_config(root);
             if cfg.insert_heading {
-                Ok(flint_core::render_template("# {{title}}\n", &ctx))
+                flint_core::render_template("# {{title}}\n", &ctx)
             } else {
-                Ok(String::new())
+                String::new()
             }
         }
-    }
+    };
+
+    Ok(content)
 }
 
 /// Helper to obtain the active workspace root or fallback to current dir.
@@ -785,6 +820,7 @@ fn frontmatter_set(
 fn note_create(
     path: String,
     template: Option<String>,
+    variables: Option<HashMap<String, String>>,
     state: State<AppState>,
 ) -> Result<NoteMeta, String> {
     let root = get_workspace_root(&state)?;
@@ -792,7 +828,13 @@ fn note_create(
     let posix = safe_path.to_posix_string();
     let title = flint_core::resolve_note_title("", safe_path.as_relative_path());
 
-    let content = resolve_new_note_content(&root, &posix, &title, template.as_deref())?;
+    let content = resolve_new_note_content_with_variables(
+        &root,
+        &posix,
+        &title,
+        template.as_deref(),
+        &variables.unwrap_or_default(),
+    )?;
     let meta = create_note(&root, &safe_path, Some(&content)).map_err(|e| e.to_string())?;
 
     let hash = flint_core::hash_bytes(content.as_bytes());
@@ -813,6 +855,259 @@ fn note_create(
 fn templates_list(state: State<AppState>) -> Result<Vec<flint_core::TemplateMeta>, String> {
     let root = get_workspace_root(&state)?;
     Ok(flint_core::list_templates(&root))
+}
+
+/// Read the effective `FlintConfig`, same fallback-to-default pattern as [`read_new_note_config`].
+fn read_full_config(root: &Path) -> flint_core::config::FlintConfig {
+    flint_core::config_get(root, None)
+        .ok()
+        .and_then(|r| serde_json::from_value::<flint_core::config::FlintConfig>(r.config).ok())
+        .unwrap_or_default()
+}
+
+/// Author a new template file under `.flint/templates/` from Journey A's `TemplateEditorModal`
+/// (M10.27): writes the declared variable schema as the `templateVariables` front-matter field,
+/// plus a starter body with a `{{title}}` heading and one `{{var:name}}` placeholder per declared
+/// variable, then returns its [`flint_core::TemplateMeta`] so the caller can open it directly in
+/// the editor ("template authoring *is* note editing").
+pub(crate) fn create_template_file(
+    root: &Path,
+    name: &str,
+    variables: &[flint_core::TemplateVariableDef],
+    body: &str,
+) -> Result<(SafePath, String, flint_core::TemplateMeta), String> {
+    let slug = flint_core::slugify(name);
+    if slug.is_empty() {
+        return Err("Template name must contain at least one letter or digit".to_string());
+    }
+    let rel_path = format!("{}.md", slug);
+    let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, rel_path);
+    let safe_path = SafePath::resolve(root, &template_rel).map_err(|e| e.to_string())?;
+
+    let content = set_front_matter_fields(
+        body,
+        &[(
+            flint_core::TEMPLATE_VARIABLES_FIELD.to_string(),
+            flint_core::serialize_template_variables(variables),
+        )],
+    );
+
+    let meta = flint_core::TemplateMeta {
+        name: name.to_string(),
+        path: rel_path,
+    };
+    Ok((safe_path, content, meta))
+}
+
+/// Author a new template file under `.flint/templates/` from the Templates screen's create form
+/// (M10.27): writes the declared variable schema as the `templateVariables` front-matter field,
+/// plus the body exactly as authored in the screen's CodeMirror editor, then returns its
+/// [`flint_core::TemplateMeta`] so the caller can select it directly.
+#[tauri::command]
+fn template_create(
+    name: String,
+    variables: Vec<flint_core::TemplateVariableDef>,
+    body: String,
+    state: State<AppState>,
+) -> Result<flint_core::TemplateMeta, String> {
+    let root = get_workspace_root(&state)?;
+    let (safe_path, content, meta) = create_template_file(&root, &name, &variables, &body)?;
+
+    let _note_meta = create_note(&root, &safe_path, Some(&content)).map_err(|e| e.to_string())?;
+    record_suppressed_write(
+        &state.suppressed_writes,
+        &safe_path.to_posix_string(),
+        Some(flint_core::hash_bytes(content.as_bytes())),
+    );
+    if let Ok(mut lock) = state.index.write() {
+        lock.insert_or_update_note(&root, &safe_path, &content);
+    }
+
+    Ok(meta)
+}
+
+/// Load one template file's raw `templateVariables` front-matter value (root-only, no `State`, so
+/// it can be exercised directly from integration tests).
+pub(crate) fn load_template_variables(
+    root: &Path,
+    template_path: &str,
+) -> Result<Vec<flint_core::TemplateVariableDef>, String> {
+    let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, template_path);
+    let safe_path = SafePath::resolve(root, &template_rel).map_err(|e| e.to_string())?;
+    let raw = std::fs::read_to_string(safe_path.as_path()).map_err(|e| e.to_string())?;
+    let (_, _, _, fields) = flint_core::parse_front_matter(&raw);
+    let raw_vars = fields
+        .into_iter()
+        .find(|(k, _)| k == flint_core::TEMPLATE_VARIABLES_FIELD)
+        .map(|(_, v)| v)
+        .unwrap_or_default();
+    Ok(flint_core::parse_template_variables(&raw_vars))
+}
+
+/// Read one template file's declared variable schema (Journey A, "Edit template variables…").
+#[tauri::command]
+fn template_variables_get(
+    template_path: String,
+    state: State<AppState>,
+) -> Result<Vec<flint_core::TemplateVariableDef>, String> {
+    let root = get_workspace_root(&state)?;
+    load_template_variables(&root, &template_path)
+}
+
+/// Rewrite only a template file's `templateVariables` front-matter field, leaving its body
+/// untouched (Journey A, "Edit template variables…" — no hand-editing the JSON required).
+#[tauri::command]
+fn template_variables_set(
+    template_path: String,
+    variables: Vec<flint_core::TemplateVariableDef>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let root = get_workspace_root(&state)?;
+    let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, template_path);
+    let safe_path = SafePath::resolve(&root, &template_rel).map_err(|e| e.to_string())?;
+    let current = std::fs::read_to_string(safe_path.as_path()).map_err(|e| e.to_string())?;
+    let new_content = set_front_matter_fields(
+        &current,
+        &[(
+            flint_core::TEMPLATE_VARIABLES_FIELD.to_string(),
+            flint_core::serialize_template_variables(&variables),
+        )],
+    );
+    let fp = write_note_atomic(&root, &safe_path, &new_content, None).map_err(|e| e.to_string())?;
+    record_suppressed_write(
+        &state.suppressed_writes,
+        &safe_path.to_posix_string(),
+        Some(fp.content_hash),
+    );
+    if let Ok(mut lock) = state.index.write() {
+        lock.insert_or_update_note(&root, &safe_path, &new_content);
+    }
+    Ok(())
+}
+
+/// Root-only implementation of `template_body_get` (no `State`), directly unit-testable.
+pub(crate) fn load_template_body(root: &Path, template_path: &str) -> Result<String, String> {
+    let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, template_path);
+    let safe_path = SafePath::resolve(root, &template_rel).map_err(|e| e.to_string())?;
+    let raw = std::fs::read_to_string(safe_path.as_path()).map_err(|e| e.to_string())?;
+    let (_, body, _, _) = flint_core::parse_front_matter(&raw);
+    Ok(body.to_string())
+}
+
+/// Read one template file's body (everything after its front-matter block, if any) for the
+/// Templates screen's CodeMirror body editor.
+#[tauri::command]
+fn template_body_get(template_path: String, state: State<AppState>) -> Result<String, String> {
+    let root = get_workspace_root(&state)?;
+    load_template_body(&root, &template_path)
+}
+
+/// Rewrite only a template file's body, leaving its `templateVariables` front-matter field (and
+/// any other front matter) untouched — the counterpart to `template_variables_set`.
+#[tauri::command]
+fn template_body_set(
+    template_path: String,
+    body: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let root = get_workspace_root(&state)?;
+    let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, template_path);
+    let safe_path = SafePath::resolve(&root, &template_rel).map_err(|e| e.to_string())?;
+    let current = std::fs::read_to_string(safe_path.as_path()).map_err(|e| e.to_string())?;
+    let new_content = flint_core::set_note_body(&current, &body);
+    let fp = write_note_atomic(&root, &safe_path, &new_content, None).map_err(|e| e.to_string())?;
+    record_suppressed_write(
+        &state.suppressed_writes,
+        &safe_path.to_posix_string(),
+        Some(fp.content_hash),
+    );
+    if let Ok(mut lock) = state.index.write() {
+        lock.insert_or_update_note(&root, &safe_path, &new_content);
+    }
+    Ok(())
+}
+
+/// One variable's declared schema plus its precedence-resolved effective value (M10.27 Journey B
+/// / Journey C) — the frontend renders this verbatim rather than reimplementing the scope chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedTemplateVariable {
+    pub def: flint_core::TemplateVariableDef,
+    pub resolved_default: String,
+}
+
+/// Root-only implementation of `resolve_new_note_variables` (no `State`), directly integration-
+/// testable against a real `.flint.db` + `.flint/templates/` fixture.
+pub(crate) fn resolve_new_note_variables_impl(
+    root: &Path,
+    template_path: Option<&str>,
+    target_folder: Option<&str>,
+) -> Result<Vec<ResolvedTemplateVariable>, String> {
+    let Some(template_path) = template_path else {
+        return Ok(Vec::new());
+    };
+
+    let vars = load_template_variables(root, template_path)?;
+
+    let config = flint_core::config_get(root, None)
+        .map_err(|e| e.to_string())?
+        .config;
+    let folder_scope =
+        flint_core::config::nearest_ancestor_folder_variables(&config, target_folder.unwrap_or(""));
+    let global_scope = read_full_config(root).templates.global_variables;
+
+    let resolved =
+        flint_core::resolve_variables(&vars, &HashMap::new(), &folder_scope, &global_scope);
+    Ok(vars
+        .into_iter()
+        .map(|def| {
+            let resolved_default = resolved.get(&def.name).cloned().unwrap_or_default();
+            ResolvedTemplateVariable {
+                def,
+                resolved_default,
+            }
+        })
+        .collect())
+}
+
+/// Server-side precedence resolution for the New Note modal's variable fields (Journey B/C):
+/// explicit (typed into the modal, not known yet at this point) > nearest-ancestor folder scope >
+/// global scope > the variable's own schema default. Returns an empty list when `template_path`
+/// is `None` (a plain/blank note has no variables to prompt for).
+#[tauri::command]
+fn resolve_new_note_variables(
+    template_path: Option<String>,
+    target_folder: Option<String>,
+    state: State<AppState>,
+) -> Result<Vec<ResolvedTemplateVariable>, String> {
+    let root = get_workspace_root(&state)?;
+    resolve_new_note_variables_impl(&root, template_path.as_deref(), target_folder.as_deref())
+}
+
+/// Read one folder's variable scope (Journey C) — `folder_path` is workspace-relative POSIX,
+/// empty string for the workspace root.
+#[tauri::command]
+fn folder_variables_get(
+    folder_path: String,
+    state: State<AppState>,
+) -> Result<HashMap<String, String>, String> {
+    let root = get_workspace_root(&state)?;
+    let key = flint_core::config::folder_variables_key(&folder_path);
+    let result = flint_core::config_get(&root, Some(&key)).map_err(|e| e.to_string())?;
+    Ok(serde_json::from_value(result.config).unwrap_or_default())
+}
+
+/// Write one folder's variable scope (Journey C, "Folder variables…" modal).
+#[tauri::command]
+fn folder_variables_set(
+    folder_path: String,
+    variables: HashMap<String, String>,
+    state: State<AppState>,
+) -> Result<(), String> {
+    let root = get_workspace_root(&state)?;
+    let key = flint_core::config::folder_variables_key(&folder_path);
+    let value = serde_json::to_value(&variables).map_err(|e| e.to_string())?;
+    flint_core::config_set(&root, &key, value).map_err(|e| e.to_string())
 }
 
 /// Pure date arithmetic for `daily_note_open`/the MCP `daily_note_open` tool (M10.26), split out
@@ -842,6 +1137,7 @@ pub(crate) fn resolve_daily_note_target_date(
 fn daily_note_open(
     offset_days: Option<i64>,
     date: Option<String>,
+    variables: Option<HashMap<String, String>>,
     state: State<AppState>,
 ) -> Result<NoteMeta, String> {
     let root = get_workspace_root(&state)?;
@@ -859,6 +1155,7 @@ fn daily_note_open(
         title: target_date.format("%Y-%m-%d").to_string(),
         path: String::new(),
         now: target_dt,
+        variables: HashMap::new(),
     };
     let rendered_path = flint_core::render_template(&cfg.path_pattern, &path_ctx);
     let safe_path = SafePath::resolve(&root, &rendered_path).map_err(|e| e.to_string())?;
@@ -871,17 +1168,19 @@ fn daily_note_open(
 
     let posix = safe_path.to_posix_string();
     let title = flint_core::resolve_note_title("", safe_path.as_relative_path());
+    let variables = variables.unwrap_or_default();
     let note_ctx = flint_core::TemplateContext {
         title: title.clone(),
         path: posix.clone(),
         now: target_dt,
+        variables: variables.clone(),
     };
     let content = match cfg.template.as_deref() {
         Some(name) => {
             let template_rel = format!("{}/{}", flint_core::TEMPLATES_DIR, name);
             let tpl_safe = SafePath::resolve(&root, &template_rel).map_err(|e| e.to_string())?;
             let raw = std::fs::read_to_string(tpl_safe.as_path()).map_err(|e| e.to_string())?;
-            flint_core::render_template(&raw, &note_ctx)
+            render_template_file(&raw, &note_ctx)
         }
         None => String::new(),
     };
@@ -1148,19 +1447,32 @@ fn note_render(
         }
     };
 
-    let wikilinks_enabled = read_wikilinks_enabled(&root);
+    let markdown_cfg = flint_core::config_get(&root, None)
+        .ok()
+        .and_then(|r| serde_json::from_value::<flint_core::config::FlintConfig>(r.config).ok())
+        .map(|c| c.markdown);
+    let wikilinks_enabled = markdown_cfg.as_ref().map(|m| m.wikilinks).unwrap_or(false);
+    let features = markdown_cfg
+        .map(|m| flint_core::render::MarkdownFeatures {
+            math: m.math,
+            tables: m.tables,
+            footnotes: m.footnotes,
+            smart_punctuation: m.smart_punctuation,
+        })
+        .unwrap_or_default();
     let filename_stems = state
         .index
         .read()
         .map(|lock| lock.filename_stems.clone())
         .unwrap_or_default();
 
-    let result = flint_core::render::render_note_markdown_with_config(
+    let result = flint_core::render::render_note_markdown_with_features(
         &raw_content,
         &theme_str,
         Some(&root),
         Some(&path),
         wikilinks_enabled,
+        features,
         Some(&filename_stems),
     );
     Ok(result)
@@ -1411,6 +1723,14 @@ pub fn build_app_with_mcp_flags(
             note_create,
             templates_list,
             daily_note_open,
+            template_create,
+            template_variables_get,
+            template_variables_set,
+            template_body_get,
+            template_body_set,
+            resolve_new_note_variables,
+            folder_variables_get,
+            folder_variables_set,
             note_rename,
             tag_rename,
             note_duplicate,
@@ -1514,6 +1834,23 @@ mod tests {
     }
 
     #[test]
+    fn new_note_content_strips_the_templates_own_front_matter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let vars = sample_vars();
+        let (safe_path, content, _) =
+            create_template_file(root, "Daily", &vars, "# {{title}}\nAt {{path}}").unwrap();
+        create_note(root, &safe_path, Some(&content)).unwrap();
+        assert!(content.contains(flint_core::TEMPLATE_VARIABLES_FIELD));
+
+        let note_content =
+            resolve_new_note_content(root, "notes/hello.md", "hello", Some("daily.md")).unwrap();
+        assert_eq!(note_content, "# hello\nAt notes/hello.md");
+        assert!(!note_content.contains(flint_core::TEMPLATE_VARIABLES_FIELD));
+        assert!(!note_content.contains("---"));
+    }
+
+    #[test]
     fn new_note_content_rejects_template_escaping_workspace() {
         let dir = tempfile::tempdir().unwrap();
         let err = resolve_new_note_content(dir.path(), "n.md", "n", Some("../../etc/passwd"))
@@ -1577,5 +1914,211 @@ mod tests {
     fn daily_note_invalid_date_is_rejected() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
         assert!(resolve_daily_note_target_date(today, None, Some("not-a-date")).is_err());
+    }
+
+    // -- M10.27: template authoring / variables IPC integration tests --------------------------
+
+    fn sample_vars() -> Vec<flint_core::TemplateVariableDef> {
+        vec![
+            flint_core::TemplateVariableDef {
+                name: "project".to_string(),
+                kind: flint_core::TemplateVariableKind::Text,
+                default: String::new(),
+                required: true,
+                options: Vec::new(),
+            },
+            flint_core::TemplateVariableDef {
+                name: "priority".to_string(),
+                kind: flint_core::TemplateVariableKind::Choice,
+                default: "Low".to_string(),
+                required: false,
+                options: vec!["Low".to_string(), "High".to_string()],
+            },
+        ]
+    }
+
+    #[test]
+    fn template_create_writes_schema_and_authored_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let vars = sample_vars();
+        let body = "# {{title}}\n\n## {{var:project}}\n\n## {{var:priority}}\n\n";
+        let (safe_path, content, meta) =
+            create_template_file(dir.path(), "Meeting Notes", &vars, body).unwrap();
+        assert_eq!(meta.path, "meeting-notes.md");
+        assert_eq!(meta.name, "Meeting Notes");
+        assert!(content.contains("{{title}}"));
+        assert!(content.contains("{{var:project}}"));
+        assert!(content.contains("{{var:priority}}"));
+        assert!(content.contains(flint_core::TEMPLATE_VARIABLES_FIELD));
+
+        create_note(dir.path(), &safe_path, Some(&content)).unwrap();
+        let round_tripped = load_template_variables(dir.path(), "meeting-notes.md").unwrap();
+        assert_eq!(round_tripped, vars);
+    }
+
+    #[test]
+    fn template_create_rejects_name_with_no_letters_or_digits() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = create_template_file(dir.path(), "***", &[], "").unwrap_err();
+        assert!(!err.is_empty());
+    }
+
+    #[test]
+    fn template_variables_set_rewrites_only_the_schema_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let (safe_path, content, _) =
+            create_template_file(dir.path(), "Plain", &[], "# {{title}}\n\n").unwrap();
+        create_note(dir.path(), &safe_path, Some(&content)).unwrap();
+
+        let new_vars = sample_vars();
+        let current = std::fs::read_to_string(safe_path.as_path()).unwrap();
+        let new_content = set_front_matter_fields(
+            &current,
+            &[(
+                flint_core::TEMPLATE_VARIABLES_FIELD.to_string(),
+                flint_core::serialize_template_variables(&new_vars),
+            )],
+        );
+        std::fs::write(safe_path.as_path(), &new_content).unwrap();
+
+        let round_tripped = load_template_variables(dir.path(), "plain.md").unwrap();
+        assert_eq!(round_tripped, new_vars);
+        // Body (the `{{title}}` starter line) survives the field-only rewrite untouched.
+        assert!(new_content.contains("{{title}}"));
+    }
+
+    #[test]
+    fn load_template_body_returns_content_after_front_matter() {
+        let dir = tempfile::tempdir().unwrap();
+        let (safe_path, content, _) =
+            create_template_file(dir.path(), "Plain", &[], "# {{title}}\n\nBody text.\n").unwrap();
+        create_note(dir.path(), &safe_path, Some(&content)).unwrap();
+
+        let body = load_template_body(dir.path(), "plain.md").unwrap();
+        assert_eq!(body, "# {{title}}\n\nBody text.\n");
+    }
+
+    #[test]
+    fn template_body_set_rewrites_only_the_body_field_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let vars = sample_vars();
+        let (safe_path, content, _) =
+            create_template_file(dir.path(), "Plain", &vars, "# {{title}}\n\nOld body.\n").unwrap();
+        create_note(dir.path(), &safe_path, Some(&content)).unwrap();
+
+        let current = std::fs::read_to_string(safe_path.as_path()).unwrap();
+        let new_content = flint_core::set_note_body(&current, "# {{title}}\n\nNew body.\n");
+        std::fs::write(safe_path.as_path(), &new_content).unwrap();
+
+        let body = load_template_body(dir.path(), "plain.md").unwrap();
+        assert_eq!(body, "# {{title}}\n\nNew body.\n");
+        // The schema field survives the body-only rewrite untouched.
+        let round_tripped = load_template_variables(dir.path(), "plain.md").unwrap();
+        assert_eq!(round_tripped, vars);
+    }
+
+    #[test]
+    fn resolve_new_note_variables_returns_empty_for_no_template() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = resolve_new_note_variables_impl(dir.path(), None, None).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_new_note_variables_precedence_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let vars = sample_vars();
+        let (safe_path, content, _) =
+            create_template_file(root, "Client Note", &vars, "# {{title}}\n\n").unwrap();
+        create_note(root, &safe_path, Some(&content)).unwrap();
+
+        // Global scope sets "project"; folder scope (nearest ancestor) overrides it for notes
+        // created under "clients/acme".
+        flint_core::config_set(
+            root,
+            "templates.globalVariables",
+            serde_json::json!({"project": "Global Co"}),
+        )
+        .unwrap();
+        flint_core::config_set(
+            root,
+            &flint_core::config::folder_variables_key("clients/acme"),
+            serde_json::json!({"project": "Acme Corp"}),
+        )
+        .unwrap();
+
+        let resolved =
+            resolve_new_note_variables_impl(root, Some("client-note.md"), Some("clients/acme"))
+                .unwrap();
+        let project = resolved.iter().find(|r| r.def.name == "project").unwrap();
+        assert_eq!(project.resolved_default, "Acme Corp");
+
+        // A folder with no scope of its own falls back to the global value.
+        let resolved_elsewhere =
+            resolve_new_note_variables_impl(root, Some("client-note.md"), Some("other/folder"))
+                .unwrap();
+        let project_elsewhere = resolved_elsewhere
+            .iter()
+            .find(|r| r.def.name == "project")
+            .unwrap();
+        assert_eq!(project_elsewhere.resolved_default, "Global Co");
+
+        // The Choice variable with no override anywhere falls back to its own schema default.
+        let priority = resolved.iter().find(|r| r.def.name == "priority").unwrap();
+        assert_eq!(priority.resolved_default, "Low");
+    }
+
+    #[test]
+    fn note_create_with_variables_renders_without_recording_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".flint/templates")).unwrap();
+        std::fs::write(
+            root.join(".flint/templates/project.md"),
+            "# {{title}}\n\nProject: {{var:project}}\n",
+        )
+        .unwrap();
+
+        let mut variables = HashMap::new();
+        variables.insert("project".to_string(), "Flint".to_string());
+        let content = resolve_new_note_content_with_variables(
+            root,
+            "notes/n.md",
+            "n",
+            Some("project.md"),
+            &variables,
+        )
+        .unwrap();
+
+        assert!(content.contains("Project: Flint"));
+        assert!(!content.contains("templateVars"));
+        assert!(!content.starts_with("---"));
+    }
+
+    #[test]
+    fn note_create_carries_template_front_matter_but_not_variable_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".flint/templates")).unwrap();
+        std::fs::write(
+            root.join(".flint/templates/task.md"),
+            "---\ntemplateVariables: '[]'\nstatus: draft\ntags:\n- todo\n---\n# {{title}}\n",
+        )
+        .unwrap();
+
+        let content = resolve_new_note_content_with_variables(
+            root,
+            "n.md",
+            "n",
+            Some("task.md"),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert!(content.contains("status: draft"));
+        assert!(content.contains("- todo"));
+        assert!(content.contains("# n"));
+        assert!(!content.contains("templateVariables"));
     }
 }

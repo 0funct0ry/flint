@@ -95,3 +95,11 @@ export function setFrontMatterFields(content: string, fields: FrontMatterField[]
 
   return fm + body;
 }
+
+/** Replace a note's body while leaving its front-matter block (if any) byte-for-byte unchanged —
+ *  mirrors `flint_core::set_note_body`, the inverse counterpart of `setFrontMatterFields` above. */
+export function setBody(content: string, newBody: string): string {
+  const { raw } = parseFrontMatter(content);
+  if (raw === null) return newBody;
+  return `---\n${raw}\n---\n${newBody}`;
+}

@@ -318,6 +318,17 @@ export interface LayoutConfig {
   activeLeftTab?: string;
   lastOpenNote?: string;
   noteModes?: Record<string, string>; // path -> 'edit'|'read'|'split'
+  /** M10.28: every pane's ordered tabs (path/pinned/viewMode) and which pane/tab is active. */
+  panes?: {
+    panes: Array<{
+      tabs: Array<{ path: string; pinned: boolean; viewMode: 'edit' | 'read' | 'split' }>;
+      activeIndex: number;
+    }>;
+    activePaneIndex: number;
+    orientation: 'horizontal' | 'vertical';
+  };
+  /** M10.28: MRU of the last 20 tab-focus events, most-recent-first, deduplicated by path. */
+  recentNotes?: string[];
 }
 
 export interface FlintConfig {

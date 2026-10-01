@@ -49,7 +49,7 @@ export interface LeftSidebarProps {
   onTabChange: (tab: LeftTab) => void;
   treeData: TreeNodeItem[];
   currentNotePath: string;
-  onSelectNote: (path: string, targetLine?: number) => void;
+  onSelectNote: (path: string, targetLineOrOpts?: number | { newTab?: boolean }) => void;
   isEmpty?: boolean;
   error?: string | null;
   selectedFolderPath?: string;
@@ -548,6 +548,11 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
       ...(!isFolder
         ? [
             {
+              id: 'open-new-tab',
+              label: 'Open in new tab',
+              onClick: () => onSelectNote(item.path, { newTab: true }),
+            },
+            {
               id: 'duplicate',
               label: 'Duplicate',
               shortcut: '⌘D',
@@ -1002,12 +1007,14 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
                   onDragOver={(e) => handleDragOver(e, item)}
                   onDrop={(e) => handleDrop(e, isFolder ? item.path : currentParent)}
                   onContextMenu={(e) => handleContextMenu(e, item)}
-                  onClick={() => {
+                  onClick={(e) => {
                     if (isFolder) {
                       toggleFolder(item.path);
                       onSelectFolder?.(item.path);
                     } else if (isNote) {
-                      onSelectNote(item.path);
+                      // ⌘/Ctrl-click opens in a new tab instead of replacing the active one.
+                      if (e.metaKey || e.ctrlKey) onSelectNote(item.path, { newTab: true });
+                      else onSelectNote(item.path);
                       onSelectFolder?.(item.path.split('/').slice(0, -1).join('/'));
                     }
                   }}
@@ -1024,7 +1031,8 @@ export const LeftSidebar: React.FC<LeftSidebarProps> = ({
                         toggleFolder(item.path);
                         onSelectFolder?.(item.path);
                       } else if (isNote) {
-                        onSelectNote(item.path);
+                        if (e.metaKey || e.ctrlKey) onSelectNote(item.path, { newTab: true });
+                      else onSelectNote(item.path);
                         onSelectFolder?.(currentParent);
                       }
                     } else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {

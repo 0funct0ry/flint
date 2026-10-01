@@ -433,6 +433,17 @@ button {
   line-height: 1.72 !important;
   font-family: var(--mono) !important;
 }
+/* Line-number gutter: CodeMirror's default theme paints it light grey; follow the tokens so it
+   works in both themes. */
+.cm-editor .cm-gutters {
+  background: var(--canvas) !important;
+  color: var(--faint) !important;
+  border: none !important;
+}
+.cm-editor .cm-activeLineGutter {
+  background: transparent !important;
+  color: var(--text-2) !important;
+}
 /* Translucent so the drawn selection layer (painted behind the text) shows through on the
    active line. */
 .cm-activeLine {

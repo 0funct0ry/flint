@@ -15,7 +15,15 @@ export const APP_COMMANDS: CommandMetadata[] = [
   // M10.27 Journey A: author a template without leaving Flint.
   { id: 'file.new_template', title: 'New template…' },
   { id: 'view.manage_templates', title: 'Manage templates…' },
-  { id: 'file.close', title: 'Close active note', shortcut: '⌘W', shortcutDisplay: '⌘W' },
+  { id: 'file.close', title: 'Close active tab', shortcut: '⌘W', shortcutDisplay: '⌘W' },
+  // M10.28 tabs and panes. ⌘1–⌘9 (jump to Nth tab, ⌘9 = last) are handled by the global key
+  // listener rather than one command each.
+  { id: 'pane.new', title: 'New pane' },
+  { id: 'tab.open_note_in_new_tab', title: 'Open note in new tab…' },
+  { id: 'pane.toggle_orientation', title: 'Toggle pane split direction (side by side / stacked)' },
+  { id: 'tab.close_others', title: 'Close other tabs' },
+  { id: 'tab.toggle_pin', title: 'Pin / unpin tab' },
+  { id: 'tab.move_to_other_pane', title: 'Move tab to other pane' },
   { id: 'palette.notes', title: 'Search notes by name', shortcut: '⌘P', shortcutDisplay: '⌘P' },
   { id: 'palette.commands', title: 'Show all commands', shortcut: '⌘⇧P', shortcutDisplay: '⌘⇧P' },
   { id: 'search.content', title: 'Search content in workspace', shortcut: '⌘⇧F', shortcutDisplay: '⌘⇧F' },

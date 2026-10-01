@@ -76,6 +76,18 @@ describe("LeftSidebar", () => {
     expect(onSelect).toHaveBeenCalledWith("daily.md");
   });
 
+  it("opens a note in a new tab on cmd/ctrl-click and from the context menu", () => {
+    const onSelect = vi.fn();
+    render(<LeftSidebar {...defaultProps} onSelectNote={onSelect} />);
+
+    fireEvent.click(screen.getByText("daily.md"), { ctrlKey: true });
+    expect(onSelect).toHaveBeenLastCalledWith("daily.md", { newTab: true });
+
+    fireEvent.contextMenu(screen.getByText("daily.md"));
+    fireEvent.click(screen.getByText("Open in new tab"));
+    expect(onSelect).toHaveBeenLastCalledWith("daily.md", { newTab: true });
+  });
+
   it("renders empty workspace state with Create button", () => {
     const onCreate = vi.fn();
     render(

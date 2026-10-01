@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { NoteFixture, NoteMeta, NameHit } from '../types';
 import { api } from '../services/ipc';
 import { commandRegistry, Command } from '../commands/registry';
@@ -8,8 +8,17 @@ export interface CommandPaletteProps {
   onClose: () => void;
   notes: Record<string, NoteFixture>;
   indexedNotes?: NoteMeta[];
-  onSelectNote: (path: string) => void;
+  onSelectNote: (path: string, opts?: { newPane?: boolean; newTab?: boolean }) => void;
   initialMode?: 'notes' | 'commands';
+  /** M10.28: MRU of recently focused notes (most-recent-first), shown for an empty query. */
+  recentNotes?: string[];
+  /** Plain Enter opens a new tab in the active pane ("Open note in new tab…"). */
+  newTabByDefault?: boolean;
+}
+
+export interface PaletteSelectOptions {
+  shiftKey?: boolean;
+  altKey?: boolean;
 }
 
 interface PaletteItem {
@@ -19,7 +28,7 @@ interface PaletteItem {
   subtitle: string;
   glyph: string;
   shortcut?: string;
-  onSelect: () => void;
+  onSelect: (opts?: PaletteSelectOptions) => void;
 }
 
 export const CommandPalette: React.FC<CommandPaletteProps> = ({
@@ -29,7 +38,15 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   indexedNotes = [],
   onSelectNote,
   initialMode = 'notes',
+  recentNotes = [],
+  newTabByDefault = false,
 }) => {
+  // ⇧ → other pane; ⌥ (or the new-tab command) → new tab in this pane; else replace.
+  const selectOpts = useCallback(
+    (opts?: PaletteSelectOptions) =>
+      opts?.shiftKey ? { newPane: true } : opts?.altKey || newTabByDefault ? { newTab: true } : undefined,
+    [newTabByDefault]
+  );
   const [query, setQuery] = useState('');
   const [selectedIndex, setSelectedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -66,8 +83,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
             title: h.title,
             subtitle: h.path,
             glyph: '◦',
-            onSelect: () => {
-              onSelectNote(h.path);
+            onSelect: (opts) => {
+              onSelectNote(h.path, selectOpts(opts));
               onClose();
             },
           }));
@@ -92,8 +109,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
               title: n.title,
               subtitle: n.path,
               glyph: '◦',
-              onSelect: () => {
-                onSelectNote(n.path);
+              onSelect: (opts) => {
+                onSelectNote(n.path, selectOpts(opts));
                 onClose();
               },
             }))
@@ -103,7 +120,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [cleanQuery, isCommandMode, indexedNotes, notes, onClose, onSelectNote]);
+  }, [cleanQuery, isCommandMode, indexedNotes, notes, onClose, onSelectNote, selectOpts]);
 
   const items: PaletteItem[] = React.useMemo(() => {
     if (isCommandMode) {
@@ -122,10 +139,28 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
             onClose();
           },
         }));
+    } else if (cleanQuery === '' && recentNotes.length > 0) {
+      // Empty query: recently focused notes instead of an arbitrary slice of the index (M10.28).
+      const known = new Map<string, string>();
+      for (const n of indexedNotes) known.set(n.path, n.title);
+      if (known.size === 0) for (const n of Object.values(notes)) known.set(n.path, n.title);
+      return recentNotes
+        .filter((p) => known.size === 0 || known.has(p))
+        .map((p) => ({
+          id: p,
+          type: 'note' as const,
+          title: known.get(p) || p.split('/').pop()?.replace(/\.(md|markdown)$/i, '') || p,
+          subtitle: p,
+          glyph: '◷',
+          onSelect: (opts?: PaletteSelectOptions) => {
+            onSelectNote(p, selectOpts(opts));
+            onClose();
+          },
+        }));
     } else {
       return fuzzyNotes;
     }
-  }, [isCommandMode, cleanQuery, fuzzyNotes, onClose]);
+  }, [isCommandMode, cleanQuery, fuzzyNotes, onClose, recentNotes, indexedNotes, notes, onSelectNote, selectOpts]);
 
   // Keyboard navigation inside palette
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -141,7 +176,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
     } else if (e.key === 'Enter') {
       e.preventDefault();
       if (items[selectedIndex]) {
-        items[selectedIndex].onSelect();
+        items[selectedIndex].onSelect({ shiftKey: e.shiftKey, altKey: e.altKey });
       }
     }
   };
@@ -184,7 +219,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
                 <li
                   key={item.id}
                   aria-selected={isSelected}
-                  onClick={item.onSelect}
+                  onClick={(e) => item.onSelect({ shiftKey: e.shiftKey, altKey: e.altKey })}
                   onMouseEnter={() => setSelectedIndex(idx)}
                   className={`flex items-center gap-2.5 px-4 py-1.5 cursor-pointer text-[12.5px] transition-colors ${
                     isSelected
@@ -208,6 +243,8 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
         <footer className="flex items-center gap-3.5 px-4 py-2 border-t border-[var(--border)] text-[11px] text-[var(--faint)] bg-[var(--panel-2)]">
           <span>↑↓ to navigate</span>
           <span>↵ to select</span>
+          {!isCommandMode && <span>⌥↵ new tab</span>}
+          {!isCommandMode && <span>⇧↵ other pane</span>}
           <span>esc to dismiss</span>
           <span className="ml-auto font-mono">{items.length} results</span>
         </footer>

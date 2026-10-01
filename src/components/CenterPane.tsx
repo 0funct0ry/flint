@@ -29,7 +29,7 @@ export interface CenterPaneProps {
   onContentChange: (newContent: string) => void;
   onSaveNow?: () => void;
   onBlurSave?: () => void;
-  onNavigateRelative: (target: string) => void;
+  onNavigateRelative: (target: string, opts?: { newTab?: boolean }) => void;
   onCreateNote?: (target: string) => void;
   onOpenExternal?: (url: string) => void;
   onCloseNote?: () => void;
@@ -53,6 +53,19 @@ export interface CenterPaneProps {
     cursorCol: number,
     selectionLength: number
   ) => void;
+  /** M10.28: the focused pane owns the module-level editor bridges and registered commands. */
+  isActivePane?: boolean;
+  /** M10.28: the note behind this tab no longer exists; show an empty state instead of an editor. */
+  missing?: boolean;
+  /** M10.28: fired when the user clicks or focuses inside this pane. */
+  onPaneFocus?: () => void;
+  /** M10.28: stable tab identity — keys the per-tab editor state (undo history) cache. */
+  tabId?: string;
+  /** M10.28: the tab strip already shows the note's name, dirty dot and close ×, so the Note Bar
+   * drops its own copy and keeps only the history/reveal buttons. */
+  hideNoteIdentity?: boolean;
+  /** Reveal this note in the OS file manager. */
+  onReveal?: () => void;
 }
 
 /**
@@ -281,6 +294,12 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   savedScrollTop,
   savedCursorPos,
   onScrollOrCursorChange,
+  isActivePane = true,
+  missing = false,
+  onPaneFocus,
+  tabId,
+  hideNoteIdentity = false,
+  onReveal,
 }) => {
   const editorContainerRef = useRef<HTMLDivElement>(null);
   const readerContainerRef = useRef<HTMLDivElement>(null);
@@ -354,6 +373,9 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
 
   // Track the note path currently loaded in the editor instance
   const loadedNotePathRef = useRef<string>('');
+  // Per-note EditorState cache (M10.28): tab switches rebuild the EditorView, this keeps each
+  // note's undo history. Keyed by path so a rename simply misses and starts fresh.
+  const editorStateCacheRef = useRef<Map<string, EditorState>>(new Map());
 
   const [contextMenuState, setContextMenuState] = useState<{ x: number; y: number } | null>(null);
 
@@ -365,6 +387,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   // Bridge `editor.insert_table_builder`'s `run` (defined once, module-level, in
   // `EDITOR_COMMANDS`) into this instance's modal state — see `openTableBuilder`'s doc comment.
   useEffect(() => {
+    if (!isActivePane) return;
     setOpenTableBuilder((view) => {
       const { state } = view;
       const range = state.selection.main;
@@ -392,11 +415,12 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     return () => {
       setOpenTableBuilder(null);
     };
-  }, []);
+  }, [isActivePane]);
 
   // Bridge outline-panel edits (M10.09) into this instance's live EditorView — see
   // `applyOutlineEdit`'s doc comment in `services/outlineEditBridge`.
   useEffect(() => {
+    if (!isActivePane) return;
     setOutlineEditDispatcher((changes) => {
       const view = editorViewRef.current;
       if (!view || changes.length === 0) return;
@@ -406,7 +430,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     return () => {
       setOutlineEditDispatcher(null);
     };
-  }, []);
+  }, [isActivePane]);
 
   const handleTableBuilderInsert = (markdown: string, replaceSelection: boolean) => {
     const view = editorViewRef.current;
@@ -428,6 +452,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   // handler always reads the currently-mounted EditorView from the ref, so this stays correct
   // across note switches without re-registering.
   useEffect(() => {
+    if (!isActivePane) return;
     for (const cmd of EDITOR_COMMANDS) {
       commandRegistry.register({
         id: cmd.id,
@@ -444,7 +469,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
         },
       });
     }
-  }, []);
+  }, [isActivePane]);
 
   // Render KaTeX formulas whenever note.renderedHtml or viewMode changes
   useEffect(() => {
@@ -776,7 +801,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
 
   // Initialize CodeMirror 6 editor instance with autocompletion and link navigation
   useEffect(() => {
-    if (!note.path) {
+    if (!note.path || missing) {
       if (editorViewRef.current) {
         editorViewRef.current.destroy();
         editorViewRef.current = null;
@@ -927,6 +952,11 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       editorContainerRef.current.contains(editorViewRef.current.dom);
     if (loadedNotePathRef.current !== note.path || !editorViewRef.current || !isAttached) {
       if (editorViewRef.current) {
+        // Keep the outgoing note's EditorState so switching back to its tab restores undo
+        // history and selection instead of starting from a fresh state (M10.28).
+        if (loadedNotePathRef.current) {
+          editorStateCacheRef.current.set(loadedNotePathRef.current, editorViewRef.current.state);
+        }
         editorViewRef.current.destroy();
       }
 
@@ -1060,13 +1090,14 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
         ],
       });
 
+      const cached = editorStateCacheRef.current.get(note.path);
       const view = new EditorView({
-        state: startState,
+        state: cached && cached.doc.toString() === note.content ? cached : startState,
         parent: editorContainerRef.current,
       });
 
       // Restore saved cursor & scroll if provided
-      if (savedCursorPos !== undefined && savedCursorPos <= startState.doc.length) {
+      if (savedCursorPos !== undefined && savedCursorPos <= view.state.doc.length) {
         view.dispatch({
           selection: { anchor: savedCursorPos },
         });
@@ -1091,7 +1122,7 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
     // is deliberately excluded here — including it would recreate the EditorState on every
     // settings change and drop cursor position / undo history.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [note.path, note.content, isDirty, savedCursorPos, savedScrollTop]);
+  }, [note.path, note.content, isDirty, savedCursorPos, savedScrollTop, missing]);
 
   // Live-preview settings (M10.1 task 6): reconfigure the relevant compartments in place on
   // config change, instead of recreating the EditorState/EditorView — this keeps cursor
@@ -1180,7 +1211,8 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
         if (href.startsWith('#/note/')) {
           e.preventDefault();
           const targetPathWithAnchor = href.replace('#/note/', '');
-          onNavigateRelative(targetPathWithAnchor);
+          // ⌘/Ctrl-click opens the linked note in a new tab.
+          onNavigateRelative(targetPathWithAnchor, e.metaKey || e.ctrlKey ? { newTab: true } : undefined);
         } else if (href.startsWith('#/ambiguous')) {
           // M10.23: a bare-name wikilink whose target stem matches more than one note — never
           // silently resolved. Ask which one, rather than picking for the user.
@@ -1224,9 +1256,17 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
   };
 
   return (
-    <main className="flex-1 flex flex-col min-w-0 bg-[var(--canvas)] select-none">
+    <main
+      className="flex-1 flex flex-col min-w-0 min-h-0 bg-[var(--canvas)] select-none"
+      data-pane-active={isActivePane ? 'true' : 'false'}
+      data-tab-id={tabId}
+      onMouseDownCapture={onPaneFocus}
+      onFocusCapture={onPaneFocus}
+    >
       {/* Note Bar */}
       <div className="flex items-center gap-2 h-[33px] shrink-0 px-3.5 border-b border-[var(--border)] text-xs text-[var(--muted)] bg-[var(--panel)]">
+        {!hideNoteIdentity && (
+        <>
         {/* Unsaved dirty dot indicator */}
         <span
           className={`text-base leading-none transition-opacity ${
@@ -1254,6 +1294,8 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
             ✕
           </button>
         )}
+        </>
+        )}
 
         {/* History navigation affordances */}
         <div className="ml-auto flex items-center gap-0.5">
@@ -1272,7 +1314,10 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
             ›
           </button>
           <button
-            className="w-6 h-6 grid place-items-center rounded text-[var(--muted)] hover:bg-[var(--panel-2)] hover:text-[var(--text)] transition-colors text-xs"
+            onClick={onReveal}
+            disabled={!note.path || missing}
+            aria-label="Reveal in file manager"
+            className="w-6 h-6 grid place-items-center rounded text-[var(--muted)] hover:bg-[var(--panel-2)] hover:text-[var(--text)] transition-colors text-xs disabled:opacity-40 disabled:pointer-events-none"
             title="Reveal in Finder / File Manager (⌘⇧R)"
           >
             ⤤
@@ -1289,7 +1334,21 @@ export const CenterPane: React.FC<CenterPaneProps> = ({
       />
 
       {/* Center View Area (Edit, Read, or Split) */}
-      {!note.path ? (
+      {missing ? (
+        <div
+          className="flex-1 flex flex-col items-center justify-center text-center p-6 bg-[var(--canvas)]"
+          role="alert"
+        >
+          <div className="text-sm font-medium text-[var(--muted)] mb-2">This note no longer exists</div>
+          <div className="text-xs text-[var(--faint)] mb-3 font-mono">{note.path}</div>
+          <button
+            onClick={onCloseNote}
+            className="px-3 py-1 text-xs border border-[var(--border)] rounded-[5px] text-[var(--text)] hover:bg-[var(--panel-2)]"
+          >
+            Close tab
+          </button>
+        </div>
+      ) : !note.path ? (
         <div className="flex-1 flex flex-col items-center justify-center text-center p-6 bg-[var(--canvas)]">
           <div className="text-sm font-medium text-[var(--muted)] mb-2">No note selected</div>
           <div className="text-xs text-[var(--faint)]">Select a note from the sidebar or press ⌘P to open one.</div>

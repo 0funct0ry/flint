@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { TitleBar, ViewMode } from './components/TitleBar';
 import { LeftSidebar, LeftTab, InlineActionState } from './components/LeftSidebar';
 import { CenterPane } from './components/CenterPane';
+import { TabStrip } from './components/TabStrip';
 import { RightSidebar } from './components/RightSidebar';
 import { StatusBar } from './components/StatusBar';
 import { CommandPalette } from './components/CommandPalette';
@@ -39,11 +40,57 @@ import {
 import { api, isTauriEnvironment } from './services/ipc';
 import { renderMarkdownToHtml } from './services/markdown';
 import { countWords, countChars } from './services/textStats';
+import {
+  PaneLayout,
+  Tab,
+  createLayout,
+  openNote as layoutOpenNote,
+  openInNewTab as layoutOpenInNewTab,
+  closeTab as layoutCloseTab,
+  closeOthers as layoutCloseOthers,
+  closeToRight as layoutCloseToRight,
+  togglePin as layoutTogglePin,
+  reorderTab,
+  moveToOtherPane as layoutMoveToOtherPane,
+  newPane as layoutNewPane,
+  toggleOrientation,
+  renamePath as layoutRenamePath,
+  markMissing,
+  patchTab,
+  patchTabByPath,
+  stepHistory,
+  setActiveTab as layoutSetActiveTab,
+  setActivePane as layoutSetActivePane,
+  getActiveTab,
+  getPaneActiveTab,
+  findTabByPath,
+  findTabById,
+  tabIdForShortcut,
+  tabsClosedByOthers,
+  tabsClosedToRight,
+  pushMru,
+  serializeLayout,
+  restoreLayout,
+} from './state/panes';
 
-interface HistoryEntry {
-  path: string;
-  scrollTop?: number;
-  cursorPos?: number;
+const EMPTY_NOTE: NoteFixture = {
+  path: '',
+  title: '',
+  folder: '',
+  tags: [],
+  content: '',
+  headings: [],
+  outgoingLinks: [],
+  backlinks: [],
+  renderedHtml: '',
+  lastModifiedAgo: '',
+};
+
+interface SelectOptions {
+  /** Open as a new tab in the other pane (⇧↵ in the palette). */
+  newPane?: boolean;
+  /** Open as a new tab in the active pane (⌘-click, ⌥↵, "Open in new tab"). */
+  newTab?: boolean;
 }
 
 export const App: React.FC = () => {
@@ -68,7 +115,9 @@ export const App: React.FC = () => {
     mq.addEventListener?.('change', onChange);
     return () => mq.removeEventListener?.('change', onChange);
   }, []);
-  const [viewMode, setViewMode] = useState<ViewMode>('split');
+  // `viewMode` is per tab (M10.28). This is only the mode a pane shows when it has no tab, and
+  // the mode new tabs start in; the live value is always the active tab's (see below).
+  const [defaultViewMode, setDefaultViewMode] = useState<ViewMode>('split');
   const [leftTab, setLeftTab] = useState<LeftTab>('tree');
   const [leftSidebarVisible, setLeftSidebarVisible] = useState(true);
   const [rightSidebarVisible, setRightSidebarVisible] = useState(true);
@@ -107,32 +156,75 @@ export const App: React.FC = () => {
   const [unresolvedLinks, setUnresolvedLinks] = useState<LinkItem[]>([]);
   const [unresolvedModalOpen, setUnresolvedModalOpen] = useState(false);
 
-  // Active note path & selected folder state
-  const [currentNotePath, setCurrentNotePath] = useState<string>('');
+  // Panes and tabs (M10.28). `noteState` / `noteFingerprints` stay keyed by path — they are the
+  // shared source of truth every tab reads from — while everything that used to be a flat global
+  // about "the" open note (path, dirty, history, conflict, view mode) now lives on the tab.
+  const [layout, setLayout] = useState<PaneLayout>(createLayout);
+  const layoutRef = useRef<PaneLayout>(layout);
+  const updateLayout = useCallback((fn: (l: PaneLayout) => PaneLayout): PaneLayout => {
+    const next = fn(layoutRef.current);
+    layoutRef.current = next;
+    setLayout(next);
+    return next;
+  }, []);
+  const [recentNotes, setRecentNotes] = useState<string[]>([]);
+  // Live scroll/cursor per tab id — high-frequency, so kept out of React state.
+  const tabViewRef = useRef<Map<string, { scrollTop: number; cursorPos: number }>>(new Map());
+
+  const activeTab = getActiveTab(layout);
+  const currentNotePath = activeTab?.path ?? '';
+  const viewMode: ViewMode = activeTab?.viewMode ?? defaultViewMode;
+  const diskVersionContent = activeTab?.diskVersionContent ?? '';
+  const defaultViewModeRef = useRef<ViewMode>(defaultViewMode);
+  defaultViewModeRef.current = defaultViewMode;
+
+  const setViewMode = useCallback(
+    (mode: ViewMode) => {
+      setDefaultViewMode(mode);
+      const tab = getActiveTab(layoutRef.current);
+      if (tab) updateLayout((l) => patchTab(l, tab.id, { viewMode: mode }));
+    },
+    [updateLayout]
+  );
+
+  // Path-keyed tab updates: a path is open in at most one tab, so these are unambiguous even
+  // when the tab isn't the active one.
+  const setDirtyFor = useCallback(
+    (path: string, dirty: boolean) => updateLayout((l) => patchTabByPath(l, path, { isDirty: dirty })),
+    [updateLayout]
+  );
+  const setConflictFor = useCallback(
+    (path: string, show: boolean, diskContent?: string) =>
+      updateLayout((l) =>
+        patchTabByPath(l, path, {
+          showConflictBanner: show,
+          diskVersionContent: show ? (diskContent ?? '') : null,
+        })
+      ),
+    [updateLayout]
+  );
+
   const [selectedFolderPath, setSelectedFolderPath] = useState<string>('');
   const [noteState, setNoteState] = useState<Record<string, NoteFixture>>(FIXTURE_NOTES);
   const [noteFingerprints, setNoteFingerprints] = useState<Record<string, Fingerprint>>({});
-  const [isDirty, setIsDirty] = useState(false);
+  const noteStateRef = useRef(noteState);
+  noteStateRef.current = noteState;
+  const noteFingerprintsRef = useRef(noteFingerprints);
+  noteFingerprintsRef.current = noteFingerprints;
   const [cursorPosition, setCursorPosition] = useState<{
     line: number;
     col: number;
     selectionLength: number;
   } | null>(null);
 
-  // Conflict handling state
-  const [showConflictBanner, setShowConflictBanner] = useState(false);
-  const [diskVersionContent, setDiskVersionContent] = useState<string>('');
+  // Conflict handling: the banner state is per tab; only the diff viewer is global.
   const [diffViewerOpen, setDiffViewerOpen] = useState(false);
 
   // Palette modal state
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [paletteMode, setPaletteMode] = useState<'notes' | 'commands'>('notes');
-
-  // Navigation history with scroll and cursor restoration (SPEC §6.3, M6)
-  const [history, setHistory] = useState<HistoryEntry[]>([]);
-  const [historyIndex, setHistoryIndex] = useState(-1);
-  const [activeScrollTop, setActiveScrollTop] = useState<number | undefined>(undefined);
-  const [activeCursorPos, setActiveCursorPos] = useState<number | undefined>(undefined);
+  // "Open note in new tab…": the palette's plain Enter opens a tab instead of replacing.
+  const [paletteNewTab, setPaletteNewTab] = useState(false);
 
   // Inline tree action state (create-note, create-folder, rename)
   const [inlineAction, setInlineAction] = useState<InlineActionState | null>(null);
@@ -200,37 +292,72 @@ export const App: React.FC = () => {
     isFolder: false,
   });
 
-  // Autosave timer reference (400ms debounce)
-  const autosaveTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const currentNoteRef = useRef<{ path: string; content: string; fingerprint?: Fingerprint; isDirty: boolean }>({
-    path: currentNotePath,
-    content: noteState[currentNotePath]?.content || '',
-    fingerprint: noteFingerprints[currentNotePath],
-    isDirty: false,
-  });
+  // Autosave timers (debounced), one per path so typing in two panes never drops a pending save.
+  const autosaveTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const clearAutosave = useCallback((path?: string) => {
+    const timers = autosaveTimersRef.current;
+    if (path === undefined) {
+      timers.forEach((t) => clearTimeout(t));
+      timers.clear();
+    } else {
+      const t = timers.get(path);
+      if (t) clearTimeout(t);
+      timers.delete(path);
+    }
+  }, []);
 
-  // Current scroll & cursor tracking
-  const currentScrollTopRef = useRef<number>(0);
-  const currentCursorPosRef = useRef<number>(0);
-
+  // Clean up autosave timers on unmount
   useEffect(() => {
-    currentNoteRef.current = {
-      path: currentNotePath,
-      content: noteState[currentNotePath]?.content || '',
-      fingerprint: noteFingerprints[currentNotePath],
-      isDirty,
-    };
-  }, [currentNotePath, noteState, noteFingerprints, isDirty]);
-
-  // Clean up autosave timer on unmount
-  useEffect(() => {
+    const timers = autosaveTimersRef.current;
     return () => {
-      if (autosaveTimerRef.current) {
-        clearTimeout(autosaveTimerRef.current);
-        autosaveTimerRef.current = null;
-      }
+      timers.forEach((t) => clearTimeout(t));
+      timers.clear();
     };
   }, []);
+
+  // Stash a tab's live scroll/cursor into the tab itself (used before it navigates away).
+  const stashTabView = useCallback(
+    (tabId: string) => {
+      const v = tabViewRef.current.get(tabId);
+      if (v) updateLayout((l) => patchTab(l, tabId, { scrollTop: v.scrollTop, cursorPos: v.cursorPos }));
+    },
+    [updateLayout]
+  );
+
+  // Rename/move propagation (M10.28): every tab pointing at the path updates in place — same tab
+  // ids, no reload — and the path-keyed caches are re-keyed so unsaved buffers survive.
+  const applyRename = useCallback(
+    (from: string, to: string) => {
+      if (!from || from === to) return;
+      const remap = (p: string) =>
+        p === from ? to : p.startsWith(`${from}/`) ? `${to}${p.slice(from.length)}` : p;
+      updateLayout((l) => layoutRenamePath(l, from, to));
+      const rekey = <T,>(prev: Record<string, T>, fix?: (v: T, np: string) => T): Record<string, T> => {
+        let changed = false;
+        const out: Record<string, T> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          const nk = remap(k);
+          if (nk !== k) changed = true;
+          out[nk] = nk !== k && fix ? fix(v, nk) : v;
+        }
+        return changed ? out : prev;
+      };
+      setNoteState((prev) =>
+        rekey(prev, (n, np) => ({ ...n, path: np, folder: np.split('/').slice(0, -1).join('/') }))
+      );
+      setNoteFingerprints((prev) => rekey(prev));
+      const timers = autosaveTimersRef.current;
+      for (const [k, t] of Array.from(timers.entries())) {
+        if (remap(k) !== k) {
+          timers.delete(k);
+          // The pending save fires against the old path; cancel it — the buffer is saved on the
+          // next edit, blur, or close, all of which use the new path.
+          clearTimeout(t);
+        }
+      }
+    },
+    [updateLayout]
+  );
 
   // Refresh workspace tree helper
   const refreshTree = useCallback(async () => {
@@ -379,18 +506,24 @@ export const App: React.FC = () => {
         };
       });
 
-      setIsDirty(false);
-      setShowConflictBanner(false);
+      setDirtyFor(path, false);
+      setConflictFor(path, false);
     } catch (err) {
       console.warn(`Failed to read note ${path}:`, err);
     }
-  }, [theme]);
+  }, [theme, setDirtyFor, setConflictFor]);
 
   // Save note via IPC
   const saveNote = useCallback(
-    async (force = false) => {
-      const { path, content, fingerprint, isDirty: dirty } = currentNoteRef.current;
-      if (!path || (!dirty && !force)) return;
+    async (force = false, pathArg?: string) => {
+      const path = pathArg ?? getActiveTab(layoutRef.current)?.path ?? '';
+      if (!path) return;
+      const tabForPath = findTabByPath(layoutRef.current, path)?.tab;
+      const dirty = !!tabForPath?.isDirty;
+      if (!dirty && !force) return;
+      if (tabForPath?.missing) return;
+      const content = noteStateRef.current[path]?.content ?? '';
+      const fingerprint = noteFingerprintsRef.current[path];
 
       try {
         const newFingerprint = await api.noteWrite(
@@ -403,8 +536,8 @@ export const App: React.FC = () => {
           ...prev,
           [path]: newFingerprint,
         }));
-        setIsDirty(false);
-        setShowConflictBanner(false);
+        setDirtyFor(path, false);
+        setConflictFor(path, false);
 
         // Re-render through the real backend pipeline so the reader pane picks up anything the
         // JS fallback renderer can't reflect live (e.g. table column alignment) — mirrors
@@ -428,24 +561,24 @@ export const App: React.FC = () => {
 
         // Update stats and backlinks after save (M7)
         refreshStats();
-        if (currentNotePath) {
-          api.linksBacklinks(currentNotePath).then((bls) => {
+        {
+          api.linksBacklinks(path).then((bls) => {
             setNoteState((prev) => {
-              const cur = prev[currentNotePath];
+              const cur = prev[path];
               if (!cur) return prev;
-              return { ...prev, [currentNotePath]: { ...cur, backlinks: bls } };
+              return { ...prev, [path]: { ...cur, backlinks: bls } };
             });
           });
 
           // Refresh note metadata (tags, title, headings, front-matter fields) from backend —
           // keeps the Frontmatter panel in sync with fields added/edited by hand in the buffer.
-          api.noteRead(currentNotePath).then((readNote) => {
+          api.noteRead(path).then((readNote) => {
             setNoteState((prev) => {
-              const cur = prev[currentNotePath];
+              const cur = prev[path];
               if (!cur) return prev;
               return {
                 ...prev,
-                [currentNotePath]: {
+                [path]: {
                   ...cur,
                   tags: readNote.meta.tags,
                   title: readNote.meta.title,
@@ -455,27 +588,36 @@ export const App: React.FC = () => {
               };
             });
           }).catch((err) => {
-            console.warn(`Failed to refresh metadata after save for ${currentNotePath}:`, err);
+            console.warn(`Failed to refresh metadata after save for ${path}:`, err);
           });
         }
       } catch (err: any) {
         const errMsg = err?.message || String(err);
         if (errMsg.toLowerCase().includes('conflict')) {
           // Note changed on disk externally
-          setShowConflictBanner(true);
+          let disk = '';
           try {
-            const diskNote = await api.noteRead(path);
-            setDiskVersionContent(diskNote.content);
+            disk = (await api.noteRead(path)).content;
           } catch {
-            setDiskVersionContent('');
+            disk = '';
           }
+          setConflictFor(path, true, disk);
         } else {
           console.error(`Error saving note ${path}:`, err);
         }
       }
     },
-    [currentNotePath, refreshStats, theme]
+    [refreshStats, theme, setDirtyFor, setConflictFor]
   );
+
+  // Save every dirty tab (window blur / unload) — with panes, more than one can be dirty.
+  const saveAllDirty = useCallback(() => {
+    for (const pane of layoutRef.current.panes) {
+      for (const tab of pane.tabs) {
+        if (tab.isDirty) void saveNote(false, tab.path);
+      }
+    }
+  }, [saveNote]);
 
   // Load workspace, tree, and listen to index events on mount (SPEC §6.2, §11, M7)
   useEffect(() => {
@@ -550,24 +692,22 @@ export const App: React.FC = () => {
         const changedPath = event.payload?.path;
         refreshStats();
 
-        // If the changed note is the currently open note
-        if (changedPath && currentNoteRef.current.path === changedPath) {
-          if (!currentNoteRef.current.isDirty) {
-            // Unsaved edits absent: reload in-place preserving scroll and cursor (SPEC §5.3, M8)
-            const prevScroll = currentScrollTopRef.current;
-            const prevCursor = currentCursorPosRef.current;
+        // If the changed note is open in any tab (M10.28: not just the active one)
+        const openTab = changedPath ? findTabByPath(layoutRef.current, changedPath)?.tab : undefined;
+        if (changedPath && openTab) {
+          if (!openTab.isDirty) {
+            // Unsaved edits absent: reload in place; live scroll/cursor live in `tabViewRef`,
+            // which the reload doesn't touch (SPEC §5.3, M8).
             await loadNote(changedPath);
-            setActiveScrollTop(prevScroll);
-            setActiveCursorPos(prevCursor);
           } else {
             // Note has unsaved edits: show conflict banner (SPEC §5.3)
-            setShowConflictBanner(true);
+            let disk = '';
             try {
-              const diskNote = await api.noteRead(changedPath);
-              setDiskVersionContent(diskNote.content);
+              disk = (await api.noteRead(changedPath)).content;
             } catch {
-              setDiskVersionContent('');
+              disk = '';
             }
+            setConflictFor(changedPath, true, disk);
           }
         }
       }).then((unsub) => {
@@ -587,9 +727,9 @@ export const App: React.FC = () => {
         const removedPath = event.payload?.path;
         refreshTree();
         refreshStats();
-        if (removedPath && currentNoteRef.current.path === removedPath) {
-          setCurrentNotePath('');
-        }
+        // A tab whose note vanished stays open with a "no longer exists" state rather than
+        // auto-closing under a user who may not be looking at it (data-safety conventions).
+        if (removedPath) updateLayout((l) => markMissing(l, removedPath));
       }).then((unsub) => {
         unlistenRemoved = unsub;
       });
@@ -599,10 +739,7 @@ export const App: React.FC = () => {
         const { from, to } = event.payload || {};
         refreshTree();
         refreshStats();
-        if (from && currentNoteRef.current.path === from && to) {
-          setCurrentNotePath(to);
-          loadNote(to);
-        }
+        if (from && to) applyRename(from, to);
       }).then((unsub) => {
         unlistenRenamed = unsub;
       });
@@ -648,7 +785,7 @@ export const App: React.FC = () => {
   // Window blur / beforeunload save
   useEffect(() => {
     const handleBlur = () => {
-      saveNote(false);
+      saveAllDirty();
     };
 
     window.addEventListener('blur', handleBlur);
@@ -657,7 +794,7 @@ export const App: React.FC = () => {
       window.removeEventListener('blur', handleBlur);
       window.removeEventListener('beforeunload', handleBlur);
     };
-  }, [saveNote]);
+  }, [saveAllDirty]);
 
   // Apply theme to html root
   useEffect(() => {
@@ -672,6 +809,7 @@ export const App: React.FC = () => {
     if (!settingsLoaded || layoutSeededRef.current) return;
     layoutSeededRef.current = true;
     setViewMode(config.behaviour.defaultMode as ViewMode);
+    setDefaultViewMode(config.behaviour.defaultMode as ViewMode);
     // Fresh workspaces have no saved layout yet — fall back to the configured UI defaults.
     setLeftTab(config.ui.leftSidebar as LeftTab);
     setRightSidebarVisible(config.ui.rightSidebarVisible);
@@ -685,6 +823,50 @@ export const App: React.FC = () => {
     }
     if (layout.activeLeftTab) {
       setLeftTab(layout.activeLeftTab as LeftTab);
+    }
+    if (Array.isArray(layout.recentNotes)) {
+      setRecentNotes(layout.recentNotes.filter((p): p is string => typeof p === 'string').slice(0, 20));
+    }
+    const persistedPanes = layout.panes;
+    if (persistedPanes && Array.isArray(persistedPanes.panes)) {
+      // Restore every pane and tab, dropping paths that no longer resolve to a file (silently —
+      // nothing to show for them).
+      const wanted = Array.from(
+        new Set(
+          persistedPanes.panes.flatMap((p) =>
+            (Array.isArray(p?.tabs) ? p.tabs : []).map((t) => t?.path).filter((x): x is string => typeof x === 'string')
+          )
+        )
+      );
+      void (async () => {
+        const live = new Set<string>();
+        await Promise.all(
+          wanted.map(async (path) => {
+            try {
+              await api.noteRead(path);
+              live.add(path);
+            } catch {
+              /* missing: skipped */
+            }
+          })
+        );
+        const restored = restoreLayout(
+          persistedPanes,
+          (path) => live.has(path),
+          config.behaviour.defaultMode as ViewMode
+        );
+        if (restored) {
+          // A note the CLI asked to open (initial_note) may already be showing; keep it.
+          const already = getActiveTab(layoutRef.current)?.path;
+          updateLayout(() => (already ? layoutOpenInNewTab(restored, already) : restored));
+          await Promise.all(
+            restored.panes.flatMap((p) => p.tabs.map((t) => loadNote(t.path)))
+          );
+          return;
+        }
+        if (layout.lastOpenNote) handleSelectNote(layout.lastOpenNote);
+      })();
+      return;
     }
     if (layout.lastOpenNote) {
       handleSelectNote(layout.lastOpenNote);
@@ -714,7 +896,7 @@ export const App: React.FC = () => {
       left: config.ui.leftSidebar,
       right: config.ui.rightSidebarVisible,
     };
-  }, [config.behaviour.defaultMode, config.ui.leftSidebar, config.ui.rightSidebarVisible]);
+  }, [config.behaviour.defaultMode, config.ui.leftSidebar, config.ui.rightSidebarVisible, setViewMode]);
 
   // Re-fetch the tree when non-note-file visibility changes.
   useEffect(() => {
@@ -727,20 +909,24 @@ export const App: React.FC = () => {
   const { math: mdMath, tables: mdTables, footnotes: mdFootnotes, smartPunctuation: mdSmart } =
     config.markdown;
   useEffect(() => {
-    const { path, content } = currentNoteRef.current;
-    if (!path) return;
+    // Every open tab, not just the active one — two panes can show two notes at once.
+    const paths = layoutRef.current.panes.flatMap((p) => p.tabs.filter((t) => !t.missing).map((t) => t.path));
+    if (paths.length === 0) return;
     let cancelled = false;
-    api
-      .noteRender(path, content, theme)
-      .then((renderRes) => {
-        if (cancelled) return;
-        setNoteState((prev) => {
-          const cur = prev[path];
-          if (!cur) return prev;
-          return { ...prev, [path]: { ...cur, renderedHtml: renderRes.html } };
-        });
-      })
-      .catch(() => {});
+    for (const path of paths) {
+      const content = noteStateRef.current[path]?.content ?? '';
+      api
+        .noteRender(path, content, theme)
+        .then((renderRes) => {
+          if (cancelled) return;
+          setNoteState((prev) => {
+            const cur = prev[path];
+            if (!cur) return prev;
+            return { ...prev, [path]: { ...cur, renderedHtml: renderRes.html } };
+          });
+        })
+        .catch(() => {});
+    }
     return () => {
       cancelled = true;
     };
@@ -748,6 +934,11 @@ export const App: React.FC = () => {
 
   // Persist sidebar-visibility / active-tab layout changes, debounced (400-500ms) like the
   // existing autosave pattern, so rapid toggles don't fire a config_set per event.
+  // Pane/tab structure and the MRU list ride the same debounce (M10.28). They're compared as
+  // JSON so per-keystroke dirty/conflict/history changes — which don't alter the persisted
+  // structure — never reset the timer or cause a write.
+  const panesJson = useMemo(() => JSON.stringify(serializeLayout(layout)), [layout]);
+  const recentJson = useMemo(() => JSON.stringify(recentNotes), [recentNotes]);
   useEffect(() => {
     if (!layoutSeededRef.current) return;
     if (layoutSaveTimerRef.current) clearTimeout(layoutSaveTimerRef.current);
@@ -755,11 +946,19 @@ export const App: React.FC = () => {
       setSettingsField('layout.leftSidebarCollapsed', !leftSidebarVisible);
       setSettingsField('layout.rightSidebarCollapsed', !rightSidebarVisible);
       setSettingsField('layout.activeLeftTab', leftTab);
+      setSettingsField('layout.panes', JSON.parse(panesJson));
+      setSettingsField('layout.recentNotes', JSON.parse(recentJson));
     }, 450);
     return () => {
       if (layoutSaveTimerRef.current) clearTimeout(layoutSaveTimerRef.current);
     };
-  }, [leftSidebarVisible, rightSidebarVisible, leftTab, setSettingsField]);
+  }, [leftSidebarVisible, rightSidebarVisible, leftTab, panesJson, recentJson, setSettingsField]);
+
+  // MRU: every tab-focus event (tab switch, pane switch, navigation) bumps the note to the front.
+  useEffect(() => {
+    if (!currentNotePath) return;
+    setRecentNotes((prev) => pushMru(prev, currentNotePath));
+  }, [currentNotePath, activeTab?.id]);
 
   // Note navigation is low-frequency: persist `lastOpenNote` immediately, no debounce.
   useEffect(() => {
@@ -784,21 +983,21 @@ export const App: React.FC = () => {
 
   // Mode cycle helper (⌘E)
   const cycleViewMode = useCallback(() => {
-    setViewMode((prev) => {
-      if (prev === 'edit') return 'read';
-      if (prev === 'read') return 'split';
-      return 'edit';
-    });
-  }, []);
+    const cur = getActiveTab(layoutRef.current)?.viewMode ?? defaultViewModeRef.current;
+    setViewMode(cur === 'edit' ? 'read' : cur === 'read' ? 'split' : 'edit');
+  }, [setViewMode]);
 
-  // Note selection
+  // Note selection — the single entry point for opening a note. By default it navigates the
+  // active tab (pushing that tab's own history); `{newPane: true}` opens it as a new tab in the
+  // other pane; a note already open anywhere is focused, never duplicated.
   const handleSelectNote = useCallback(
-    async (targetPath: string, targetLine?: number) => {
-      // Clear pending autosave timer on navigation
-      if (autosaveTimerRef.current) {
-        clearTimeout(autosaveTimerRef.current);
-        autosaveTimerRef.current = null;
-      }
+    async (
+      targetPath: string,
+      lineOrOpts?: number | SelectOptions,
+      maybeOpts?: SelectOptions
+    ) => {
+      const targetLine = typeof lineOrOpts === 'number' ? lineOrOpts : undefined;
+      const opts: SelectOptions = (typeof lineOrOpts === 'object' ? lineOrOpts : maybeOpts) ?? {};
 
       // Split anchor if present
       const cleanPath = targetPath.split('#')[0];
@@ -810,7 +1009,8 @@ export const App: React.FC = () => {
         return;
       }
 
-      if (cleanPath === currentNotePath) {
+      const cur = getActiveTab(layoutRef.current);
+      if (cleanPath === cur?.path && !opts.newPane) {
         if (anchor) {
           setScrollToAnchor(anchor);
           setTimeout(() => setScrollToAnchor(null), 300);
@@ -822,29 +1022,30 @@ export const App: React.FC = () => {
         return;
       }
 
-      // Save previous note if dirty before navigating
-      if (isDirty) {
-        await saveNote(false);
-      }
+      const alreadyOpen = !!findTabByPath(layoutRef.current, cleanPath);
 
-      // Save current scroll/cursor to current history entry before moving
-      if (historyIndex >= 0 && historyIndex < history.length) {
-        history[historyIndex] = {
-          ...history[historyIndex],
-          scrollTop: currentScrollTopRef.current,
-          cursorPos: currentCursorPosRef.current,
-        };
+      // Save the note being navigated away from if dirty (existing single-note behaviour)
+      const replacing = !opts.newPane && !opts.newTab;
+      if (cur && !alreadyOpen && replacing && cur.isDirty) {
+        clearAutosave(cur.path);
+        await saveNote(false, cur.path);
       }
+      if (cur && !alreadyOpen && replacing) stashTabView(cur.id);
 
-      const newEntry: HistoryEntry = { path: cleanPath };
-      setHistory((prev) => [...prev.slice(0, historyIndex + 1), newEntry]);
-      setHistoryIndex((prev) => prev + 1);
-      setCurrentNotePath(cleanPath);
-      setActiveScrollTop(undefined);
-      setActiveCursorPos(undefined);
+      const before = getActiveTab(layoutRef.current);
+      const mode = before?.viewMode ?? defaultViewModeRef.current;
+      updateLayout((l) =>
+        opts.newTab && !opts.newPane
+          ? layoutOpenInNewTab(l, cleanPath, mode)
+          : layoutOpenNote(l, cleanPath, { newPane: opts.newPane, viewMode: mode })
+      );
+      if (cur && !alreadyOpen && replacing && !cur.pinned) tabViewRef.current.delete(cur.id);
       setCursorPosition(null);
 
-      await loadNote(cleanPath);
+      // A tab that was already open keeps its in-memory buffer (it may be dirty); everything
+      // else is read from disk.
+      const needsLoad = !alreadyOpen || !noteFingerprintsRef.current[cleanPath];
+      if (needsLoad) await loadNote(cleanPath);
 
       if (anchor) {
         setTimeout(() => {
@@ -860,7 +1061,7 @@ export const App: React.FC = () => {
         }, 100);
       }
     },
-    [currentNotePath, history, historyIndex, isDirty, loadNote, saveNote]
+    [clearAutosave, loadNote, saveNote, stashTabView, updateLayout]
   );
 
   // Open a given path as the active workspace (M10.04 onboarding)
@@ -868,6 +1069,12 @@ export const App: React.FC = () => {
     async (path: string) => {
       try {
         const info = await api.workspaceOpen(path);
+        // A different workspace: its panes, tabs, histories and buffers don't carry over.
+        clearAutosave();
+        tabViewRef.current.clear();
+        updateLayout(() => createLayout());
+        setNoteFingerprints({});
+        setCursorPosition(null);
         setWorkspaceInfo(info);
         setNoWorkspace(false);
         if (info.start_collapsed) {
@@ -884,7 +1091,7 @@ export const App: React.FC = () => {
         console.error('Failed to open workspace:', err);
       }
     },
-    [handleSelectNote, refreshStats, config.ui.showNonNoteFiles]
+    [clearAutosave, handleSelectNote, refreshStats, updateLayout, config.ui.showNonNoteFiles]
   );
 
   // Open a folder via native picker and load it as workspace (M10.04 onboarding)
@@ -1007,75 +1214,44 @@ export const App: React.FC = () => {
       } catch (err: any) {
         const errMsg = err?.message || String(err);
         if (errMsg.toLowerCase().includes('conflict')) {
-          setShowConflictBanner(true);
+          let disk = '';
           try {
-            const diskNote = await api.noteRead(path);
-            setDiskVersionContent(diskNote.content);
+            disk = (await api.noteRead(path)).content;
           } catch {
-            setDiskVersionContent('');
+            disk = '';
           }
+          setConflictFor(path, true, disk);
         } else {
           showToast(`Failed to save front matter: ${errMsg}`);
         }
       }
     },
-    [currentNotePath, noteFingerprints, showToast]
+    [currentNotePath, noteFingerprints, setConflictFor, showToast]
   );
 
-  // History back / forward with cursor and scroll restoration
-  const handleBack = useCallback(async () => {
-    if (historyIndex > 0) {
-      if (autosaveTimerRef.current) {
-        clearTimeout(autosaveTimerRef.current);
-        autosaveTimerRef.current = null;
-      }
-      if (isDirty) {
-        await saveNote(false);
-      }
-      // Save current position
-      if (historyIndex < history.length) {
-        history[historyIndex] = {
-          ...history[historyIndex],
-          scrollTop: currentScrollTopRef.current,
-          cursorPos: currentCursorPosRef.current,
-        };
-      }
-
-      const targetEntry = history[historyIndex - 1];
-      setHistoryIndex(historyIndex - 1);
-      setCurrentNotePath(targetEntry.path);
-      setActiveScrollTop(targetEntry.scrollTop);
-      setActiveCursorPos(targetEntry.cursorPos);
-      await loadNote(targetEntry.path);
-    }
-  }, [history, historyIndex, isDirty, loadNote, saveNote]);
-
-  const handleForward = useCallback(async () => {
-    if (historyIndex < history.length - 1) {
-      if (autosaveTimerRef.current) {
-        clearTimeout(autosaveTimerRef.current);
-        autosaveTimerRef.current = null;
-      }
-      if (isDirty) {
-        await saveNote(false);
-      }
-      // Save current position
-      if (historyIndex >= 0 && historyIndex < history.length) {
-        history[historyIndex] = {
-          ...history[historyIndex],
-          scrollTop: currentScrollTopRef.current,
-          cursorPos: currentCursorPosRef.current,
-        };
-      }
-
-      const targetEntry = history[historyIndex + 1];
-      setHistoryIndex(historyIndex + 1);
-      setCurrentNotePath(targetEntry.path);
-      setActiveScrollTop(targetEntry.scrollTop);
-      setActiveCursorPos(targetEntry.cursorPos);
-      await loadNote(targetEntry.path);
-    }
-  }, [history, historyIndex, isDirty, loadNote, saveNote]);
+  // History back / forward (per tab) with cursor and scroll restoration
+  const stepTabHistory = useCallback(
+    async (tabId: string | undefined, delta: -1 | 1) => {
+      const tab = tabId
+        ? findTabById(layoutRef.current, tabId)?.tab
+        : getActiveTab(layoutRef.current) ?? undefined;
+      if (!tab) return;
+      const target = tab.history[tab.historyIndex + delta];
+      if (!target) return;
+      clearAutosave(tab.path);
+      if (tab.isDirty) await saveNote(false, tab.path);
+      stashTabView(tab.id);
+      const res = stepHistory(layoutRef.current, tab.id, delta);
+      if (!res) return;
+      updateLayout(() => res.layout);
+      tabViewRef.current.delete(tab.id);
+      setCursorPosition(null);
+      await loadNote(res.entry.path);
+    },
+    [clearAutosave, loadNote, saveNote, stashTabView, updateLayout]
+  );
+  const handleBack = useCallback((tabId?: string) => stepTabHistory(tabId, -1), [stepTabHistory]);
+  const handleForward = useCallback((tabId?: string) => stepTabHistory(tabId, 1), [stepTabHistory]);
 
   /** Render `newNote.filenamePattern`'s `{{ title }}` placeholder against a filler title, used as
    * both the inline-create field's initial value and the New Note modal's initial name field —
@@ -1220,17 +1396,8 @@ export const App: React.FC = () => {
           await refreshTree();
           await refreshStats();
 
-          // If currently viewing the renamed note, update current path
-          if (currentNotePath === fromPath) {
-            setCurrentNotePath(toPath);
-            await loadNote(toPath);
-          } else if (currentNotePath.startsWith(`${fromPath}/`)) {
-            // Note inside a renamed folder
-            const sub = currentNotePath.slice(fromPath.length);
-            const newCurrent = `${toPath}${sub}`;
-            setCurrentNotePath(newCurrent);
-            await loadNote(newCurrent);
-          }
+          // Every open tab on the renamed note (or inside a renamed folder) updates in place.
+          applyRename(fromPath, toPath);
 
           if (res?.links_updated && res.links_updated > 0) {
             showToast(`Renamed. Updated ${res.links_updated} link${res.links_updated === 1 ? '' : 's'}`);
@@ -1246,10 +1413,9 @@ export const App: React.FC = () => {
   }, [
     showTemplateWarning,
     config.templates.defaultTemplate,
-    currentNotePath,
+    applyRename,
     handleSelectNote,
     inlineAction,
-    loadNote,
     refreshStats,
     refreshTree,
     showToast,
@@ -1286,14 +1452,12 @@ export const App: React.FC = () => {
       }
 
       await refreshTree();
-      if (currentNotePath === itemPath || currentNotePath.startsWith(`${itemPath}/`)) {
-        setCurrentNotePath('');
-      }
+      updateLayout((l) => markMissing(l, itemPath));
       showToast(`Moved "${itemPath.split('/').pop()}" to Trash`);
     } catch (err: any) {
       showToast(`Delete failed: ${err?.message || String(err)}`);
     }
-  }, [currentNotePath, refreshTree, showToast, config.behaviour.deleteToTrash]);
+  }, [refreshTree, showToast, updateLayout, config.behaviour.deleteToTrash]);
 
   const handleConfirmPermanentDelete = useCallback(async () => {
     const { itemPath, isFolder } = deleteModalState;
@@ -1307,14 +1471,12 @@ export const App: React.FC = () => {
       }
 
       await refreshTree();
-      if (currentNotePath === itemPath || currentNotePath.startsWith(`${itemPath}/`)) {
-        setCurrentNotePath('');
-      }
+      updateLayout((l) => markMissing(l, itemPath));
       showToast(`Permanently deleted "${itemPath.split('/').pop()}"`);
     } catch (err: any) {
       showToast(`Permanent delete failed: ${err?.message || String(err)}`);
     }
-  }, [currentNotePath, deleteModalState, refreshTree, showToast]);
+  }, [deleteModalState, refreshTree, showToast, updateLayout]);
 
   const handleMoveItem = useCallback(async (fromPath: string, toParentFolder: string) => {
     const itemName = fromPath.split('/').pop()!;
@@ -1325,12 +1487,7 @@ export const App: React.FC = () => {
       await refreshTree();
       await refreshStats();
 
-      if (currentNotePath === fromPath) {
-        setCurrentNotePath(toPath);
-      } else if (currentNotePath.startsWith(`${fromPath}/`)) {
-        const sub = currentNotePath.slice(fromPath.length);
-        setCurrentNotePath(`${toPath}${sub}`);
-      }
+      applyRename(fromPath, toPath);
 
       // Show toast with undo affordance
       const folderDisplayName = toParentFolder || 'workspace root';
@@ -1347,9 +1504,7 @@ export const App: React.FC = () => {
             await api.noteRename(toPath, fromPath);
             await refreshTree();
             await refreshStats();
-            if (currentNotePath === toPath) {
-              setCurrentNotePath(fromPath);
-            }
+            applyRename(toPath, fromPath);
             showToast(`Restored "${itemName}" to original location`);
           } catch (undoErr: any) {
             showToast(`Undo failed: ${undoErr?.message || String(undoErr)}`);
@@ -1360,7 +1515,7 @@ export const App: React.FC = () => {
     } catch (err: any) {
       showToast(`Failed to move: ${err?.message || String(err)}`);
     }
-  }, [currentNotePath, refreshStats, refreshTree, showToast]);
+  }, [applyRename, refreshStats, refreshTree, showToast]);
 
   const handleRevealInFileManager = useCallback(async (itemPath: string) => {
     try {
@@ -1375,17 +1530,110 @@ export const App: React.FC = () => {
     showToast(`Copied path "${itemPath}" to clipboard`);
   }, [showToast]);
 
-  const handleCloseNote = useCallback(async () => {
-    if (autosaveTimerRef.current) {
-      clearTimeout(autosaveTimerRef.current);
-      autosaveTimerRef.current = null;
-    }
-    if (isDirty) {
-      await saveNote(false);
-    }
-    setCurrentNotePath('');
-    setCursorPosition(null);
-  }, [isDirty, saveNote]);
+  // Saves a tab's unsaved edits before it closes — the same save-then-leave flow the single-note
+  // app had, never a second dirty-close dialog. A save that hits a conflict leaves the tab dirty;
+  // closing it then would silently drop the buffer, so the close is refused instead.
+  const saveBeforeClose = useCallback(
+    async (tabs: Tab[]): Promise<boolean> => {
+      for (const tab of tabs) {
+        clearAutosave(tab.path);
+        if (tab.isDirty && !tab.missing) await saveNote(false, tab.path);
+      }
+      const stillDirty = tabs.some((t) => {
+        const cur = findTabById(layoutRef.current, t.id)?.tab;
+        return !!cur && cur.isDirty && !cur.missing;
+      });
+      if (stillDirty) {
+        showToast('Unsaved changes could not be saved (the note changed on disk). Resolve the conflict first.');
+        return false;
+      }
+      return true;
+    },
+    [clearAutosave, saveNote, showToast]
+  );
+
+  const handleCloseNote = useCallback(
+    async (tabId?: string) => {
+      const tab = tabId
+        ? findTabById(layoutRef.current, tabId)?.tab
+        : getActiveTab(layoutRef.current) ?? undefined;
+      if (!tab) return;
+      if (!(await saveBeforeClose([tab]))) return;
+      tabViewRef.current.delete(tab.id);
+      updateLayout((l) => layoutCloseTab(l, tab.id));
+      setCursorPosition(null);
+    },
+    [saveBeforeClose, updateLayout]
+  );
+
+  const handleCloseOthers = useCallback(
+    async (tabId?: string) => {
+      const id = tabId ?? getActiveTab(layoutRef.current)?.id;
+      if (!id) return;
+      const closing = tabsClosedByOthers(layoutRef.current, id);
+      if (!(await saveBeforeClose(closing))) return;
+      closing.forEach((t) => tabViewRef.current.delete(t.id));
+      updateLayout((l) => layoutCloseOthers(l, id));
+    },
+    [saveBeforeClose, updateLayout]
+  );
+
+  const handleCloseToRight = useCallback(
+    async (tabId: string) => {
+      const closing = tabsClosedToRight(layoutRef.current, tabId);
+      if (!(await saveBeforeClose(closing))) return;
+      closing.forEach((t) => tabViewRef.current.delete(t.id));
+      updateLayout((l) => layoutCloseToRight(l, tabId));
+    },
+    [saveBeforeClose, updateLayout]
+  );
+
+  const handleActivateTab = useCallback(
+    (tabId: string) => {
+      updateLayout((l) => layoutSetActiveTab(l, tabId));
+      setCursorPosition(null);
+    },
+    [updateLayout]
+  );
+
+  const handleFocusPane = useCallback(
+    (paneId: string) => {
+      if (layoutRef.current.activePaneId !== paneId) {
+        updateLayout((l) => layoutSetActivePane(l, paneId));
+        setCursorPosition(null);
+      }
+    },
+    [updateLayout]
+  );
+
+  const handleTogglePin = useCallback(
+    (tabId?: string) => {
+      const id = tabId ?? getActiveTab(layoutRef.current)?.id;
+      if (id) updateLayout((l) => layoutTogglePin(l, id));
+    },
+    [updateLayout]
+  );
+
+  const handleMoveToOtherPane = useCallback(
+    (tabId?: string) => {
+      const id = tabId ?? getActiveTab(layoutRef.current)?.id;
+      if (id) updateLayout((l) => layoutMoveToOtherPane(l, id));
+    },
+    [updateLayout]
+  );
+
+  const handleNewPane = useCallback(() => updateLayout((l) => layoutNewPane(l)), [updateLayout]);
+  const handleToggleOrientation = useCallback(() => updateLayout((l) => toggleOrientation(l)), [updateLayout]);
+
+  // ⌘1–⌘9: jump to the Nth tab in the active pane (⌘9 = the last tab).
+  const handleJumpToTab = useCallback(
+    (n: number) => {
+      const pane = layoutRef.current.panes.find((p) => p.id === layoutRef.current.activePaneId);
+      const id = pane ? tabIdForShortcut(pane, n) : null;
+      if (id) handleActivateTab(id);
+    },
+    [handleActivateTab]
+  );
 
   // Register commands in registry per SPEC §9.3 & M4. Metadata (id/title/shortcut) lives in
   // src/commands/appCommands.ts — the single source of truth the docs site's shortcut table is
@@ -1397,6 +1645,16 @@ export const App: React.FC = () => {
       'file.new_template': () => handleOpenTemplatesScreen({ initialCreate: true }),
       'view.manage_templates': () => handleOpenTemplatesScreen(),
       'file.close': () => handleCloseNote(),
+      'pane.new': handleNewPane,
+      'tab.open_note_in_new_tab': () => {
+        setPaletteMode('notes');
+        setPaletteNewTab(true);
+        setPaletteOpen(true);
+      },
+      'pane.toggle_orientation': handleToggleOrientation,
+      'tab.close_others': () => handleCloseOthers(),
+      'tab.toggle_pin': () => handleTogglePin(),
+      'tab.move_to_other_pane': () => handleMoveToOtherPane(),
       'palette.notes': () => {
         setPaletteMode('notes');
         setPaletteOpen(true);
@@ -1438,6 +1696,11 @@ export const App: React.FC = () => {
     config.dailyNotes.enabled,
     cycleViewMode,
     handleCloseNote,
+    handleCloseOthers,
+    handleMoveToOtherPane,
+    handleNewPane,
+    handleToggleOrientation,
+    handleTogglePin,
     handleDailyNoteOpen,
     handleDailyNotePickDate,
     handleStartCreateFolder,
@@ -1489,6 +1752,10 @@ export const App: React.FC = () => {
       } else if (mod && e.key === ']') {
         e.preventDefault();
         handleForward();
+      } else if (mod && e.shiftKey && e.key.toLowerCase() === 'r') {
+        e.preventDefault();
+        const path = getActiveTab(layoutRef.current)?.path;
+        if (path) handleRevealInFileManager(path);
       } else if (mod && e.key.toLowerCase() === 's') {
         e.preventDefault();
         saveNote(false);
@@ -1498,39 +1765,42 @@ export const App: React.FC = () => {
       } else if (mod && e.key === ',') {
         e.preventDefault();
         setSettingsOpen((prev) => !prev);
+      } else if (mod && !e.shiftKey && !e.altKey && /^[1-9]$/.test(e.key)) {
+        e.preventDefault();
+        handleJumpToTab(parseInt(e.key, 10));
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [cycleViewMode, handleBack, handleCloseNote, handleForward, handleOpenFolder, handleStartCreateFolder, handleStartCreateNote, saveNote]);
+  }, [cycleViewMode, handleBack, handleCloseNote, handleForward, handleJumpToTab, handleOpenFolder, handleRevealInFileManager, handleStartCreateFolder, handleStartCreateNote, saveNote]);
 
-  const currentNote = currentNotePath
-    ? noteState[currentNotePath] ||
-      FIXTURE_NOTES[currentNotePath] || {
-        path: currentNotePath,
-        title: currentNotePath.split('/').pop()?.replace(/\.md$/, '') || 'Untitled',
-        folder: currentNotePath.split('/').slice(0, -1).join('/'),
-        tags: [],
-        content: '',
-        headings: [],
-        outgoingLinks: [],
-        backlinks: [],
-        renderedHtml: '',
-        lastModifiedAgo: 'just now',
-      }
-    : {
-        path: '',
-        title: '',
-        folder: '',
-        tags: [],
-        content: '',
-        headings: [],
-        outgoingLinks: [],
-        backlinks: [],
-        renderedHtml: '',
-        lastModifiedAgo: '',
-      };
+  const noteFor = useCallback(
+    (path: string): NoteFixture =>
+      path
+        ? noteState[path] ||
+          FIXTURE_NOTES[path] || {
+            path,
+            title: path.split('/').pop()?.replace(/\.md$/, '') || 'Untitled',
+            folder: path.split('/').slice(0, -1).join('/'),
+            tags: [],
+            content: '',
+            headings: [],
+            outgoingLinks: [],
+            backlinks: [],
+            renderedHtml: '',
+            lastModifiedAgo: 'just now',
+          }
+        : EMPTY_NOTE,
+    [noteState]
+  );
+  const currentNote = noteFor(currentNotePath);
+
+  const tabTitle = useCallback(
+    (tab: Tab) =>
+      noteState[tab.path]?.title || tab.path.split('/').pop()?.replace(/\.(md|markdown)$/i, '') || tab.path,
+    [noteState]
+  );
 
   const textStats = React.useMemo(() => {
     if (!currentNotePath) {
@@ -1547,15 +1817,17 @@ export const App: React.FC = () => {
     ? `${workspaceInfo.name}/${currentNotePath.replace(/^projects\//, '')}`
     : workspaceInfo.name;
 
-  // Content change handler with 400ms debounced autosave and live outgoing links extraction
-  const handleContentChange = (newContent: string) => {
-    setIsDirty(true);
+  // Content change handler with 400ms debounced autosave and live outgoing links extraction.
+  // Keyed by path (not "the current note"): with panes, the edit can come from a non-active tab.
+  const handleContentChange = (targetPath: string, newContent: string) => {
+    if (!targetPath) return;
+    setDirtyFor(targetPath, true);
     const renderedHtml = renderMarkdownToHtml(newContent);
     setNoteState((prev) => {
-      const current = prev[currentNotePath];
+      const current = prev[targetPath];
       return {
         ...prev,
-        [currentNotePath]: {
+        [targetPath]: {
           ...current,
           content: newContent,
           renderedHtml,
@@ -1564,7 +1836,6 @@ export const App: React.FC = () => {
     });
 
     // Extract outgoing links live for the right sidebar
-    const targetPath = currentNotePath;
     api.linksOutgoing(targetPath, newContent)
       .then((outgoingLinks) => {
         setNoteState((prev) => {
@@ -1584,12 +1855,14 @@ export const App: React.FC = () => {
       });
 
     // Debounce autosave per config.behaviour.autosaveMs (settings-configurable, M10.1)
-    if (autosaveTimerRef.current) {
-      clearTimeout(autosaveTimerRef.current);
-    }
-    autosaveTimerRef.current = setTimeout(() => {
-      saveNote(false);
-    }, config.behaviour.autosaveMs);
+    clearAutosave(targetPath);
+    autosaveTimersRef.current.set(
+      targetPath,
+      setTimeout(() => {
+        autosaveTimersRef.current.delete(targetPath);
+        saveNote(false, targetPath);
+      }, config.behaviour.autosaveMs)
+    );
   };
 
   return (
@@ -1794,44 +2067,92 @@ export const App: React.FC = () => {
           />
         )}
 
-        <CenterPane
-          note={currentNote}
-          viewMode={viewMode}
-          theme={theme}
-          isDirty={isDirty}
-          onContentChange={handleContentChange}
-          onSaveNow={() => saveNote(false)}
-          onBlurSave={() => saveNote(false)}
-          onNavigateRelative={handleSelectNote}
-          onCreateNote={handleCreateBrokenNote}
-          onOpenExternal={handleOpenExternal}
-          onCloseNote={handleCloseNote}
-          showConflictBanner={showConflictBanner}
-          onKeepVersion={() => {
-            // Force overwrite on disk
-            saveNote(true);
-          }}
-          onLoadFromDisk={async () => {
-            await loadNote(currentNotePath);
-          }}
-          onShowDifferences={() => {
-            setDiffViewerOpen(true);
-          }}
-          onBack={handleBack}
-          onForward={handleForward}
-          onHeadingInView={(anchor) => setActiveHeadingAnchor(anchor)}
-          scrollToAnchor={scrollToAnchor}
-          scrollToLine={scrollToLine}
-          treeData={treeData}
-          indexedNotes={indexedNotes}
-          savedScrollTop={activeScrollTop}
-          savedCursorPos={activeCursorPos}
-          onScrollOrCursorChange={(scrollTop, cursorPos, cursorLine, cursorCol, selectionLength) => {
-            currentScrollTopRef.current = scrollTop;
-            currentCursorPosRef.current = cursorPos;
-            setCursorPosition({ line: cursorLine, col: cursorCol, selectionLength });
-          }}
-        />
+        <div
+          className={`flex-1 flex min-w-0 min-h-0 ${layout.orientation === 'vertical' ? 'flex-row' : 'flex-col'}`}
+        >
+          {layout.panes.map((pane, paneIndex) => {
+            const tab = getPaneActiveTab(pane);
+            const isActivePane = pane.id === layout.activePaneId;
+            const multiPane = layout.panes.length > 1;
+            const tabNote = tab ? noteFor(tab.path) : EMPTY_NOTE;
+            const view = tab ? tabViewRef.current.get(tab.id) : undefined;
+            return (
+              <div
+                key={pane.id}
+                data-testid={`pane-${paneIndex}`}
+                className={`flex-1 flex flex-col min-w-0 min-h-0 ${
+                  paneIndex > 0
+                    ? layout.orientation === 'vertical'
+                      ? 'border-l border-[var(--border)]'
+                      : 'border-t border-[var(--border)]'
+                    : ''
+                } ${multiPane && isActivePane ? 'shadow-[inset_0_2px_0_var(--accent)]' : ''}`}
+              >
+                <TabStrip
+                  paneId={pane.id}
+                  tabs={pane.tabs}
+                  activeTabId={pane.activeTabId}
+                  isActivePane={isActivePane}
+                  titleFor={tabTitle}
+                  onActivate={handleActivateTab}
+                  onClose={(id) => void handleCloseNote(id)}
+                  onCloseOthers={(id) => void handleCloseOthers(id)}
+                  onCloseToRight={(id) => void handleCloseToRight(id)}
+                  onTogglePin={handleTogglePin}
+                  onMoveToOtherPane={handleMoveToOtherPane}
+                  onReorder={(from, to) => updateLayout((l) => reorderTab(l, pane.id, from, to))}
+                />
+                <CenterPane
+                  note={tabNote}
+                  tabId={tab?.id}
+                  hideNoteIdentity
+                  onReveal={() => tab?.path && handleRevealInFileManager(tab.path)}
+                  isActivePane={isActivePane}
+                  missing={!!tab?.missing}
+                  onPaneFocus={() => handleFocusPane(pane.id)}
+                  viewMode={tab?.viewMode ?? defaultViewMode}
+                  theme={theme}
+                  isDirty={tab?.isDirty ?? false}
+                  onContentChange={(content) => handleContentChange(tab?.path ?? '', content)}
+                  onSaveNow={() => saveNote(false, tab?.path)}
+                  onBlurSave={() => saveNote(false, tab?.path)}
+                  onNavigateRelative={handleSelectNote}
+                  onCreateNote={handleCreateBrokenNote}
+                  onOpenExternal={handleOpenExternal}
+                  onCloseNote={() => void handleCloseNote(tab?.id)}
+                  showConflictBanner={tab?.showConflictBanner ?? false}
+                  onKeepVersion={() => {
+                    // Force overwrite on disk
+                    saveNote(true, tab?.path);
+                  }}
+                  onLoadFromDisk={async () => {
+                    if (tab) await loadNote(tab.path);
+                  }}
+                  onShowDifferences={() => {
+                    handleFocusPane(pane.id);
+                    setDiffViewerOpen(true);
+                  }}
+                  onBack={() => void handleBack(tab?.id)}
+                  onForward={() => void handleForward(tab?.id)}
+                  onHeadingInView={isActivePane ? (anchor) => setActiveHeadingAnchor(anchor) : undefined}
+                  scrollToAnchor={isActivePane ? scrollToAnchor : null}
+                  scrollToLine={isActivePane ? scrollToLine : null}
+                  treeData={treeData}
+                  indexedNotes={indexedNotes}
+                  savedScrollTop={view?.scrollTop ?? tab?.scrollTop}
+                  savedCursorPos={view?.cursorPos ?? tab?.cursorPos}
+                  onScrollOrCursorChange={(scrollTop, cursorPos, cursorLine, cursorCol, selectionLength) => {
+                    if (!tab) return;
+                    tabViewRef.current.set(tab.id, { scrollTop, cursorPos });
+                    if (isActivePane) {
+                      setCursorPosition({ line: cursorLine, col: cursorCol, selectionLength });
+                    }
+                  }}
+                />
+              </div>
+            );
+          })}
+        </div>
 
         {rightSidebarVisible && (
           <RightSidebar
@@ -1876,11 +2197,16 @@ export const App: React.FC = () => {
       {/* Command Palette Modal */}
       <CommandPalette
         isOpen={paletteOpen}
-        onClose={() => setPaletteOpen(false)}
+        onClose={() => {
+          setPaletteOpen(false);
+          setPaletteNewTab(false);
+        }}
         notes={noteState}
+        newTabByDefault={paletteNewTab}
         indexedNotes={indexedNotes}
         onSelectNote={handleSelectNote}
         initialMode={paletteMode}
+        recentNotes={recentNotes}
       />
 
       {/* Unresolved Links Modal (M7) */}
@@ -1901,7 +2227,7 @@ export const App: React.FC = () => {
         notePath={currentNotePath}
         bufferContent={currentNote.content}
         diskContent={diskVersionContent}
-        onKeepVersion={() => saveNote(true)}
+        onKeepVersion={() => saveNote(true, currentNotePath)}
         onLoadFromDisk={() => loadNote(currentNotePath)}
       />
 

@@ -1,104 +1,159 @@
 # Flint
 
-Flint is a local-first Markdown knowledge workspace: a Tauri 2.x desktop app, launched from a CLI, that opens a directory on disk and treats every `.md`/`.markdown` file in it as a note, with an editor, reader, link navigation, search, and backlinks.
+Flint is a desktop app for writing and connecting Markdown notes. Point it at any folder on your computer. Every `.md` file becomes a note you can edit, read, link, and search. It is for people who want a fast note workspace without giving up their files.
 
-Flint owns no data — every note stays a plain, portable Markdown file that remains readable, editable, and movable with any other tool (`vim`, Finder, `git`, `rsync`, Obsidian). It makes no network requests, ever.
-
-**Governing principle:** the filesystem is the workspace, Markdown files are the knowledge base, Flint is the interface for working with them.
+[![CI](https://github.com/0funct0ry/flint/actions/workflows/ci.yml/badge.svg)](https://github.com/0funct0ry/flint/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/0funct0ry/flint?include_prereleases)](https://github.com/0funct0ry/flint/releases)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+![Rust](https://img.shields.io/badge/rust-2021-orange)
+![Tauri](https://img.shields.io/badge/tauri-2.x-24C8DB)
 
 **Documentation:** [0funct0ry.github.io/flint](https://0funct0ry.github.io/flint/)
 
----
+## Key Features
 
-## Repository Structure
+- **Your files stay yours.** Notes are plain Markdown. Edit them with `vim`, `git`, or Finder at any time.
+- **Edit, read, or split.** Write with a CodeMirror editor. Preview in the reader beside it.
+- **Links and backlinks.** Jump between notes. See which notes point at the one you have open.
+- **Fast search.** Find notes by name or search the text of every note.
+- **Safe saving.** Writes are atomic. Flint warns you if a file changed on disk while you edited.
+- **Rename without breaking links.** Flint updates links in other notes and reports how many.
+- **Wikilinks, tags, embeds, Mermaid diagrams.** Use them as you write.
+- **Templates and daily notes.** Create notes from reusable templates.
+- **Tabs and split panes.** Work on several notes at once.
+- **A real command line.** Search, list, and check a workspace without opening a window.
+- **Local only.** Flint never makes outbound network requests. A test enforces this.
+- **Optional agent access.** An opt-in local MCP server lets coding agents read your notes.
+- **Light and dark themes.** Everything works with the keyboard.
 
+## Install
+
+Pick the route that fits. Full details are in the [install guide](https://0funct0ry.github.io/flint/docs/install/).
+
+```bash
+# macOS and Linux
+curl -fsSL https://0funct0ry.github.io/flint/install.sh | sh
 ```
-flint/
-├── Cargo.toml                  # Workspace definition
-├── crates/
-│   ├── flint-core/             # Pure domain logic: index, link parsing, search, path guard
-│   ├── flint-cli/              # clap CLI + Tauri host, produces the single `flint` binary
-│   └── flint-app/              # lib-only: Tauri commands, events, watcher wiring
-├── src/                        # React 18 + TypeScript + Tailwind + CodeMirror 6 frontend
-├── src-tauri/ -> crates/flint-cli
-├── bin/flint                   # macOS PATH shim — routes `flint` through LaunchServices
-└── internal-docs/              # Specification & milestone build prompts
-```
 
----
+You can also download a `.dmg`, `.AppImage`, `.deb`, or `.msi` from the [releases page](https://github.com/0funct0ry/flint/releases). Every route ends with a `flint` command on your `PATH`.
 
-## Quick Start & Development
+## Prerequisites (building from source)
 
-### Prerequisites
-- [Rust](https://rustup.rs/) (edition 2021+)
-- [Node.js](https://nodejs.org/) (v20+)
-- [pnpm](https://pnpm.io/)
+| Tool | Version |
+| --- | --- |
+| [Rust](https://rustup.rs/) | stable, 2021 edition |
+| [Node.js](https://nodejs.org/) | 20 or later |
+| [pnpm](https://pnpm.io/) | 11 |
+| Linux only | `libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `librsvg2-dev`, `patchelf` |
 
-### Installation & Run
+## Getting Started
 
-1. **Install frontend dependencies:**
+1. Clone the repository.
+
+   ```bash
+   git clone https://github.com/0funct0ry/flint.git
+   cd flint
+   ```
+
+2. Install frontend dependencies.
+
    ```bash
    pnpm install
    pnpm approve-builds --all
    ```
 
-2. **Run frontend dev server:**
-   ```bash
-   pnpm dev
-   ```
+3. Configure settings. Flint needs no environment variables. It keeps per-workspace settings in `.flint.db` inside the workspace.
 
-3. **Run Tauri application (dev mode):**
+4. Run the app in development mode.
+
    ```bash
    cargo tauri dev
    ```
 
-4. **CLI invocation:**
-   ```bash
-   cargo run -p flint-cli -- --help
-   ```
+## Usage
 
----
+Open a folder as a workspace:
 
-## Building the App Bundle (macOS)
+```bash
+flint ~/notes
+flint .
+```
 
-To produce a fully launchable `Flint.app` (required for Finder double-click, Dock icon, and menu-bar registration — M10.04):
+Work from the terminal without opening a window:
+
+```bash
+flint init ~/notes            # create settings and a starter note
+flint new ideas/launch.md     # create a note
+flint search "retro"          # print matches as path:line:match
+flint list --folder ideas     # list note paths
+flint doctor                  # report broken links and orphan notes
+flint info --json             # workspace details as JSON
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--workspace <PATH>` | Choose the workspace explicitly |
+| `--no-open` | Skip the GUI |
+| `--json` | Print machine-readable output |
+| `--foreground` | Keep the GUI attached to the terminal |
+| `--mcp` / `--mcp-auth` | Start the local MCP server, optionally with a bearer token |
+
+Exit codes: `0` success, `1` failure, `2` bad usage, `3` workspace not found, `4` permission denied, `5` note not found.
+
+Common shortcuts: `⌘N` new note, `⌘P` find a note, `⌘⇧P` command list, `⌘⇧F` search all notes, `⌘E` switch edit/read/split.
+
+### Project layout
+
+```text
+flint/
+├── crates/
+│   ├── flint-core/   # index, link parsing, search, path guard (no Tauri)
+│   ├── flint-cli/    # clap CLI and Tauri host; builds the single `flint` binary
+│   └── flint-app/    # Tauri commands, events, watcher, MCP server
+├── src/              # React + TypeScript + Tailwind + CodeMirror frontend
+├── docs/             # Astro Starlight documentation site
+├── packaging/        # Homebrew cask
+└── install.sh        # macOS/Linux installer
+```
+
+## Testing and Quality
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --locked -- -D warnings
+cargo test --workspace --locked   # includes the no-network-crate guard
+cargo deny check
+
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm build
+```
+
+CI runs all of these on every push and pull request.
+
+## Deployment
+
+Pushing a `v*` tag runs the release workflow. It builds a universal `.dmg`, an `.AppImage` and `.deb`, and an `.msi`. It publishes them with a `SHA256SUMS` file to a GitHub Release. Builds ship without an updater, because Flint never checks the network.
+
+Build a macOS app bundle locally:
 
 ```bash
 cargo tauri build --bundles app
 ```
 
-The bundle is written to `target/release/bundle/macos/Flint.app`.
+The bundle lands in `target/release/bundle/macos/Flint.app`. Use the bundle, not `cargo run`, to test Finder launch and the Dock icon.
 
-> **Note:** `cargo run -p flint-cli` and `cargo tauri dev` produce a raw binary only.
-> The `.app` bundle is required for proper macOS GUI activation via LaunchServices.
+## Contributing
 
-### macOS PATH Shim (`bin/flint`)
+Open an issue before large changes. Then:
 
-The file [`bin/flint`](./bin/flint) is a thin shell script that must be installed to `PATH` (e.g. `/usr/local/bin/flint`).  It routes terminal invocations through `open -a Flint.app --args "$@"` so the GUI process is always registered with LaunchServices:
+1. Fork the repository and create a branch.
+2. Keep to the checks in [Testing and Quality](#testing-and-quality).
+3. Open a pull request that describes what changed and why.
 
-```bash
-# Install (after building Flint.app and copying to /Applications):
-sudo install -m 0755 bin/flint /usr/local/bin/flint
-```
+Flint's data-safety rules are fixed. Never delete a note without being asked. Never overwrite unsaved work silently. Never add outbound network calls.
 
-The shim searches `/Applications/Flint.app`, `~/Applications/Flint.app`, and a recorded install path before falling back to the dev binary with a warning.
+## License
 
----
-
-## Verification & Testing
-
-- **Rust Checks:**
-  ```bash
-  cargo fmt --check
-  cargo clippy --workspace -- -D warnings
-  cargo test --workspace
-  ```
-
-- **Frontend Checks:**
-  ```bash
-  pnpm lint
-  pnpm test
-  pnpm typecheck
-  pnpm build
-  ```
-
+Flint is dual-licensed under MIT or Apache-2.0, at your option, as declared in `Cargo.toml`.

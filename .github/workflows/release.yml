@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-universal
+            os: macos-latest
+            args: --target universal-apple-darwin --bundles dmg
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            args: --bundles appimage,deb
+            rust_targets: ''
+          - name: windows-x86_64
+            os: windows-latest
+            args: --bundles msi
+            rust_targets: ''
+    runs-on: ${{ matrix.os }}
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+      - name: Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libssl-dev patchelf libxdo-dev
+      - uses: pnpm/action-setup@v3
+        with:
+          version: 11.0.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm approve-builds --all
+      - name: Import macOS signing certificate
+        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > cert.p12
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import cert.p12 -k build.keychain -P "${{ secrets.APPLE_CERTIFICATE_PASSWORD }}" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
+          rm cert.p12
+      - name: Build bundles
+        # Signing/notarization are enabled only when the secrets exist; otherwise the build is
+        # unsigned and the release notes say so. Updater artifacts are disabled in tauri.conf.json.
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: pnpm exec tauri build ${{ matrix.args }}
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          mkdir -p out
+          find target -path '*release/bundle/*' -type f \
+            \( -name '*.dmg' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.msi' \) \
+            -exec cp {} out/ \;
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundles-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          pattern: bundles-*
+          merge-multiple: true
+      - name: Verify all four artifacts and write checksums
+        working-directory: out
+        run: |
+          for ext in dmg AppImage deb msi; do
+            ls *."$ext" >/dev/null || { echo "missing .$ext artifact" >&2; exit 1; }
+          done
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Compose release notes
+        env:
+          SIGNED: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '$0 ~ "^## \\["v"\\]"{f=1;next} /^## \[/{f=0} f' CHANGELOG.md > changes.md
+          if [ "$SIGNED" = "true" ]; then s="macOS builds are signed and notarized."; \
+          else s="These builds are **unsigned**: macOS Gatekeeper and Windows SmartScreen will warn on first launch."; fi
+          sed -e "s/__VERSION__/$version/g" -e "/__CHANGELOG__/{r changes.md" -e "d}" \
+              -e "s/__SIGNING__/$s/" .github/release-notes-template.md > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: out/*
+          draft: false

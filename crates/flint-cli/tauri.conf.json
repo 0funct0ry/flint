@@ -27,13 +27,40 @@
   "mainBinaryName": "flint",
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": [
+      "dmg",
+      "appimage",
+      "deb",
+      "msi"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": false,
+    "category": "Productivity",
+    "shortDescription": "Local-first Markdown knowledge workspace",
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": null
+    },
+    "windows": {
+      "wix": {
+        "fragmentPaths": [
+          "wix/path.wxs"
+        ],
+        "componentRefs": [
+          "FlintPathEnv"
+        ]
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    }
   }
 }

@@ -1,3 +1,4 @@
+mod cli_install;
 mod mcp;
 
 use flint_core::{
@@ -1854,6 +1855,11 @@ pub fn build_app_with_mcp_flags(
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(state)
+        .setup(|_app| {
+            #[cfg(target_os = "macos")]
+            cli_install::offer_install(_app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             workspace_open,
             workspace_tree,

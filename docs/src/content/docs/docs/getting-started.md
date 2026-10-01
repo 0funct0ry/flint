@@ -8,21 +8,8 @@ Installing it once gives you both.
 
 ## Install
 
-**macOS** — download the disk image, drag Flint to Applications, then open it once; it offers to
-add the `flint` command to `/usr/local/bin`.
-
-**Linux** — `sudo dpkg -i flint_0.1.0_amd64.deb` (Debian/Ubuntu), or `chmod +x
-Flint-0.1.0.AppImage` and run it directly on any distribution.
-
-**Windows** — run `Flint-0.1.0-x64.msi`. The installer adds the install directory to your `PATH`.
-
-**From source**
-
-```
-$ cargo install flint
-```
-
-Requires a recent stable Rust toolchain, Node.js 20 or later, and pnpm.
+See the [Install guide](/flint/docs/install/) for the install script, installers, Homebrew, and
+building from source.
 
 Confirm the install:
 

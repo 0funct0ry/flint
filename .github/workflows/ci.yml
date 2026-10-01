@@ -19,8 +19,12 @@ jobs:
         run: cargo fmt --check
       - name: Rust clippy
         run: cargo clippy --workspace --locked -- -D warnings
-      - name: Rust tests
+      - name: Rust tests (includes the no-network-crate guard)
         run: cargo test --workspace --locked
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
       - name: Install Node for Tauri build
         uses: actions/setup-node@v4
         with:

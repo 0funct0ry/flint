@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Adds the install directory to the system PATH so `flint` works from any terminal (M10.3). -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="FlintPathEnv" Guid="6f1d7c3e-5b0a-4e2c-9a41-2d8c0b7a9e15" KeyPath="yes">
+        <Environment Id="FlintPathEntry" Name="PATH" Value="[INSTALLDIR]" Permanent="no" Part="last" Action="set" System="yes" />
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+</Wix>

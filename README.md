@@ -4,7 +4,7 @@ Flint is a desktop app for writing and connecting Markdown notes. Point it at an
 
 [![CI](https://github.com/0funct0ry/flint/actions/workflows/ci.yml/badge.svg)](https://github.com/0funct0ry/flint/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/0funct0ry/flint?include_prereleases)](https://github.com/0funct0ry/flint/releases)
-[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-2021-orange)
 ![Tauri](https://img.shields.io/badge/tauri-2.x-24C8DB)
 
@@ -156,4 +156,4 @@ Flint's data-safety rules are fixed. Never delete a note without being asked. Ne
 
 ## License
 
-Flint is dual-licensed under MIT or Apache-2.0, at your option, as declared in `Cargo.toml`.
+Flint is released under the [MIT License](LICENSE).

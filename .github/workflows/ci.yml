@@ -21,10 +21,13 @@ jobs:
         run: cargo clippy --workspace --locked -- -D warnings
       - name: Rust tests (includes the no-network-crate guard)
         run: cargo test --workspace --locked
-      - name: cargo deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+      # The EmbarkStudios action is container-based and runs on Linux only; this job runs on macOS.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
         with:
-          command: check
+          tool: cargo-deny
+      - name: cargo deny
+        run: cargo deny check
       - name: Install Node for Tauri build
         uses: actions/setup-node@v4
         with:
